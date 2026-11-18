@@ -1,0 +1,37 @@
+# Binaries & build outputs
+dist/
+*.exe
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+coverage.txt
+
+# Strikeye runtime data, demos & media
+*.dem
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.mp4
+*.bak
+config.json
+cache/
+media/
+backup/
+
+# Python / legacy reference caches
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# OS & editor files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+*.swo
+*~

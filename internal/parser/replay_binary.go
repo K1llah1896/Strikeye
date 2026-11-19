@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
 )
@@ -224,11 +225,17 @@ func ReadReplayRound(path string, roundNum uint32) (ReplayHeader, ReplayRoundDat
 	}
 	for _, e := range entries {
 		if e.RoundNumber == roundNum {
+			if e.Length > 256<<20 {
+				return ReplayHeader{}, ReplayRoundData{}, io.ErrUnexpectedEOF
+			}
 			if _, err := f.Seek(int64(e.Offset), io.SeekStart); err != nil {
 				return ReplayHeader{}, ReplayRoundData{}, err
 			}
-			lr := io.LimitReader(f, int64(e.Length))
-			rd, err := decodeRoundPayload(lr)
+			buf := make([]byte, e.Length)
+			if _, err := io.ReadFull(f, buf); err != nil {
+				return ReplayHeader{}, ReplayRoundData{}, err
+			}
+			rd, err := decodeRoundPayloadBytes(buf)
 			return hdr, rd, err
 		}
 	}
@@ -287,26 +294,24 @@ func readHeaderAndIndex(f *os.File) (ReplayHeader, []RoundIndexEntry, error) {
 		return hdr, nil, err
 	}
 
+	if hdr.RoundCount > 4096 {
+		return hdr, nil, io.ErrUnexpectedEOF
+	}
 	if _, err := f.Seek(int64(hdr.IndexOffset), io.SeekStart); err != nil {
 		return hdr, nil, err
 	}
+	indexBytes := make([]byte, int(hdr.RoundCount)*36)
+	if _, err := io.ReadFull(f, indexBytes); err != nil {
+		return hdr, nil, err
+	}
 	entries := make([]RoundIndexEntry, hdr.RoundCount)
+	sr := sliceReader{b: indexBytes}
 	for i := uint32(0); i < hdr.RoundCount; i++ {
-		if err := binary.Read(f, binary.LittleEndian, &entries[i].RoundNumber); err != nil {
-			return hdr, nil, err
-		}
-		if err := binary.Read(f, binary.LittleEndian, &entries[i].StartTick); err != nil {
-			return hdr, nil, err
-		}
-		if err := binary.Read(f, binary.LittleEndian, &entries[i].EndTick); err != nil {
-			return hdr, nil, err
-		}
-		if err := binary.Read(f, binary.LittleEndian, &entries[i].Offset); err != nil {
-			return hdr, nil, err
-		}
-		if err := binary.Read(f, binary.LittleEndian, &entries[i].Length); err != nil {
-			return hdr, nil, err
-		}
+		entries[i].RoundNumber, _ = sr.u32()
+		entries[i].StartTick, _ = sr.i64()
+		entries[i].EndTick, _ = sr.i64()
+		entries[i].Offset, _ = sr.u64()
+		entries[i].Length, _ = sr.u64()
 	}
 	return hdr, entries, nil
 }
@@ -400,150 +405,300 @@ func encodeRoundPayload(w io.Writer, r ReplayRoundData) error {
 	return nil
 }
 
-func decodeRoundPayload(r io.Reader) (ReplayRoundData, error) {
+type sliceReader struct {
+	b []byte
+	o int
+}
+
+func (s *sliceReader) rem() int { return len(s.b) - s.o }
+
+func (s *sliceReader) u8() (uint8, error) {
+	if s.rem() < 1 {
+		return 0, io.ErrUnexpectedEOF
+	}
+	v := s.b[s.o]
+	s.o++
+	return v, nil
+}
+
+func (s *sliceReader) u16() (uint16, error) {
+	if s.rem() < 2 {
+		return 0, io.ErrUnexpectedEOF
+	}
+	v := binary.LittleEndian.Uint16(s.b[s.o:])
+	s.o += 2
+	return v, nil
+}
+
+func (s *sliceReader) u32() (uint32, error) {
+	if s.rem() < 4 {
+		return 0, io.ErrUnexpectedEOF
+	}
+	v := binary.LittleEndian.Uint32(s.b[s.o:])
+	s.o += 4
+	return v, nil
+}
+
+func (s *sliceReader) i64() (int64, error) {
+	if s.rem() < 8 {
+		return 0, io.ErrUnexpectedEOF
+	}
+	v := int64(binary.LittleEndian.Uint64(s.b[s.o:]))
+	s.o += 8
+	return v, nil
+}
+
+func (s *sliceReader) u64() (uint64, error) {
+	if s.rem() < 8 {
+		return 0, io.ErrUnexpectedEOF
+	}
+	v := binary.LittleEndian.Uint64(s.b[s.o:])
+	s.o += 8
+	return v, nil
+}
+
+func (s *sliceReader) f32() (float32, error) {
+	u, err := s.u32()
+	if err != nil {
+		return 0, err
+	}
+	return math.Float32frombits(u), nil
+}
+
+func (s *sliceReader) shortString(intern map[string]string) (string, error) {
+	l, err := s.u8()
+	if err != nil {
+		return "", err
+	}
+	if l == 0 {
+		return "", nil
+	}
+	if s.rem() < int(l) {
+		return "", io.ErrUnexpectedEOF
+	}
+	raw := s.b[s.o : s.o+int(l)]
+	s.o += int(l)
+	if intern != nil {
+		if cached, ok := intern[string(raw)]; ok {
+			return cached, nil
+		}
+		str := string(raw)
+		intern[str] = str
+		return str, nil
+	}
+	return string(raw), nil
+}
+
+func decodeRoundPayloadBytes(buf []byte) (ReplayRoundData, error) {
 	var out ReplayRoundData
-	if err := binary.Read(r, binary.LittleEndian, &out.RoundNumber); err != nil {
+	sr := sliceReader{b: buf}
+	intern := make(map[string]string, 48)
+
+	var err error
+	if out.RoundNumber, err = sr.u32(); err != nil {
 		return out, err
 	}
-	if err := binary.Read(r, binary.LittleEndian, &out.StartTick); err != nil {
+	if out.StartTick, err = sr.i64(); err != nil {
 		return out, err
 	}
-	if err := binary.Read(r, binary.LittleEndian, &out.EndTick); err != nil {
+	if out.EndTick, err = sr.i64(); err != nil {
 		return out, err
 	}
 
-	var frameCount uint32
-	if err := binary.Read(r, binary.LittleEndian, &frameCount); err != nil {
+	frameCount, err := sr.u32()
+	if err != nil {
 		return out, err
+	}
+	// Each frame is at least 10 bytes (8 tick + 2 pCount).
+	if uint64(frameCount)*10 > uint64(sr.rem()) {
+		return out, io.ErrUnexpectedEOF
 	}
 	out.Frames = make([]ReplayFrame, frameCount)
 	for i := uint32(0); i < frameCount; i++ {
-		if err := binary.Read(r, binary.LittleEndian, &out.Frames[i].Tick); err != nil {
+		if out.Frames[i].Tick, err = sr.i64(); err != nil {
 			return out, err
 		}
-		var pCount uint16
-		if err := binary.Read(r, binary.LittleEndian, &pCount); err != nil {
+		pCount, err := sr.u16()
+		if err != nil {
 			return out, err
 		}
-		out.Frames[i].Players = make([]ReplayPlayerPose, pCount)
+		// Each player pose is at least 34 bytes (fixed fields + 1-byte string len).
+		if int(pCount)*34 > sr.rem() {
+			return out, io.ErrUnexpectedEOF
+		}
+		players := make([]ReplayPlayerPose, pCount)
 		for j := uint16(0); j < pCount; j++ {
-			var p ReplayPlayerPose
-			var flags uint8
-			_ = binary.Read(r, binary.LittleEndian, &p.Slot)
-			_ = binary.Read(r, binary.LittleEndian, &p.Team)
-			_ = binary.Read(r, binary.LittleEndian, &flags)
-			p.Alive = flags&(1<<0) != 0
-			p.HasBomb = flags&(1<<1) != 0
-			p.IsDefusing = flags&(1<<2) != 0
-			_ = binary.Read(r, binary.LittleEndian, &p.Health)
-			_ = binary.Read(r, binary.LittleEndian, &p.Armor)
-			_ = binary.Read(r, binary.LittleEndian, &p.Money)
-			_ = binary.Read(r, binary.LittleEndian, &p.EquipValue)
-			_ = binary.Read(r, binary.LittleEndian, &p.FlashDur)
-			_ = binary.Read(r, binary.LittleEndian, &p.X)
-			_ = binary.Read(r, binary.LittleEndian, &p.Y)
-			_ = binary.Read(r, binary.LittleEndian, &p.Z)
-			_ = binary.Read(r, binary.LittleEndian, &p.Yaw)
-			_ = binary.Read(r, binary.LittleEndian, &p.Pitch)
-			var err error
-			p.ActiveWeapon, err = readShortString(r)
+			if sr.rem() < 34 {
+				return out, io.ErrUnexpectedEOF
+			}
+			b := sr.b[sr.o:]
+			flags := b[2]
+			p := ReplayPlayerPose{
+				Slot:       b[0],
+				Team:       b[1],
+				Alive:      flags&(1<<0) != 0,
+				HasBomb:    flags&(1<<1) != 0,
+				IsDefusing: flags&(1<<2) != 0,
+				Health:     b[3],
+				Armor:      b[4],
+				Money:      binary.LittleEndian.Uint16(b[5:7]),
+				EquipValue: binary.LittleEndian.Uint16(b[7:9]),
+				FlashDur:   math.Float32frombits(binary.LittleEndian.Uint32(b[9:13])),
+				X:          math.Float32frombits(binary.LittleEndian.Uint32(b[13:17])),
+				Y:          math.Float32frombits(binary.LittleEndian.Uint32(b[17:21])),
+				Z:          math.Float32frombits(binary.LittleEndian.Uint32(b[21:25])),
+				Yaw:        math.Float32frombits(binary.LittleEndian.Uint32(b[25:29])),
+				Pitch:      math.Float32frombits(binary.LittleEndian.Uint32(b[29:33])),
+			}
+			sr.o += 33
+			p.ActiveWeapon, err = sr.shortString(intern)
 			if err != nil {
 				return out, err
 			}
-			out.Frames[i].Players[j] = p
+			players[j] = p
 		}
+		out.Frames[i].Players = players
 	}
 
-	var gCount uint32
-	if err := binary.Read(r, binary.LittleEndian, &gCount); err != nil {
+	gCount, err := sr.u32()
+	if err != nil {
 		return out, err
+	}
+	if uint64(gCount)*30 > uint64(sr.rem()) {
+		return out, io.ErrUnexpectedEOF
 	}
 	out.Grenades = make([]GrenadeTrack, gCount)
 	for i := uint32(0); i < gCount; i++ {
 		g := &out.Grenades[i]
 		g.RoundNumber = int(out.RoundNumber)
-		_ = binary.Read(r, binary.LittleEndian, &g.EntityID)
-		var err error
-		g.ThrowerSteamID, err = readShortString(r)
+		if g.EntityID, err = sr.i64(); err != nil {
+			return out, err
+		}
+		if g.ThrowerSteamID, err = sr.shortString(intern); err != nil {
+			return out, err
+		}
+		if g.GrenadeType, err = sr.shortString(intern); err != nil {
+			return out, err
+		}
+		if g.ThrowTick, err = sr.i64(); err != nil {
+			return out, err
+		}
+		if g.EndTick, err = sr.i64(); err != nil {
+			return out, err
+		}
+		ptCount, err := sr.u32()
 		if err != nil {
 			return out, err
 		}
-		g.GrenadeType, err = readShortString(r)
-		if err != nil {
-			return out, err
-		}
-		_ = binary.Read(r, binary.LittleEndian, &g.ThrowTick)
-		_ = binary.Read(r, binary.LittleEndian, &g.EndTick)
-		var ptCount uint32
-		if err := binary.Read(r, binary.LittleEndian, &ptCount); err != nil {
-			return out, err
+		if uint64(ptCount)*20 > uint64(sr.rem()) {
+			return out, io.ErrUnexpectedEOF
 		}
 		g.Points = make([]GrenadeSample, ptCount)
 		for j := uint32(0); j < ptCount; j++ {
-			_ = binary.Read(r, binary.LittleEndian, &g.Points[j].Tick)
-			_ = binary.Read(r, binary.LittleEndian, &g.Points[j].Pos.X)
-			_ = binary.Read(r, binary.LittleEndian, &g.Points[j].Pos.Y)
-			_ = binary.Read(r, binary.LittleEndian, &g.Points[j].Pos.Z)
+			b := sr.b[sr.o : sr.o+20]
+			sr.o += 20
+			g.Points[j] = GrenadeSample{
+				Tick: int64(binary.LittleEndian.Uint64(b[0:8])),
+				Pos: Point3D{
+					X: math.Float32frombits(binary.LittleEndian.Uint32(b[8:12])),
+					Y: math.Float32frombits(binary.LittleEndian.Uint32(b[12:16])),
+					Z: math.Float32frombits(binary.LittleEndian.Uint32(b[16:20])),
+				},
+			}
 		}
 	}
 
-	var sCount uint32
-	if err := binary.Read(r, binary.LittleEndian, &sCount); err != nil {
+	sCount, err := sr.u32()
+	if err != nil {
 		return out, err
+	}
+	if uint64(sCount)*37 > uint64(sr.rem()) {
+		return out, io.ErrUnexpectedEOF
 	}
 	out.Smokes = make([]SmokeEffect, sCount)
 	for i := uint32(0); i < sCount; i++ {
 		s := &out.Smokes[i]
 		s.RoundNumber = int(out.RoundNumber)
-		_ = binary.Read(r, binary.LittleEndian, &s.EntityID)
-		var err error
-		s.ThrowerSteamID, err = readShortString(r)
-		if err != nil {
+		if s.EntityID, err = sr.i64(); err != nil {
 			return out, err
 		}
-		_ = binary.Read(r, binary.LittleEndian, &s.StartTick)
-		_ = binary.Read(r, binary.LittleEndian, &s.EndTick)
-		_ = binary.Read(r, binary.LittleEndian, &s.Pos.X)
-		_ = binary.Read(r, binary.LittleEndian, &s.Pos.Y)
-		_ = binary.Read(r, binary.LittleEndian, &s.Pos.Z)
+		if s.ThrowerSteamID, err = sr.shortString(intern); err != nil {
+			return out, err
+		}
+		if s.StartTick, err = sr.i64(); err != nil {
+			return out, err
+		}
+		if s.EndTick, err = sr.i64(); err != nil {
+			return out, err
+		}
+		if s.Pos.X, err = sr.f32(); err != nil {
+			return out, err
+		}
+		if s.Pos.Y, err = sr.f32(); err != nil {
+			return out, err
+		}
+		if s.Pos.Z, err = sr.f32(); err != nil {
+			return out, err
+		}
 	}
 
-	var iCount uint32
-	if err := binary.Read(r, binary.LittleEndian, &iCount); err != nil {
+	iCount, err := sr.u32()
+	if err != nil {
 		return out, err
+	}
+	if uint64(iCount)*29 > uint64(sr.rem()) {
+		return out, io.ErrUnexpectedEOF
 	}
 	out.Infernos = make([]InfernoEffect, iCount)
 	for i := uint32(0); i < iCount; i++ {
 		inf := &out.Infernos[i]
 		inf.RoundNumber = int(out.RoundNumber)
-		_ = binary.Read(r, binary.LittleEndian, &inf.UniqueID)
-		var err error
-		inf.ThrowerSteamID, err = readShortString(r)
+		if inf.UniqueID, err = sr.i64(); err != nil {
+			return out, err
+		}
+		if inf.ThrowerSteamID, err = sr.shortString(intern); err != nil {
+			return out, err
+		}
+		if inf.StartTick, err = sr.i64(); err != nil {
+			return out, err
+		}
+		if inf.EndTick, err = sr.i64(); err != nil {
+			return out, err
+		}
+		hCount, err := sr.u32()
 		if err != nil {
 			return out, err
 		}
-		_ = binary.Read(r, binary.LittleEndian, &inf.StartTick)
-		_ = binary.Read(r, binary.LittleEndian, &inf.EndTick)
-		var hCount uint32
-		if err := binary.Read(r, binary.LittleEndian, &hCount); err != nil {
-			return out, err
+		if uint64(hCount)*8 > uint64(sr.rem()) {
+			return out, io.ErrUnexpectedEOF
 		}
 		inf.Hull = make([]Point2D, hCount)
 		for j := uint32(0); j < hCount; j++ {
-			_ = binary.Read(r, binary.LittleEndian, &inf.Hull[j].X)
-			_ = binary.Read(r, binary.LittleEndian, &inf.Hull[j].Y)
+			b := sr.b[sr.o : sr.o+8]
+			sr.o += 8
+			inf.Hull[j] = Point2D{
+				X: math.Float32frombits(binary.LittleEndian.Uint32(b[0:4])),
+				Y: math.Float32frombits(binary.LittleEndian.Uint32(b[4:8])),
+			}
 		}
 	}
 
-	var eCount uint32
-	if err := binary.Read(r, binary.LittleEndian, &eCount); err != nil {
+	eCount, err := sr.u32()
+	if err != nil {
 		return out, err
+	}
+	if uint64(eCount)*11 > uint64(sr.rem()) {
+		return out, io.ErrUnexpectedEOF
 	}
 	out.InputEdges = make([]InputEdge, eCount)
 	for i := uint32(0); i < eCount; i++ {
-		_ = binary.Read(r, binary.LittleEndian, &out.InputEdges[i].Tick)
-		_ = binary.Read(r, binary.LittleEndian, &out.InputEdges[i].PlayerSlot)
-		_ = binary.Read(r, binary.LittleEndian, &out.InputEdges[i].Buttons)
+		b := sr.b[sr.o : sr.o+11]
+		sr.o += 11
+		out.InputEdges[i] = InputEdge{
+			Tick:       int64(binary.LittleEndian.Uint64(b[0:8])),
+			PlayerSlot: b[8],
+			Buttons:    binary.LittleEndian.Uint16(b[9:11]),
+		}
 	}
 	return out, nil
 }
@@ -554,19 +709,4 @@ func writeShortString(w io.Writer, s string) {
 	}
 	_ = binary.Write(w, binary.LittleEndian, uint8(len(s)))
 	_, _ = w.Write([]byte(s))
-}
-
-func readShortString(r io.Reader) (string, error) {
-	var l uint8
-	if err := binary.Read(r, binary.LittleEndian, &l); err != nil {
-		return "", err
-	}
-	if l == 0 {
-		return "", nil
-	}
-	buf := make([]byte, l)
-	if _, err := io.ReadFull(r, buf); err != nil {
-		return "", err
-	}
-	return string(buf), nil
 }

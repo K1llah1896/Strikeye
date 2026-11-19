@@ -8,9 +8,11 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"runtime/debug"
 	"syscall"
 	"time"
 
+	"strikeye/internal/agent"
 	"strikeye/internal/config"
 	"strikeye/internal/ipc"
 	"strikeye/internal/storage"
@@ -23,6 +25,7 @@ import (
 func main() {
 	showVersion := flag.Bool("version", false, "Print version information and exit")
 	envCheck := flag.Bool("env-check", false, "Print runtime environment summary and exit")
+	agentMode := flag.Bool("agent", false, "Run headless background agent service")
 	dataRootFlag := flag.String("data-root", "", "Override Strikeye DataRoot directory")
 	pipeFlag := flag.String("pipe", "", "Override IPC named pipe / socket address")
 	flag.Parse()
@@ -54,10 +57,19 @@ func main() {
 
 	defer func() {
 		if r := recover(); r != nil {
-			logStartupError(dataRoot, fmt.Sprintf("panic: %v", r))
+			logStartupError(dataRoot, fmt.Sprintf("panic: %v\n%s", r, string(debug.Stack())))
 			os.Exit(1)
 		}
 	}()
+
+	if *agentMode {
+		if err := agent.Run(ctx, dataRoot, *pipeFlag); err != nil {
+			logStartupError(dataRoot, fmt.Sprintf("strikeye-agent error: %v", err))
+			fmt.Fprintf(os.Stderr, "strikeye-agent error: %v\n", err)
+			os.Exit(1)
+		}
+		return
+	}
 
 	if err := runDesktop(ctx, dataRoot, *pipeFlag); err != nil {
 		logStartupError(dataRoot, fmt.Sprintf("strikeye error: %v", err))
@@ -109,20 +121,18 @@ func connectOrSpawnAgent(ctx context.Context, dataRoot, pipeAddr string) *ipc.Cl
 		return cli
 	}
 
-	// Auto-spawn strikeye-agent beside strikeye executable (or on PATH).
-	exeDir := "."
-	if exePath, err := os.Executable(); err == nil {
-		exeDir = filepath.Dir(exePath)
+	// Auto-spawn integrated background agent via self-invocation (--agent).
+	selfExe, err := os.Executable()
+	var cmd *exec.Cmd
+	if err == nil && selfExe != "" {
+		cmd = exec.Command(selfExe, "--agent", "--data-root", dataRoot, "--pipe", pipeAddr)
+	} else {
+		agentBin := "strikeye-agent"
+		if os.PathSeparator == '\\' {
+			agentBin = "strikeye-agent.exe"
+		}
+		cmd = exec.Command(agentBin, "--data-root", dataRoot, "--pipe", pipeAddr)
 	}
-	agentBin := "strikeye-agent"
-	if os.PathSeparator == '\\' {
-		agentBin = "strikeye-agent.exe"
-	}
-	candidate := filepath.Join(exeDir, agentBin)
-	if _, err := os.Stat(candidate); err != nil {
-		candidate = agentBin
-	}
-	cmd := exec.Command(candidate, "--data-root", dataRoot, "--pipe", pipeAddr)
 	detachAgentProcess(cmd)
 	_ = cmd.Start()
 
@@ -192,5 +202,11 @@ func runDesktop(ctx context.Context, dataRoot, pipeOverride string) error {
 		DB:       db,
 		Agent:    agentCli,
 	})
-	return app.Run(ctx)
+	err = app.Run(ctx)
+	if agentCli != nil && !app.ShouldKeepAgentOnExit() {
+		sctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+		_ = agentCli.Call(sctx, "agent.shutdown", nil, nil)
+		cancel()
+	}
+	return err
 }

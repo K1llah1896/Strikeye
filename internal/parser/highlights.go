@@ -267,7 +267,7 @@ func evaluateSegment(
 				allBurst = false
 			}
 		}
-		if allBurst {
+		if len(seg) >= 3 && allBurst {
 			tags = append(tags, "爆发刷屏")
 			score += 8
 		}
@@ -277,10 +277,6 @@ func evaluateSegment(
 		}
 	}
 
-	if len(seg) >= 5 && totalTeamKills == len(seg) {
-		tags = append(tags, "🧹 清盘")
-		score += 15
-	}
 	if isFirstKill && len(seg) >= 2 {
 		tags = append(tags, "⚔️ 首杀")
 		score += 5
@@ -325,7 +321,6 @@ func evaluateSegment(
 		isLongRangeWep := isSniper || w == "deagle" || w == "revolver"
 
 		if k.IsHeadshot {
-			tags = append(tags, "爆头")
 			if !isSniper && (w == "ak47" || w == "deagle" || w == "m4a1" || w == "m4a1_silencer" || w == "usp_silencer" || w == "glock") {
 				tags = append(tags, "💥 颗秒")
 				if clipType == "" {
@@ -340,10 +335,6 @@ func evaluateSegment(
 				clipType = "knife"
 			}
 			score += 20
-			if !k.VictimFacing {
-				tags = append(tags, "🔙 背刺")
-				score += 8
-			}
 		}
 		if isLongRangeWep && k.Distance >= longRangeKillDist {
 			tags = append(tags, "🔭 百步穿杨")

@@ -158,6 +158,7 @@ echo '{"format":{"duration":"4.0"},"streams":[{"codec_type":"video","codec_name"
 	guard := &fakeProcessGuard{}
 	runner := &fakeSessionRunner{mp4Source: rawMP4}
 	cfg := config.DefaultConfig(tmp)
+	cfg.Render.Policy = config.PolicySmartHighlights
 	cfg.Render.KeyOverlayEnabled = false
 
 	layout, _ := config.ResolveDataLayout(tmp)

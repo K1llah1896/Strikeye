@@ -42,29 +42,56 @@ func Open(dbPath, snapshotDir string, migrations ...Migration) (*DB, error) {
 		migrations = DefaultMigrations()
 	}
 
+	openOnce := func(dsn string, forceDeleteJournal bool) (*DB, error) {
+		sqlDB, err := sql.Open("sqlite", dsn)
+		if err != nil {
+			return nil, fmt.Errorf("open sqlite %q: %w", cleanPath, err)
+		}
+		// Single writer connection guarantees PRAGMAs apply consistently and avoids SQLITE_BUSY in-process.
+		sqlDB.SetMaxOpenConns(1)
+
+		db := &DB{
+			sql:         sqlDB,
+			path:        cleanPath,
+			snapshotDir: filepath.Clean(snapshotDir),
+		}
+
+		if err := db.applyPragmas(context.Background(), forceDeleteJournal); err != nil {
+			_ = sqlDB.Close()
+			return nil, err
+		}
+		if err := db.migrate(context.Background(), migrations); err != nil {
+			_ = sqlDB.Close()
+			return nil, err
+		}
+		return db, nil
+	}
+
+	useUNC := isUNCPath(cleanPath)
 	dsn := buildSQLiteDSN(cleanPath)
-	sqlDB, err := sql.Open("sqlite", dsn)
-	if err != nil {
-		return nil, fmt.Errorf("open sqlite %q: %w", cleanPath, err)
+	var lastErr error
+	for attempt := 0; attempt < 5; attempt++ {
+		db, err := openOnce(dsn, useUNC)
+		if err == nil {
+			return db, nil
+		}
+		lastErr = err
+		if isLockingProtocolErr(err) && !useUNC {
+			// Mapped network/WSL drives (e.g. Z:\...) can return SQLITE_PROTOCOL (15)
+			// on WAL/shm locks. Retry immediately with DELETE journal + win32-none VFS.
+			fbDSN := buildSQLiteFallbackDSN(cleanPath)
+			if fbDB, fbErr := openOnce(fbDSN, true); fbErr == nil {
+				return fbDB, nil
+			} else {
+				lastErr = fbErr
+			}
+		}
+		if !isTransientLockErr(err) {
+			break
+		}
+		time.Sleep(time.Duration(attempt+1) * 120 * time.Millisecond)
 	}
-	// Single writer connection guarantees PRAGMAs apply consistently and avoids SQLITE_BUSY in-process.
-	sqlDB.SetMaxOpenConns(1)
-
-	db := &DB{
-		sql:         sqlDB,
-		path:        cleanPath,
-		snapshotDir: filepath.Clean(snapshotDir),
-	}
-
-	if err := db.applyPragmas(context.Background()); err != nil {
-		_ = sqlDB.Close()
-		return nil, err
-	}
-	if err := db.migrate(context.Background(), migrations); err != nil {
-		_ = sqlDB.Close()
-		return nil, err
-	}
-	return db, nil
+	return nil, lastErr
 }
 
 // OpenDefault opens <dataRoot>/strikeye.db with snapshots in <dataRoot>/backup/db_snapshots.
@@ -84,6 +111,25 @@ func isUNCPath(path string) bool {
 	return strings.HasPrefix(slashed, "//")
 }
 
+func isLockingProtocolErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "locking protocol") || strings.Contains(msg, "sqlite_protocol")
+}
+
+func isTransientLockErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "database is locked") ||
+		strings.Contains(msg, "sqlite_busy") ||
+		strings.Contains(msg, "sqlite_locked") ||
+		strings.Contains(msg, "locking protocol")
+}
+
 func buildSQLiteDSN(path string) string {
 	slashed := strings.ReplaceAll(filepath.ToSlash(path), "\\", "/")
 	// Windows UNC paths (\\host\share\..., e.g. \\wsl.localhost\...) do not
@@ -92,10 +138,20 @@ func buildSQLiteDSN(path string) string {
 	if strings.HasPrefix(slashed, "//") {
 		return "file://" + slashed + "?_pragma=busy_timeout(5000)&_pragma=journal_mode(DELETE)&_pragma=synchronous(NORMAL)&_pragma=foreign_keys(1)&vfs=win32-none"
 	}
-	return "file:" + slashed + "?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)&_pragma=foreign_keys(1)"
+	// Do not put journal_mode(WAL) in the DSN so connection-open PRAGMAs cannot fail
+	// with SQLITE_PROTOCOL (15) before applyPragmas can fall back to DELETE mode.
+	return "file:" + slashed + "?_pragma=busy_timeout(5000)&_pragma=synchronous(NORMAL)&_pragma=foreign_keys(1)"
 }
 
-func (db *DB) applyPragmas(ctx context.Context) error {
+func buildSQLiteFallbackDSN(path string) string {
+	slashed := strings.ReplaceAll(filepath.ToSlash(path), "\\", "/")
+	if strings.HasPrefix(slashed, "//") {
+		return "file://" + slashed + "?_pragma=busy_timeout(5000)&_pragma=journal_mode(DELETE)&_pragma=synchronous(NORMAL)&_pragma=foreign_keys(1)&vfs=win32-none"
+	}
+	return "file:" + slashed + "?_pragma=busy_timeout(5000)&_pragma=journal_mode(DELETE)&_pragma=synchronous(NORMAL)&_pragma=foreign_keys(1)&vfs=win32-none"
+}
+
+func (db *DB) applyPragmas(ctx context.Context, forceDeleteJournal bool) error {
 	basePragmas := []string{
 		"PRAGMA busy_timeout=5000;",
 		"PRAGMA synchronous=NORMAL;",
@@ -106,15 +162,15 @@ func (db *DB) applyPragmas(ctx context.Context) error {
 			return fmt.Errorf("exec %q: %w", p, err)
 		}
 	}
-	if isUNCPath(db.path) {
+	if forceDeleteJournal || isUNCPath(db.path) {
 		if _, err := db.sql.ExecContext(ctx, "PRAGMA journal_mode=DELETE;"); err != nil {
 			return fmt.Errorf("exec %q: %w", "PRAGMA journal_mode=DELETE;", err)
 		}
 		return nil
 	}
 	if _, err := db.sql.ExecContext(ctx, "PRAGMA journal_mode=WAL;"); err != nil {
-		// If another process is concurrently initializing the DB, fall back to DELETE
-		// instead of failing desktop startup with SQLITE_BUSY.
+		// If another process is concurrently initializing the DB or the filesystem
+		// does not support WAL shared-memory locks, fall back to DELETE cleanly.
 		if _, fbErr := db.sql.ExecContext(ctx, "PRAGMA journal_mode=DELETE;"); fbErr != nil {
 			return fmt.Errorf("exec %q: %w", "PRAGMA journal_mode=WAL;", err)
 		}

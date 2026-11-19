@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"strikeye/internal/agent"
 	"strikeye/internal/config"
 	"strikeye/internal/ipc"
 	"strikeye/internal/storage"
@@ -31,8 +32,8 @@ func TestAgentServiceRPCAndParseEvents(t *testing.T) {
 	}
 	defer db.Close()
 
-	svc := newAgentService(dataRoot, cfg, db)
-	go svc.runParseWorker(ctx)
+	svc := agent.NewService(dataRoot, cfg, db)
+	go svc.RunParseWorker(ctx)
 
 	sock := filepath.Join(tmp, "agent-test.sock")
 	if os.PathSeparator == '\\' {
@@ -43,7 +44,7 @@ func TestAgentServiceRPCAndParseEvents(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer ln.Close()
-	go func() { _ = svc.rpc.Serve(ctx, ln) }()
+	go func() { _ = svc.RPC().Serve(ctx, ln) }()
 
 	conn, err := ipc.Dial(ctx, sock)
 	if err != nil {
@@ -81,7 +82,7 @@ func TestAgentServiceRPCAndParseEvents(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	svc.handleDiscovered(watcher.DiscoveredDemo{Demo: d, Created: created})
+	svc.HandleDiscovered(watcher.DiscoveredDemo{Demo: d, Created: created})
 
 	seenTopics := make(map[string]bool)
 	for len(seenTopics) < 3 {

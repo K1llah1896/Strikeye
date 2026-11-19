@@ -44,7 +44,7 @@ func TestEnsureDataLayoutAndLoadDefaults(t *testing.T) {
 		}
 	}
 
-	if cfg.Render.Policy != PolicySmartHighlights || cfg.Render.Width != 1920 || cfg.Render.FPS != 60 {
+	if cfg.Render.Policy != PolicyManualOnly || cfg.Render.Width != 1920 || cfg.Render.FPS != 60 {
 		t.Fatalf("unexpected default render config: %+v", cfg.Render)
 	}
 	if _, err := os.Stat(ConfigPath(root)); err != nil {

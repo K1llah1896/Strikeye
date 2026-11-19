@@ -108,6 +108,14 @@ func (w *Watcher) Run(ctx context.Context) error {
 	}
 }
 
+// ScanReport summarizes the outcome of a manual or reload-triggered directory scan.
+type ScanReport struct {
+	Targets    int      `json:"targets"`
+	Candidates int      `json:"candidates"`
+	Discovered int      `json:"discovered"`
+	Warnings   []string `json:"warnings,omitempty"`
+}
+
 // SetTargets updates the active watch targets dynamically.
 func (w *Watcher) SetTargets(targets []WatchTarget) {
 	w.mu.Lock()
@@ -118,28 +126,37 @@ func (w *Watcher) SetTargets(targets []WatchTarget) {
 // ScanNow immediately scans all configured targets and ingests any .dem file
 // whose modification time is already older than StableDuration.
 func (w *Watcher) ScanNow(ctx context.Context) error {
+	_, err := w.ScanNowWithReport(ctx)
+	return err
+}
+
+// ScanNowWithReport immediately scans all configured targets and returns a diagnostic summary.
+func (w *Watcher) ScanNowWithReport(ctx context.Context) (ScanReport, error) {
 	return w.scanOnce(ctx, true)
 }
 
 // PollOnce performs one scan + stabilization step across all configured targets.
 func (w *Watcher) PollOnce(ctx context.Context) error {
-	return w.scanOnce(ctx, false)
+	_, err := w.scanOnce(ctx, false)
+	return err
 }
 
-func (w *Watcher) scanOnce(ctx context.Context, immediate bool) error {
+func (w *Watcher) scanOnce(ctx context.Context, immediate bool) (ScanReport, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
 	now := time.Now()
 	seenPaths := make(map[string]struct{})
 	targets := append([]WatchTarget(nil), w.opts.Targets...)
+	rep := ScanReport{Targets: len(targets)}
 
 	for _, target := range targets {
 		if ctx.Err() != nil {
-			return ctx.Err()
+			return rep, ctx.Err()
 		}
 		err := filepath.WalkDir(target.Dir, func(path string, d fs.DirEntry, walkErr error) error {
 			if walkErr != nil {
+				rep.Warnings = append(rep.Warnings, fmt.Sprintf("%s: %v", path, walkErr))
 				return nil
 			}
 			if d.IsDir() {
@@ -148,13 +165,18 @@ func (w *Watcher) scanOnce(ctx context.Context, immediate bool) error {
 			if !strings.EqualFold(filepath.Ext(d.Name()), ".dem") {
 				return nil
 			}
+			rep.Candidates++
 			clean := filepath.Clean(path)
 			seenPaths[clean] = struct{}{}
-			w.processCandidate(ctx, clean, target, now, immediate)
+			if added, warn := w.processCandidate(ctx, clean, target, now, immediate); warn != "" {
+				rep.Warnings = append(rep.Warnings, warn)
+			} else if added {
+				rep.Discovered++
+			}
 			return nil
 		})
 		if err != nil && !os.IsNotExist(err) {
-			return err
+			return rep, err
 		}
 	}
 
@@ -164,13 +186,13 @@ func (w *Watcher) scanOnce(ctx context.Context, immediate bool) error {
 			delete(w.tracks, path)
 		}
 	}
-	return nil
+	return rep, nil
 }
 
-func (w *Watcher) processCandidate(ctx context.Context, path string, target WatchTarget, now time.Time, immediate bool) {
+func (w *Watcher) processCandidate(ctx context.Context, path string, target WatchTarget, now time.Time, immediate bool) (bool, string) {
 	info, err := os.Stat(path)
 	if err != nil || info.IsDir() {
-		return
+		return false, ""
 	}
 
 	tr, exists := w.tracks[path]
@@ -184,7 +206,7 @@ func (w *Watcher) processCandidate(ctx context.Context, path string, target Watc
 		}
 		w.tracks[path] = tr
 		if !immediate || now.Sub(info.ModTime()) < w.opts.StableDuration {
-			return
+			return false, ""
 		}
 	} else {
 		if tr.size != info.Size() || !tr.modTime.Equal(info.ModTime()) {
@@ -194,19 +216,19 @@ func (w *Watcher) processCandidate(ctx context.Context, path string, target Watc
 			tr.samples = 1
 			tr.rejected = false
 			tr.ingested = false
-			return
+			return false, ""
 		}
 
 		if tr.ingested || tr.rejected {
-			return
+			return false, ""
 		}
 
 		tr.samples++
 		if !immediate && (tr.samples < w.opts.MinSamples || now.Sub(tr.lastChange) < w.opts.StableDuration) {
-			return
+			return false, ""
 		}
 		if immediate && now.Sub(info.ModTime()) < w.opts.StableDuration {
-			return
+			return false, ""
 		}
 	}
 
@@ -215,7 +237,7 @@ func (w *Watcher) processCandidate(ctx context.Context, path string, target Watc
 		if w.opts.OnWarning != nil {
 			w.opts.OnWarning(path, err)
 		}
-		return
+		return false, fmt.Sprintf("%s: %v", filepath.Base(path), err)
 	}
 
 	hash, err := StreamSHA256(path)
@@ -223,7 +245,7 @@ func (w *Watcher) processCandidate(ctx context.Context, path string, target Watc
 		if w.opts.OnWarning != nil {
 			w.opts.OnWarning(path, err)
 		}
-		return
+		return false, fmt.Sprintf("%s: %v", filepath.Base(path), err)
 	}
 
 	platform := target.Platform
@@ -244,13 +266,14 @@ func (w *Watcher) processCandidate(ctx context.Context, path string, target Watc
 		if w.opts.OnWarning != nil {
 			w.opts.OnWarning(path, err)
 		}
-		return
+		return false, fmt.Sprintf("%s: %v", filepath.Base(path), err)
 	}
 
 	tr.ingested = true
 	if w.opts.OnDiscovered != nil {
 		w.opts.OnDiscovered(DiscoveredDemo{Demo: demo, Created: created})
 	}
+	return created, ""
 }
 
 // ValidateDemoFile verifies minimum file size, non-exclusive readability, and PBDEMS2 header magic.

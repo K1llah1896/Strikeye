@@ -185,7 +185,7 @@ func (s *Scheduler) RecoverInterrupted(ctx context.Context) (requeued int64, fai
 func (s *Scheduler) PlanTasksForDemo(ctx context.Context, demoID int64) ([]storage.RenderTask, error) {
 	policy := s.opts.Config.Render.Policy
 	if policy == "" {
-		policy = config.PolicySmartHighlights
+		policy = config.PolicyManualOnly
 	}
 	if policy == config.PolicyManualOnly {
 		return nil, nil

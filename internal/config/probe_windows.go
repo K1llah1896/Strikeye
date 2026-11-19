@@ -3,11 +3,24 @@
 package config
 
 import (
+	"os"
 	"path/filepath"
 	"strings"
 
 	"golang.org/x/sys/windows/registry"
 )
+
+func exeToolDirs() []string {
+	exe, err := os.Executable()
+	if err != nil {
+		return nil
+	}
+	dir := filepath.Dir(exe)
+	return []string{
+		filepath.Join(dir, "tools"),
+		dir,
+	}
+}
 
 func platformSteamRoots(getenv func(string) string) []string {
 	var roots []string
@@ -51,6 +64,13 @@ func platformSteamRoots(getenv func(string) string) []string {
 
 func platformHLAECandidates(getenv func(string) string) []string {
 	var out []string
+	for _, base := range exeToolDirs() {
+		out = append(out,
+			filepath.Join(base, "hlae", "HLAE.exe"),
+			filepath.Join(base, "HLAE", "HLAE.exe"),
+			filepath.Join(base, "HLAE.exe"),
+		)
+	}
 	if local := getenv("LOCALAPPDATA"); local != "" {
 		out = append(out, filepath.Join(local, "Programs", "HLAE", "HLAE.exe"))
 	}
@@ -71,6 +91,13 @@ func platformHLAECandidates(getenv func(string) string) []string {
 func platformMediaToolCandidates(base string, getenv func(string) string) []string {
 	exe := base + ".exe"
 	var out []string
+	for _, dir := range exeToolDirs() {
+		out = append(out,
+			filepath.Join(dir, "ffmpeg", exe),
+			filepath.Join(dir, "ffmpeg", "bin", exe),
+			filepath.Join(dir, exe),
+		)
+	}
 	if local := getenv("LOCALAPPDATA"); local != "" {
 		out = append(out, filepath.Join(local, "Strikeye", "third_party", "ffmpeg", exe))
 	}

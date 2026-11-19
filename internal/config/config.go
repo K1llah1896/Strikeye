@@ -92,7 +92,7 @@ func DefaultConfig(dataRoot string) Config {
 		DataRoot:      filepath.Clean(dataRoot),
 		DemoWatchDirs: []string{},
 		Render: RenderConfig{
-			Policy:                 PolicySmartHighlights,
+			Policy:                 PolicyManualOnly,
 			Width:                  1920,
 			Height:                 1080,
 			FPS:                    60,

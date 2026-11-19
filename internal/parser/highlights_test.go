@@ -69,15 +69,18 @@ func TestDetectCompetitiveHighlightsExcludesFailAndMemeTags(t *testing.T) {
 			t.Fatalf("forbidden fail/meme tag %q found in %v", forbidden, tags)
 		}
 	}
-	// Check expected competitive tags (and ensure "爆头" was covered by "💥 颗秒"/"枪枪爆头").
-	for _, required := range []string{"双杀", "爆发刷屏", "枪枪爆头", "💥 颗秒", "🔭 百步穿杨", "❤️ 极限锁血", "💸 ECO翻盘"} {
+	// Check expected competitive tags (and ensure removed/broad tags are absent).
+	for _, required := range []string{"双杀", "枪枪爆头", "💥 颗秒", "🔭 百步穿杨", "❤️ 极限锁血", "💸 ECO翻盘"} {
 		if !strings.Contains(joined, required) {
 			t.Fatalf("expected tag %q in %v", required, tags)
 		}
 	}
+	if strings.Contains(joined, "爆发刷屏") {
+		t.Fatalf("expected 爆发刷屏 to require >= 3 kills, got on 2K: %v", tags)
+	}
 	for _, tag := range tags {
-		if tag == "爆头" {
-			t.Fatalf("broad tag 爆头 should have been deduplicated by 💥 颗秒/枪枪爆头")
+		if tag == "爆头" || tag == "🧹 清盘" || tag == "🔙 背刺" {
+			t.Fatalf("unexpected removed tag %q in %v", tag, tags)
 		}
 	}
 }

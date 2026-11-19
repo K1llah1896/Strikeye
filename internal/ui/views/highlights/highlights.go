@@ -4,7 +4,9 @@ package highlights
 import (
 	"context"
 	"fmt"
+	"sort"
 	"strings"
+	"sync"
 
 	"github.com/egoist/mygo/ui"
 	"strikeye/internal/composer"
@@ -40,10 +42,12 @@ type MontageItem struct {
 
 // View manages Highlight Library and Montage Workbench state.
 type View struct {
+	mu             sync.RWMutex
 	db             *storage.DB
 	agent          AgentCaller
 	ffmpegPath     string
 	demoID         int64
+	demo           *storage.Demo
 	clips          []storage.HighlightClip
 	videosByID     map[int64]storage.MediaVideo
 	radarBySteam   map[string]storage.RadarCard
@@ -77,8 +81,12 @@ func NewView(db *storage.DB, agent AgentCaller, ffmpegPath string, onStartRender
 		videosByID:    make(map[int64]storage.MediaVideo),
 		radarBySteam:  make(map[string]storage.RadarCard),
 		playerWidget:  components.NewVideoPlayerWidget(ffmpegPath),
-		activeTab:     "library",
-		filter:        HighlightFilter{ClipType: "全部类型"},
+		activeTab: "library",
+		filter: HighlightFilter{
+			PlayerQuery: "全部选手",
+			ClipType:    "全部类型",
+			TagQuery:    "全部标签",
+		},
 		title:         "Strikeye Highlight Montage",
 		clipVol:       1.0,
 		bgmVol:        0.35,
@@ -96,58 +104,64 @@ func (v *View) Close() {
 	}
 }
 
-// LoadDemo refreshes highlights, verified videos, and radar cards for demoID (or all demos if 0).
+// LoadDemo refreshes highlights, verified videos, and radar cards for the selected demoID.
+// When demoID <= 0, highlights remain unbound (empty) until a demo is selected.
 func (v *View) LoadDemo(ctx context.Context, demoID int64) error {
-	v.demoID = demoID
-	if v.db == nil {
-		return nil
-	}
-	v.videosByID = make(map[int64]storage.MediaVideo)
-	v.radarBySteam = make(map[string]storage.RadarCard)
+	videosByID := make(map[int64]storage.MediaVideo)
+	radarBySteam := make(map[string]storage.RadarCard)
+	var clips []storage.HighlightClip
+	var demo *storage.Demo
 
-	if demoID > 0 {
+	if v.db != nil && demoID > 0 {
+		if d, err := v.db.Demos().GetByID(ctx, demoID); err == nil {
+			demo = &d
+		}
 		allMedia, _ := v.db.Media().ListByDemo(ctx, demoID)
 		for _, mv := range allMedia {
-			v.videosByID[mv.ID] = mv
+			videosByID[mv.ID] = mv
 		}
-		v.clips, _ = v.db.Analysis().ListHighlightClips(ctx, demoID)
+		clips, _ = v.db.Analysis().ListHighlightClips(ctx, demoID)
 		cards, _ := v.db.Analysis().ListRadarCards(ctx, demoID)
 		for _, c := range cards {
-			v.radarBySteam[c.SteamID64] = c
+			radarBySteam[c.SteamID64] = c
 		}
-	} else {
-		demos, _ := v.db.Demos().List(ctx)
-		var all []storage.HighlightClip
-		for _, d := range demos {
-			allMedia, _ := v.db.Media().ListByDemo(ctx, d.ID)
-			for _, mv := range allMedia {
-				v.videosByID[mv.ID] = mv
-			}
-			cs, _ := v.db.Analysis().ListHighlightClips(ctx, d.ID)
-			all = append(all, cs...)
-			cards, _ := v.db.Analysis().ListRadarCards(ctx, d.ID)
-			for _, c := range cards {
-				v.radarBySteam[c.SteamID64] = c
-			}
-		}
-		v.clips = all
 	}
+
+	if v.playerWidget != nil {
+		v.playerWidget.Close()
+	}
+	v.mu.Lock()
+	v.demoID = demoID
+	v.demo = demo
+	v.videosByID = videosByID
+	v.radarBySteam = radarBySteam
+	v.clips = clips
+	v.selectedClipID = ""
+	v.mu.Unlock()
 	return nil
 }
 
 // SetExportProgress updates the live montage export status from IPC events.
 func (v *View) SetExportProgress(status string, progress float64, msg string) {
+	v.mu.Lock()
 	v.exportStatus = status
 	v.exportProgress = progress
 	if msg != "" {
 		v.statusMsg = msg
 	}
+	v.mu.Unlock()
 }
 
 // FilterClips filters HighlightClip items purely in-memory.
 func FilterClips(clips []storage.HighlightClip, f HighlightFilter) []storage.HighlightClip {
 	pq := strings.ToLower(strings.TrimSpace(f.PlayerQuery))
+	if pq == "全部选手" {
+		pq = ""
+	}
 	tq := strings.ToLower(strings.TrimSpace(f.TagQuery))
+	if tq == "全部标签" {
+		tq = ""
+	}
 	out := make([]storage.HighlightClip, 0, len(clips))
 	for _, c := range clips {
 		if f.FavoritesOnly && !c.IsFavorite {
@@ -168,6 +182,64 @@ func FilterClips(clips []storage.HighlightClip, f HighlightFilter) []storage.Hig
 		out = append(out, c)
 	}
 	return out
+}
+
+func (v *View) playerOptions() []string {
+	v.mu.RLock()
+	clips := v.clips
+	v.mu.RUnlock()
+	seen := map[string]bool{}
+	var items []string
+	for _, c := range clips {
+		name := strings.TrimSpace(c.PlayerName)
+		if name != "" && !seen[name] {
+			seen[name] = true
+			items = append(items, name)
+		}
+	}
+	sort.Strings(items)
+	return append([]string{"全部选手"}, items...)
+}
+
+func (v *View) clipTypeOptions() []string {
+	v.mu.RLock()
+	clips := v.clips
+	v.mu.RUnlock()
+	seen := map[string]bool{}
+	var items []string
+	for _, c := range clips {
+		ct := strings.TrimSpace(c.ClipType)
+		if ct != "" && !seen[ct] {
+			seen[ct] = true
+			items = append(items, ct)
+		}
+	}
+	for _, def := range []string{"ace", "4k", "3k", "2k", "clutch", "defuse", "one_tap", "knife", "long_range", "noscope", "airborne"} {
+		if !seen[def] {
+			seen[def] = true
+			items = append(items, def)
+		}
+	}
+	sort.Strings(items)
+	return append([]string{"全部类型"}, items...)
+}
+
+func (v *View) tagOptions() []string {
+	v.mu.RLock()
+	clips := v.clips
+	v.mu.RUnlock()
+	seen := map[string]bool{}
+	var items []string
+	for _, c := range clips {
+		for _, t := range theme.ParseTags(c.TagsJSON) {
+			if t != "" && !seen[t] {
+				seen[t] = true
+				items = append(items, t)
+			}
+		}
+	}
+	sort.Strings(items)
+	return append([]string{"全部标签"}, items...)
 }
 
 // BuildMontageSpec assembles a composer.MontageSpec from ordered MontageItems and workbench options.
@@ -228,17 +300,43 @@ func BuildMontageSpec(
 
 // Render draws the Highlight Library and Montage Workbench tabs.
 func (v *View) Render(c *ui.Context) {
-	ui.Column(c).Fill().Padding(16).Gap(12).Children(func() {
-		theme.RowCenter(c).FillWidth().Gap(8).Children(func() {
-			if theme.TabButton(c, "1. 精彩片段库 (Highlight Library)", v.activeTab == "library").Clicked() {
-				v.activeTab = "library"
+	v.mu.RLock()
+	demoID := v.demoID
+	demo := v.demo
+	clipCount := len(v.clips)
+	statusMsg := v.statusMsg
+	v.mu.RUnlock()
+
+	if demoID <= 0 {
+		ui.Column(c).Fill().Center().Padding(32).Children(func() {
+			ui.Box(c).Width(460).Children(func() {
+				theme.EmptyStateCard(c, theme.IconHighlights, "尚未选择比赛", "请先在比赛资料库选择一场比赛，以查看该场次的精彩片段。")
+			})
+		})
+		return
+	}
+
+	ui.Column(c).Fill().Padding(14).Gap(14).Children(func() {
+		if demo != nil {
+			mapName := "未知地图"
+			if demo.MapName != nil {
+				mapName = *demo.MapName
 			}
-			if theme.TabButton(c, fmt.Sprintf("2. 合辑创作工作台 (%d 段)", len(v.montageItems)), v.activeTab == "montage").Clicked() {
-				v.activeTab = "montage"
-			}
+			theme.RenderMapScoreBanner(c, mapName, demo.TeamAName, demo.TeamBName, demo.TeamAScore, demo.TeamBScore, func() {
+				theme.PillBadge(c, fmt.Sprintf("精彩片段 %d  •  合辑 %d 段", clipCount, len(v.montageItems)), theme.AccentAmber)
+			})
+		}
+
+		theme.RowCenter(c).FillWidth().Gap(10).Children(func() {
+			theme.SegmentedControl(c, []theme.SegmentItem{
+				{Key: "library", Label: "1. 精彩片段库", Icon: theme.IconHighlights},
+				{Key: "montage", Label: fmt.Sprintf("2. 合辑创作工作台 (%d 段)", len(v.montageItems)), Icon: theme.IconFilm},
+			}, v.activeTab, func(k string) {
+				v.activeTab = k
+			})
 			ui.Spacer(c)
-			if v.statusMsg != "" {
-				theme.MutedText(c, v.statusMsg)
+			if statusMsg != "" {
+				theme.PillBadge(c, statusMsg, theme.AccentCyan)
 			}
 		})
 
@@ -251,25 +349,27 @@ func (v *View) Render(c *ui.Context) {
 }
 
 func (v *View) renderLibrary(c *ui.Context) {
-	theme.Card(c, func() {
+	v.mu.RLock()
+	clips := v.clips
+	v.mu.RUnlock()
+
+	theme.GlassCard(c, func() {
 		theme.RowCenter(c).FillWidth().Gap(8).Children(func() {
-			ui.TextInput(c, &v.filter.PlayerQuery).Width(180).Placeholder("按选手筛选")
-			ui.Select(c, &v.filter.ClipType, []string{"全部类型", "multi_kill", "ace", "clutch", "opening_kill", "utility"})
-			ui.TextInput(c, &v.filter.TagQuery).Width(180).Placeholder("按标签筛选 (如 4K, 1v3)")
+			ui.Select(c, &v.filter.PlayerQuery, v.playerOptions())
+			ui.Select(c, &v.filter.ClipType, v.clipTypeOptions())
+			ui.Select(c, &v.filter.TagQuery, v.tagOptions())
 			ui.Checkbox(c, &v.filter.RenderedOnly, "仅看已生成视频")
 			ui.Checkbox(c, &v.filter.FavoritesOnly, "仅看收藏")
 		})
 	})
 
-	filtered := FilterClips(v.clips, v.filter)
-	ui.Row(c).FillWidth().Grow(1).MinHeight(0).Gap(12).Children(func() {
+	filtered := FilterClips(clips, v.filter)
+	ui.Row(c).FillWidth().Grow(1).MinHeight(0).Gap(14).Children(func() {
 		ui.Column(c).Width(420).FillHeight().MinHeight(0).Children(func() {
 			ui.Scroll(c).FillWidth().Grow(1).MinHeight(0).Children(func() {
-				ui.Column(c).FillWidth().Gap(8).Children(func() {
+				ui.Column(c).FillWidth().Gap(10).Children(func() {
 					if len(filtered) == 0 {
-						theme.Card(c, func() {
-							theme.MutedText(c, "暂无符合条件的高光片段")
-						})
+						theme.EmptyStateCard(c, theme.IconHighlights, "暂无符合条件的高光片段", "调整上方筛选条件或等待后台解析完成。")
 						return
 					}
 					for _, clip := range filtered {
@@ -286,16 +386,20 @@ func (v *View) renderLibrary(c *ui.Context) {
 
 func (v *View) renderClipCard(c *ui.Context, clip storage.HighlightClip) {
 	ready := clip.MediaVideoID != nil && *clip.MediaVideoID > 0
-	card := theme.Card(c, func() {
+	var accent ui.Color
+	if clip.ID == v.selectedClipID {
+		accent = theme.AccentAmber
+	}
+	theme.BentoCard(c, accent, 14, func() {
 		theme.RowCenter(c).FillWidth().Gap(8).Children(func() {
-			theme.ScoreText(c, fmt.Sprintf("R%d", clip.RoundNumber)).FontSize(14).TextColor(theme.AccentAmber)
+			theme.ScoreText(c, fmt.Sprintf("R%d", clip.RoundNumber)).FontSize(16).TextColor(theme.AccentAmber)
 			ui.Text(c, clip.PlayerName).FontSize(14).Bold().TextColor(theme.TextPrimary)
 			theme.MutedText(c, theme.ClipTypeLabel(clip.ClipType))
 			ui.Spacer(c)
 			if ready {
-				theme.Capsule(c, "已生成 MP4", theme.StatusGreen)
+				theme.PillBadge(c, "已生成 MP4", theme.StatusGreen)
 			} else {
-				theme.Capsule(c, "未渲染", theme.StatusGray)
+				theme.PillBadge(c, "未渲染", theme.StatusGray)
 			}
 		})
 		tags := theme.ParseTags(clip.TagsJSON)
@@ -303,28 +407,41 @@ func (v *View) renderClipCard(c *ui.Context, clip storage.HighlightClip) {
 			ui.ScrollHorizontal(c).FillWidth().Children(func() {
 				theme.RowCenter(c).Gap(6).Children(func() {
 					for _, tag := range tags {
-						ui.Box(c).Shrink(0).Background(theme.BgInput).Radius(10).PaddingX(9).PaddingY(3).Children(func() {
-							ui.Text(c, tag).Font("Rajdhani").FontSize(11).Bold().TextColor(theme.AccentCyan)
-						})
+						ui.Box(c).Shrink(0).
+							Background(ui.RGBA(34, 211, 238, 0.12)).
+							Border(1, ui.RGBA(34, 211, 238, 0.28)).
+							Radius(999).
+							PaddingX(10).
+							PaddingY(3).
+							Children(func() {
+								ui.Text(c, tag).Font("Rajdhani").FontSize(11).Bold().TextColor(theme.AccentCyan)
+							})
 					}
 				})
 			})
 		}
 		theme.RowCenter(c).Gap(6).Children(func() {
-			if theme.ActionButton(c, "预览/裁剪").Clicked() {
+			if theme.IconActionButton(c, theme.IconPlay, "预览/裁剪").Clicked() {
+				v.mu.Lock()
 				v.selectedClipID = clip.ID
+				mv, ok := storage.MediaVideo{}, false
 				if ready {
-					if mv, ok := v.videosByID[*clip.MediaVideoID]; ok {
-						v.playerWidget.Load(mv.FilePath, mv.DurationSec, clip.StartTick, clip.EndTick, 64, 0)
-					}
+					mv, ok = v.videosByID[*clip.MediaVideoID]
+				}
+				v.mu.Unlock()
+				if ready && ok {
+					v.playerWidget.Load(mv.FilePath, mv.DurationSec, clip.StartTick, clip.EndTick, 64, 0)
 				} else {
 					v.playerWidget.Close()
 				}
 			}
 			if ready {
-				if theme.AccentButton(c, "加入合辑").Clicked() {
-					if mv, ok := v.videosByID[*clip.MediaVideoID]; ok {
-						rc := v.radarBySteam[clip.PlayerSteamID64]
+				if theme.IconAccentButton(c, theme.IconPlus, "加入合辑").Clicked() {
+					v.mu.RLock()
+					mv, ok := v.videosByID[*clip.MediaVideoID]
+					rc := v.radarBySteam[clip.PlayerSteamID64]
+					v.mu.RUnlock()
+					if ok {
 						radarPath := rc.StaticImagePath
 						if rc.AnimVideoPath != nil && *rc.AnimVideoPath != "" {
 							radarPath = *rc.AnimVideoPath
@@ -335,14 +452,16 @@ func (v *View) renderClipCard(c *ui.Context, clip storage.HighlightClip) {
 							TrimEndSec:     mv.DurationSec,
 							RadarMediaPath: radarPath,
 						})
+						v.mu.Lock()
 						v.statusMsg = "已加入合辑工作台: " + clip.PlayerName
+						v.mu.Unlock()
 					}
 				}
 			} else {
-				if theme.ActionButton(c, "加入渲染队列").Clicked() {
+				if theme.IconActionButton(c, theme.IconPlus, "加入渲染队列").Clicked() {
 					v.enqueueClip(clip)
 				}
-				if theme.AccentButton(c, "立即渲染").Clicked() {
+				if theme.IconAccentButton(c, theme.IconBolt, "立即渲染").Clicked() {
 					v.enqueueClip(clip)
 					if v.onStartRender != nil {
 						v.onStartRender()
@@ -351,16 +470,19 @@ func (v *View) renderClipCard(c *ui.Context, clip storage.HighlightClip) {
 			}
 		})
 	})
-	if clip.ID == v.selectedClipID {
-		_ = card.Border(1, theme.AccentAmber)
-	}
 }
 
 func (v *View) renderClipPreview(c *ui.Context) {
+	v.mu.RLock()
+	clips := v.clips
+	selectedClipID := v.selectedClipID
+	v.mu.RUnlock()
+
 	var selected *storage.HighlightClip
-	for i := range v.clips {
-		if v.clips[i].ID == v.selectedClipID {
-			selected = &v.clips[i]
+	for i := range clips {
+		if clips[i].ID == selectedClipID {
+			cp := clips[i]
+			selected = &cp
 			break
 		}
 	}
@@ -428,6 +550,9 @@ func (v *View) renderWorkbench(c *ui.Context) {
 							})
 							return
 						}
+						moveUpIdx := -1
+						moveDownIdx := -1
+						removeIdx := -1
 						for idx := range v.montageItems {
 							it := &v.montageItems[idx]
 							ui.Column(c).FillWidth().Background(theme.BgInput).Border(1, theme.BorderSubtle).Radius(6).Padding(10).Gap(8).Children(func() {
@@ -438,13 +563,13 @@ func (v *View) renderWorkbench(c *ui.Context) {
 										FontSize(13).Bold().TextColor(theme.TextPrimary)
 									ui.Spacer(c)
 									if idx > 0 && theme.ActionButton(c, "上移").Clicked() {
-										v.montageItems[idx-1], v.montageItems[idx] = v.montageItems[idx], v.montageItems[idx-1]
+										moveUpIdx = idx
 									}
 									if idx < len(v.montageItems)-1 && theme.ActionButton(c, "下移").Clicked() {
-										v.montageItems[idx+1], v.montageItems[idx] = v.montageItems[idx], v.montageItems[idx+1]
+										moveDownIdx = idx
 									}
 									if theme.DangerButton(c, "移除").Clicked() {
-										v.montageItems = append(v.montageItems[:idx], v.montageItems[idx+1:]...)
+										removeIdx = idx
 									}
 								})
 								theme.RowCenter(c).FillWidth().Gap(8).Children(func() {
@@ -453,6 +578,13 @@ func (v *View) renderWorkbench(c *ui.Context) {
 									ui.TextInput(c, &it.Subtitle).Width(220).Placeholder("自定义字幕条...")
 								})
 							})
+						}
+						if removeIdx >= 0 && removeIdx < len(v.montageItems) {
+							v.montageItems = append(v.montageItems[:removeIdx], v.montageItems[removeIdx+1:]...)
+						} else if moveUpIdx > 0 && moveUpIdx < len(v.montageItems) {
+							v.montageItems[moveUpIdx-1], v.montageItems[moveUpIdx] = v.montageItems[moveUpIdx], v.montageItems[moveUpIdx-1]
+						} else if moveDownIdx >= 0 && moveDownIdx < len(v.montageItems)-1 {
+							v.montageItems[moveDownIdx+1], v.montageItems[moveDownIdx] = v.montageItems[moveDownIdx], v.montageItems[moveDownIdx+1]
 						}
 					})
 				})
@@ -472,19 +604,28 @@ func (v *View) renderWorkbench(c *ui.Context) {
 				})
 				ui.Checkbox(c, &v.showNameCard, "开启左下角选手信息卡")
 				ui.TextInput(c, &v.outputPath).FillWidth().Placeholder("导出路径 (留空自动生成)")
-				if v.exportStatus != "" {
-					theme.Capsule(c, fmt.Sprintf("%s %.0f%%", v.exportStatus, v.exportProgress*100), theme.AccentCyan)
+				v.mu.RLock()
+				exportStatus := v.exportStatus
+				exportProgress := v.exportProgress
+				demoID := v.demoID
+				v.mu.RUnlock()
+				if exportStatus != "" {
+					theme.Capsule(c, fmt.Sprintf("%s %.0f%%", exportStatus, exportProgress*100), theme.AccentCyan)
 				}
 				if theme.AccentButton(c, "导出合辑 MP4").Clicked() && len(v.montageItems) > 0 && v.agent != nil {
-					spec := BuildMontageSpec(v.demoID, v.title, v.introPath, v.outroPath, v.bgmPath, v.outputPath,
+					spec := BuildMontageSpec(demoID, v.title, v.introPath, v.outroPath, v.bgmPath, v.outputPath,
 						v.clipVol, v.bgmVol, v.transition, v.transitionDur, v.showNameCard, v.montageItems)
 					var res map[string]any
 					if err := v.agent.Call(context.Background(), "montage.export", map[string]any{"spec": spec}, &res); err != nil {
+						v.mu.Lock()
 						v.statusMsg = "导出启动失败: " + err.Error()
+						v.mu.Unlock()
 					} else {
+						v.mu.Lock()
 						v.exportStatus = "running"
 						v.exportProgress = 0.05
 						v.statusMsg = "后台 FFmpeg 正在合成合辑..."
+						v.mu.Unlock()
 					}
 				}
 			})

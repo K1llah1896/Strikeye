@@ -1,10 +1,12 @@
 package settings
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"testing"
 
+	"github.com/egoist/mygo/ui"
 	"strikeye/internal/config"
 )
 
@@ -28,5 +30,48 @@ func TestApplyChoicesAndStorageMaintenance(t *testing.T) {
 	removed, err := CleanInvalidCache(tmp)
 	if err != nil || removed != 1 {
 		t.Fatalf("expected 1 removed temp cache file, got removed=%d err=%v", removed, err)
+	}
+}
+
+func TestSaveWatchDirsButtonPersistsConfig(t *testing.T) {
+	tmp := t.TempDir()
+	v := NewView(nil, nil, tmp)
+	v.watchDirsTx = "\"D:\\CS2\\replays\"\r\nE:\\FaceitDemos\r\n"
+
+	tt := ui.NewTester(v.Render, 1100, 800)
+	tt.Frame()
+	if err := tt.Click("保存监听目录"); err != nil {
+		t.Fatalf("Click 保存监听目录 failed: %v", err)
+	}
+	tt.Frame()
+
+	loaded, _, err := config.Load(tmp)
+	if err != nil {
+		t.Fatalf("config.Load failed: %v", err)
+	}
+	if len(loaded.DemoWatchDirs) != 2 || loaded.DemoWatchDirs[0] != `D:\CS2\replays` || loaded.DemoWatchDirs[1] != `E:\FaceitDemos` {
+		t.Fatalf("unexpected persisted DemoWatchDirs: %+v", loaded.DemoWatchDirs)
+	}
+	_ = v.Reload(context.Background())
+	if v.watchDirsTx == "" {
+		t.Fatalf("expected watchDirsTx restored on Reload")
+	}
+}
+
+func TestStatusBannerDismissesOnClick(t *testing.T) {
+	v := NewView(nil, nil, t.TempDir())
+	v.setStatus("配置已保存")
+
+	tt := ui.NewTester(v.Render, 1100, 800)
+	tt.Frame()
+	if !tt.HasText("配置已保存") {
+		t.Fatalf("expected status banner to be visible")
+	}
+	if err := tt.Click("关闭"); err != nil {
+		t.Fatalf("click 关闭 failed: %v", err)
+	}
+	tt.Frame()
+	if tt.HasText("配置已保存") {
+		t.Fatalf("expected status banner to disappear after clicking 关闭")
 	}
 }

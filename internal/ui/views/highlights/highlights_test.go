@@ -3,6 +3,7 @@ package highlights
 import (
 	"testing"
 
+	"github.com/egoist/mygo/ui"
 	"strikeye/internal/storage"
 )
 
@@ -34,5 +35,25 @@ func TestFilterClipsAndBuildMontageSpec(t *testing.T) {
 	}
 	if spec.Clips[0].NameCard == nil || spec.Clips[0].NameCard.PlayerName != "donk" {
 		t.Fatalf("expected lower-third name card for donk")
+	}
+}
+
+func TestRemoveMontageItemDoesNotPanic(t *testing.T) {
+	v := NewView(nil, nil, "", nil)
+	v.demoID = 1
+	v.activeTab = "montage"
+	v.montageItems = []MontageItem{
+		{Clip: storage.HighlightClip{ID: "c1", PlayerName: "donk", RoundNumber: 1, ClipType: "ace"}},
+		{Clip: storage.HighlightClip{ID: "c2", PlayerName: "sh1ro", RoundNumber: 2, ClipType: "clutch"}},
+	}
+
+	tt := ui.NewTester(v.Render, 1100, 700)
+	tt.Frame()
+	if err := tt.Click("移除"); err != nil {
+		t.Fatalf("click 移除 failed: %v", err)
+	}
+	tt.Frame()
+	if len(v.montageItems) != 1 {
+		t.Fatalf("expected 1 montage item remaining after remove, got %d", len(v.montageItems))
 	}
 }

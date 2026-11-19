@@ -350,7 +350,9 @@ func (w *VideoPlayerWidget) Render(c *ui.Context, anchors []TimelineAnchor, enab
 	}
 
 	pos := p.Position().Seconds()
+	w.mu.Lock()
 	w.seekSec = pos
+	w.mu.Unlock()
 
 	videoH := float32(420)
 	if fs {
@@ -358,7 +360,7 @@ func (w *VideoPlayerWidget) Render(c *ui.Context, anchors []TimelineAnchor, enab
 	}
 
 	ui.Column(c).FillWidth().Gap(8).Children(func() {
-		ui.Column(c).FillWidth().Height(videoH).Background(theme.BgBase).Radius(12).Clip().Center().Children(func() {
+		ui.Column(c).FillWidth().Height(videoH).Background(theme.BgBase).Border(1, theme.RimBorder).Radius(18).Clip().Center().Children(func() {
 			ui.Video(c, p).Fill()
 		})
 

@@ -11,6 +11,7 @@ import (
 
 	"github.com/egoist/mygo/ui"
 	"github.com/fogleman/gg"
+	xdraw "golang.org/x/image/draw"
 	"strikeye/assets/maps"
 	"strikeye/internal/parser"
 	"strikeye/internal/ui/theme"
@@ -27,14 +28,17 @@ type HeatmapPoint struct {
 // Radar2DCanvas renders 32Hz CS2RPL01 tactical replay frames and KDE heatmaps
 // onto a MyGo ui.Bitmap backed by assets/maps or a procedural coordinate grid.
 type Radar2DCanvas struct {
-	mu         sync.Mutex
-	mapName    string
-	lowerLayer bool
-	meta       maps.MapMeta
-	bgImage    image.Image
-	bgCache    *image.RGBA
-	bitmap     *ui.Bitmap
-	size       int
+	mu           sync.Mutex
+	bmpMu        sync.Mutex
+	mapName      string
+	lowerLayer   bool
+	meta         maps.MapMeta
+	bgImage      image.Image
+	bgCache      *image.RGBA
+	bitmap       *ui.Bitmap // owned and mutated exclusively on the UI main thread in RenderUI
+	pendingImg   image.Image
+	pendingDirty bool
+	size         int
 }
 
 // NewRadar2DCanvas constructs a square 2D radar canvas of size x size pixels.
@@ -49,6 +53,10 @@ func NewRadar2DCanvas(size int) *Radar2DCanvas {
 // and immediately renders the base radar backdrop so empty replay states are never blank.
 func (r *Radar2DCanvas) ConfigureMap(mapName string, lower bool, fallbackBounds [4]float64) {
 	r.mu.Lock()
+	if r.bgCache != nil && r.mapName == mapName && r.lowerLayer == lower {
+		r.mu.Unlock()
+		return
+	}
 	r.mapName = mapName
 	r.lowerLayer = lower
 	if meta, ok := maps.LookupMap(mapName); ok {
@@ -73,6 +81,18 @@ func (r *Radar2DCanvas) ensureBgCacheLocked() {
 		return
 	}
 	rgba := image.NewRGBA(image.Rect(0, 0, r.size, r.size))
+	// Fast obsidian fill
+	for i := 0; i < len(rgba.Pix); i += 4 {
+		rgba.Pix[i] = 11
+		rgba.Pix[i+1] = 15
+		rgba.Pix[i+2] = 23
+		rgba.Pix[i+3] = 255
+	}
+	if r.bgImage != nil {
+		xdraw.ApproxBiLinear.Scale(rgba, rgba.Bounds(), r.bgImage, r.bgImage.Bounds(), xdraw.Over, nil)
+		r.bgCache = rgba
+		return
+	}
 	dc := gg.NewContextForRGBA(rgba)
 	r.drawBackground(dc)
 	r.bgCache = rgba
@@ -111,8 +131,15 @@ func (r *Radar2DCanvas) drawBackground(dc *gg.Context) {
 	dc.Stroke()
 }
 
+func validRadarPt(px, py, s float64) bool {
+	if math.IsNaN(px) || math.IsInf(px, 0) || math.IsNaN(py) || math.IsInf(py, 0) {
+		return false
+	}
+	return px >= -s && px <= 2*s && py >= -s && py <= 2*s
+}
+
 // RenderReplayFrame rasterizes one 32Hz ReplayFrame plus active grenades/smokes/infernos
-// and updates the internal GPU bitmap.
+// and stages the resulting RGBA image for main-thread GPU bitmap upload.
 func (r *Radar2DCanvas) RenderReplayFrame(round parser.ReplayRoundData, frameIdx int) image.Image {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -125,19 +152,24 @@ func (r *Radar2DCanvas) RenderReplayFrame(round parser.ReplayRoundData, frameIdx
 		tick := frame.Tick
 
 		// 1. Smokes (144 CS2 units radius)
-		for _, sm := range round.Smokes {
-			if tick < sm.StartTick || tick > sm.EndTick {
-				continue
+		rad := (144.0 / math.Max(1, r.meta.Scale)) * (s / 1024.0)
+		if !math.IsNaN(rad) && !math.IsInf(rad, 0) && rad > 0 && rad <= s {
+			for _, sm := range round.Smokes {
+				if tick < sm.StartTick || tick > sm.EndTick {
+					continue
+				}
+				px, py := maps.WorldToRadar(r.meta, float64(sm.Pos.X), float64(sm.Pos.Y), s, s)
+				if !validRadarPt(px, py, s) {
+					continue
+				}
+				dc.SetRGBA(0.75, 0.80, 0.88, 0.45)
+				dc.DrawCircle(px, py, rad)
+				dc.Fill()
+				dc.SetRGBA(0.90, 0.95, 1.0, 0.75)
+				dc.SetLineWidth(1.5)
+				dc.DrawCircle(px, py, rad)
+				dc.Stroke()
 			}
-			px, py := maps.WorldToRadar(r.meta, float64(sm.Pos.X), float64(sm.Pos.Y), s, s)
-			rad := (144.0 / math.Max(1, r.meta.Scale)) * (s / 1024.0)
-			dc.SetRGBA(0.75, 0.80, 0.88, 0.45)
-			dc.DrawCircle(px, py, rad)
-			dc.Fill()
-			dc.SetRGBA(0.90, 0.95, 1.0, 0.75)
-			dc.SetLineWidth(1.5)
-			dc.DrawCircle(px, py, rad)
-			dc.Stroke()
 		}
 
 		// 2. Infernos / Molotov convex hulls
@@ -145,20 +177,29 @@ func (r *Radar2DCanvas) RenderReplayFrame(round parser.ReplayRoundData, frameIdx
 			if tick < inf.StartTick || tick > inf.EndTick || len(inf.Hull) < 3 {
 				continue
 			}
-			for i, pt := range inf.Hull {
+			ptsAdded := 0
+			for _, pt := range inf.Hull {
 				px, py := maps.WorldToRadar(r.meta, float64(pt.X), float64(pt.Y), s, s)
-				if i == 0 {
+				if !validRadarPt(px, py, s) {
+					continue
+				}
+				if ptsAdded == 0 {
 					dc.MoveTo(px, py)
 				} else {
 					dc.LineTo(px, py)
 				}
+				ptsAdded++
 			}
-			dc.ClosePath()
-			dc.SetRGBA(0.96, 0.38, 0.12, 0.42)
-			dc.FillPreserve()
-			dc.SetRGBA(0.98, 0.55, 0.15, 0.85)
-			dc.SetLineWidth(1.5)
-			dc.Stroke()
+			if ptsAdded >= 3 {
+				dc.ClosePath()
+				dc.SetRGBA(0.96, 0.38, 0.12, 0.42)
+				dc.FillPreserve()
+				dc.SetRGBA(0.98, 0.55, 0.15, 0.85)
+				dc.SetLineWidth(1.5)
+				dc.Stroke()
+			} else if ptsAdded > 0 {
+				dc.ClearPath()
+			}
 		}
 
 		// 3. Grenade flight arcs
@@ -166,29 +207,37 @@ func (r *Radar2DCanvas) RenderReplayFrame(round parser.ReplayRoundData, frameIdx
 			if tick < g.ThrowTick || tick > g.EndTick || len(g.Points) < 2 {
 				continue
 			}
-			started := false
+			ptsAdded := 0
 			for _, pt := range g.Points {
 				if pt.Tick > tick {
 					break
 				}
 				px, py := maps.WorldToRadar(r.meta, float64(pt.Pos.X), float64(pt.Pos.Y), s, s)
-				if !started {
+				if !validRadarPt(px, py, s) {
+					continue
+				}
+				if ptsAdded == 0 {
 					dc.MoveTo(px, py)
-					started = true
 				} else {
 					dc.LineTo(px, py)
 				}
+				ptsAdded++
 			}
-			if started {
+			if ptsAdded >= 2 {
 				dc.SetRGBA(0.22, 0.74, 0.97, 0.85)
 				dc.SetLineWidth(1.8)
 				dc.Stroke()
+			} else if ptsAdded > 0 {
+				dc.ClearPath()
 			}
 		}
 
 		// 4. Players (view cone, health ring, flash ring, C4 indicator)
 		for _, p := range frame.Players {
 			px, py := maps.WorldToRadar(r.meta, float64(p.X), float64(p.Y), s, s)
+			if !validRadarPt(px, py, s) {
+				continue
+			}
 			if !p.Alive {
 				dc.SetRGBA(0.45, 0.50, 0.58, 0.65)
 				dc.SetLineWidth(1.5)
@@ -199,14 +248,16 @@ func (r *Radar2DCanvas) RenderReplayFrame(round parser.ReplayRoundData, frameIdx
 			}
 
 			// View cone (yaw in degrees, CS2 Y is inverted on radar)
-			yawRad := -float64(p.Yaw) * math.Pi / 180.0
-			coneLen := 22.0
-			dc.SetRGBA(1, 1, 1, 0.16)
-			dc.MoveTo(px, py)
-			dc.LineTo(px+math.Cos(yawRad-0.35)*coneLen, py+math.Sin(yawRad-0.35)*coneLen)
-			dc.LineTo(px+math.Cos(yawRad+0.35)*coneLen, py+math.Sin(yawRad+0.35)*coneLen)
-			dc.ClosePath()
-			dc.Fill()
+			if !math.IsNaN(float64(p.Yaw)) && !math.IsInf(float64(p.Yaw), 0) {
+				yawRad := -float64(p.Yaw) * math.Pi / 180.0
+				coneLen := 22.0
+				dc.SetRGBA(1, 1, 1, 0.16)
+				dc.MoveTo(px, py)
+				dc.LineTo(px+math.Cos(yawRad-0.35)*coneLen, py+math.Sin(yawRad-0.35)*coneLen)
+				dc.LineTo(px+math.Cos(yawRad+0.35)*coneLen, py+math.Sin(yawRad+0.35)*coneLen)
+				dc.ClosePath()
+				dc.Fill()
+			}
 
 			// Team color dot
 			if p.Team == 1 {
@@ -245,15 +296,21 @@ func (r *Radar2DCanvas) RenderReplayFrame(round parser.ReplayRoundData, frameIdx
 	}
 
 	img := dc.Image()
-	if r.bitmap == nil {
-		r.bitmap = ui.NewBitmap(img)
-	} else {
-		r.bitmap.Update(img)
-	}
+	r.updateBitmap(img)
 	return img
 }
 
-// ComputeKDEGrid builds a normalized [0,1] 2D kernel density grid from world samples.
+func (r *Radar2DCanvas) updateBitmap(img image.Image) {
+	// Never create or mutate ui.Bitmap off the main UI thread; stage the latest image
+	// so RenderUI uploads it safely on the main thread.
+	r.bmpMu.Lock()
+	r.pendingImg = img
+	r.pendingDirty = true
+	r.bmpMu.Unlock()
+}
+
+// ComputeKDEGrid builds a normalized [0,1] 2D kernel density grid from world samples
+// using a histogram + separable 1D Gaussian convolution so runtime is O(N + gridRes^2 * radius).
 func ComputeKDEGrid(meta maps.MapMeta, points []HeatmapPoint, gridRes int, bandwidth float64) [][]float64 {
 	if gridRes <= 0 {
 		gridRes = 64
@@ -271,74 +328,153 @@ func ComputeKDEGrid(meta maps.MapMeta, points []HeatmapPoint, gridRes int, bandw
 
 	radius := int(math.Ceil(bandwidth * 2.5))
 	twoSigmaSq := 2 * bandwidth * bandwidth
-	maxVal := 0.0
 
+	// 1. Accumulate weights onto a 2D histogram (O(N), zero math.Exp calls).
+	hist := make([]float64, gridRes*gridRes)
+	hasAny := false
+	resF := float64(gridRes)
 	for _, pt := range points {
-		gx, gy := maps.WorldToRadar(meta, pt.X, pt.Y, float64(gridRes), float64(gridRes))
-		w := pt.Weight
-		if w <= 0 {
-			w = 1
+		if math.IsNaN(pt.X) || math.IsInf(pt.X, 0) || math.IsNaN(pt.Y) || math.IsInf(pt.Y, 0) {
+			continue
+		}
+		gx, gy := maps.WorldToRadar(meta, pt.X, pt.Y, resF, resF)
+		if math.IsNaN(gx) || math.IsInf(gx, 0) || math.IsNaN(gy) || math.IsInf(gy, 0) {
+			continue
 		}
 		cx, cy := int(math.Round(gx)), int(math.Round(gy))
-		for dy := -radius; dy <= radius; dy++ {
-			ny := cy + dy
-			if ny < 0 || ny >= gridRes {
+		if cx < -radius || cx >= gridRes+radius || cy < -radius || cy >= gridRes+radius {
+			continue
+		}
+		w := pt.Weight
+		if w <= 0 || math.IsNaN(w) || math.IsInf(w, 0) {
+			w = 1
+		}
+		if cx >= 0 && cx < gridRes && cy >= 0 && cy < gridRes {
+			hist[cy*gridRes+cx] += w
+			hasAny = true
+		}
+	}
+	if !hasAny {
+		return grid
+	}
+
+	// 2. Precompute 1D Gaussian kernel (only radius+1 math.Exp calls).
+	kernel := make([]float64, radius+1)
+	for d := 0; d <= radius; d++ {
+		kernel[d] = math.Exp(-float64(d*d) / twoSigmaSq)
+	}
+
+	// 3. Horizontal 1D pass: hist -> tmp.
+	tmp := make([]float64, gridRes*gridRes)
+	for y := 0; y < gridRes; y++ {
+		row := y * gridRes
+		for x := 0; x < gridRes; x++ {
+			v := hist[row+x]
+			if v == 0 {
 				continue
 			}
-			for dx := -radius; dx <= radius; dx++ {
-				nx := cx + dx
-				if nx < 0 || nx >= gridRes {
-					continue
+			x0 := x - radius
+			if x0 < 0 {
+				x0 = 0
+			}
+			x1 := x + radius
+			if x1 >= gridRes {
+				x1 = gridRes - 1
+			}
+			for nx := x0; nx <= x1; nx++ {
+				dx := nx - x
+				if dx < 0 {
+					dx = -dx
 				}
-				d2 := float64(dx*dx + dy*dy)
-				val := w * math.Exp(-d2/twoSigmaSq)
-				grid[ny][nx] += val
-				if grid[ny][nx] > maxVal {
-					maxVal = grid[ny][nx]
-				}
+				tmp[row+nx] += v * kernel[dx]
 			}
 		}
 	}
-	if maxVal > 0 {
-		for y := 0; y < gridRes; y++ {
+
+	// 4. Vertical 1D pass: tmp -> grid, tracking maxVal.
+	maxVal := 0.0
+	for y := 0; y < gridRes; y++ {
+		y0 := y - radius
+		if y0 < 0 {
+			y0 = 0
+		}
+		y1 := y + radius
+		if y1 >= gridRes {
+			y1 = gridRes - 1
+		}
+		outRow := grid[y]
+		for ny := y0; ny <= y1; ny++ {
+			dy := ny - y
+			if dy < 0 {
+				dy = -dy
+			}
+			k := kernel[dy]
+			srcRow := tmp[ny*gridRes : (ny+1)*gridRes]
 			for x := 0; x < gridRes; x++ {
-				grid[y][x] /= maxVal
+				if srcRow[x] == 0 {
+					continue
+				}
+				outRow[x] += srcRow[x] * k
+			}
+		}
+		for x := 0; x < gridRes; x++ {
+			if outRow[x] > maxVal {
+				maxVal = outRow[x]
+			}
+		}
+	}
+
+	if maxVal > 0 {
+		invMax := 1.0 / maxVal
+		for y := 0; y < gridRes; y++ {
+			row := grid[y]
+			for x := 0; x < gridRes; x++ {
+				row[x] *= invMax
 			}
 		}
 	}
 	return grid
 }
 
-// RenderHeatmap rasterizes a KDE heatmap overlay onto the map background.
+// RenderHeatmap rasterizes a KDE heatmap overlay onto the map background using direct pixel blending.
 func (r *Radar2DCanvas) RenderHeatmap(points []HeatmapPoint) image.Image {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	dc := r.newFrameContextLocked()
+	r.ensureBgCacheLocked()
+	dst := image.NewRGBA(image.Rect(0, 0, r.size, r.size))
+	copy(dst.Pix, r.bgCache.Pix)
 
 	const gridRes = 96
 	grid := ComputeKDEGrid(r.meta, points, gridRes, 2.2)
-	cellW := float64(r.size) / float64(gridRes)
-	for gy := 0; gy < gridRes; gy++ {
-		for gx := 0; gx < gridRes; gx++ {
+	for py := 0; py < r.size; py++ {
+		gy := py * gridRes / r.size
+		if gy >= gridRes {
+			gy = gridRes - 1
+		}
+		rowOff := py * dst.Stride
+		for px := 0; px < r.size; px++ {
+			gx := px * gridRes / r.size
+			if gx >= gridRes {
+				gx = gridRes - 1
+			}
 			v := grid[gy][gx]
 			if v < 0.04 {
 				continue
 			}
 			c := thermalColor(v)
-			dc.SetColor(c)
-			dc.DrawRectangle(float64(gx)*cellW, float64(gy)*cellW, cellW+0.5, cellW+0.5)
-			dc.Fill()
+			a := uint32(c.A)
+			inv := 255 - a
+			idx := rowOff + px*4
+			dst.Pix[idx] = uint8((uint32(dst.Pix[idx])*inv + uint32(c.R)*a) / 255)
+			dst.Pix[idx+1] = uint8((uint32(dst.Pix[idx+1])*inv + uint32(c.G)*a) / 255)
+			dst.Pix[idx+2] = uint8((uint32(dst.Pix[idx+2])*inv + uint32(c.B)*a) / 255)
+			dst.Pix[idx+3] = 255
 		}
 	}
 
-	img := dc.Image()
-	if r.bitmap == nil {
-		r.bitmap = ui.NewBitmap(img)
-	} else {
-		r.bitmap.Update(img)
-	}
-	return img
+	r.updateBitmap(dst)
+	return dst
 }
 
 func thermalColor(v float64) color.NRGBA {
@@ -355,15 +491,34 @@ func thermalColor(v float64) color.NRGBA {
 }
 
 // RenderUI displays the cached bitmap inside a MyGo Native UI container.
+// It flushes any staged raster image into ui.Bitmap on the main UI thread.
 func (r *Radar2DCanvas) RenderUI(c *ui.Context, displaySize float32) {
-	r.mu.Lock()
+	r.bmpMu.Lock()
+	if r.pendingDirty && r.pendingImg != nil {
+		if r.bitmap == nil {
+			r.bitmap = ui.NewBitmap(r.pendingImg)
+		} else {
+			r.bitmap.Update(r.pendingImg)
+		}
+		r.pendingImg = nil
+		r.pendingDirty = false
+	}
 	bmp := r.bitmap
-	r.mu.Unlock()
+	r.bmpMu.Unlock()
 	if bmp == nil {
-		ui.Column(c).Width(displaySize).Height(displaySize).Background(theme.BgBase).Radius(12).Center().Children(func() {
-			theme.MutedText(c, "等待加载 2D 雷达数据...")
-		})
+		ui.Column(c).Width(displaySize).Height(displaySize).
+			Background(theme.BgInput).
+			Border(1, theme.RimBorder).
+			Radius(18).
+			Center().
+			Gap(8).
+			Children(func() {
+				theme.RenderIcon(c, theme.IconRadar, 26, theme.TextMuted)
+				theme.MutedText(c, "等待加载 2D 雷达数据...")
+			})
 		return
 	}
-	ui.Image(c, bmp).Width(displaySize).Height(displaySize).Radius(12).Clip()
+	ui.Box(c).Width(displaySize).Height(displaySize).Radius(18).Border(1, theme.RimBorder).Clip().Children(func() {
+		ui.Image(c, bmp).Fill()
+	})
 }

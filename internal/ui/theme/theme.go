@@ -26,17 +26,18 @@ func ColorEffect(pos vec2, color vec4) vec4 {
 }
 `)
 
-// Default Pure Black + Emerald Green color tokens.
+// Default Spatial Obsidian color tokens.
 var (
-	BgBase       = ui.Hex("#000000") // Pure black OLED background
-	BgSurface    = ui.Hex("#09090B") // Card & panel background
-	BgElevated   = ui.Hex("#141418") // Hover / elevated panel
-	BgInput      = ui.Hex("#050507") // Input / dark control surface
-	BorderSubtle = ui.Hex("#222228") // Subtle card border
-	TextPrimary  = ui.Hex("#FAFAFA") // Crisp primary text
-	TextMuted    = ui.Hex("#8E8E98") // Secondary label text
-	AccentAmber  = ui.Hex("#22C55E") // Primary highlight / action accent (emerald green)
-	AccentCyan   = ui.Hex("#38BDF8") // Secondary data / active accent
+	BgBase       = ui.Hex("#05070B") // Deep obsidian spatial canvas
+	BgSurface    = ui.RGBA(15, 20, 30, 0.78) // Translucent glass card surface
+	BgElevated   = ui.RGBA(24, 32, 48, 0.86) // Hover / elevated glass panel
+	BgInput      = ui.RGBA(9, 13, 21, 0.85)  // Input / recessed glass well
+	BorderSubtle = ui.RGBA(255, 255, 255, 0.09) // Luminous hairline glass rim
+	RimBorder    = ui.RGBA(255, 255, 255, 0.09) // Specular glass edge highlight
+	TextPrimary  = ui.Hex("#F8FAFC") // Crisp primary text
+	TextMuted    = ui.Hex("#8B98AD") // Secondary label text
+	AccentAmber  = ui.Hex("#38BDF8") // Primary highlight / action accent (ice cyan)
+	AccentCyan   = ui.Hex("#22D3EE") // Secondary data / active accent
 	StatusGreen  = ui.Hex("#22C55E") // Ready / verified
 	StatusYellow = ui.Hex("#EAB308") // Queued / pending
 	StatusRed    = ui.Hex("#EF4444") // Failed / error
@@ -46,16 +47,24 @@ var (
 
 	themeMu        sync.RWMutex
 	activeIsDark   = true
-	accentHover    = ui.Hex("#4ADE80")
-	accentPressed  = ui.Hex("#16A34A")
-	accentText     = ui.Hex("#000000")
-	overlayColor   = ui.RGBA(0, 0, 0, 0.72)
+	accentHover    = ui.Hex("#7DD3FC")
+	accentPressed  = ui.Hex("#0284C7")
+	accentText     = ui.Hex("#05070B")
+	overlayColor   = ui.RGBA(5, 7, 11, 0.72)
 	bgImagePath    string
 	bgBitmap       *ui.Bitmap
-	hasGradient    bool
-	bgGradient     ui.LinearGradient
+	hasGradient    = true
+	bgGradient     = ui.LinearGradient{
+		Angle: 135,
+		Stops: []ui.GradientStop{
+			{Color: ui.Hex("#05070B"), At: 0},
+			{Color: ui.Hex("#0A1222"), At: 0.52},
+			{Color: ui.Hex("#060911"), At: 1},
+		},
+		Oklab: true,
+	}
 	activePreset   = config.ThemePresetPureBlack
-	activeCardOpac = 0.90
+	activeCardOpac = 0.78
 )
 
 // PresetSpec defines a built-in Strikeye color palette preset.
@@ -92,16 +101,17 @@ func Presets() []PresetSpec {
 		},
 		{
 			ID:           config.ThemePresetPureBlack,
-			Label:        "极致全黑 (Pure Black)",
+			Label:        "空间黑曜石 (Spatial Obsidian)",
 			Dark:         true,
-			BgBase:       "#000000",
-			BgSurface:    "#09090B",
-			BgElevated:   "#141418",
-			BgInput:      "#050507",
-			BorderSubtle: "#222228",
-			TextPrimary:  "#FAFAFA",
-			TextMuted:    "#8E8E98",
-			Accent:       "#22C55E",
+			BgBase:       "#05070B",
+			BgSurface:    "#0F141E",
+			BgElevated:   "#182030",
+			BgInput:      "#090D15",
+			BorderSubtle: "#1F2937",
+			TextPrimary:  "#F8FAFC",
+			TextMuted:    "#8B98AD",
+			Accent:       "#38BDF8",
+			Gradient:     []string{"#05070B", "#0A1222", "#060911"},
 		},
 		{
 			ID:           config.ThemePresetGradientAurora,
@@ -303,12 +313,13 @@ func Apply(cfg config.ThemeConfig) {
 	BgElevated = elevated
 	BgInput = input
 	BorderSubtle = ui.Hex(p.BorderSubtle)
+	if p.Dark {
+		RimBorder = ui.RGBA(255, 255, 255, 0.09)
+	} else {
+		RimBorder = ui.RGBA(15, 23, 42, 0.10)
+	}
 	if bgBitmap != nil || hasGradient {
-		if p.Dark {
-			BorderSubtle = ui.RGBA(255, 255, 255, 0.14)
-		} else {
-			BorderSubtle = ui.RGBA(15, 23, 42, 0.12)
-		}
+		BorderSubtle = RimBorder
 	}
 	TextPrimary = ui.Hex(p.TextPrimary)
 	TextMuted = ui.Hex(p.TextMuted)
@@ -444,18 +455,180 @@ func StatusDot(c *ui.Context, col ui.Color, size float32) ui.Element {
 	return ui.Box(c).Width(size).Height(size).Radius(size / 2).Background(col)
 }
 
-// Card renders a frosted-glass / esports surface container with subtle border and padding.
-func Card(c *ui.Context, fn func()) ui.Element {
+// AmbientBackdrop renders the Spatial Glass background layer: either the user's
+// custom background image with readability overlay, or the procedural obsidian
+// gradient with soft blurred radial ambient glow orbs.
+func AmbientBackdrop(c *ui.Context) {
+	bmp, overlayCol := BackgroundBitmap()
+	grad, hasGrad := BackgroundGradient()
+	themeMu.RLock()
+	dark := activeIsDark
+	accent := AccentAmber
+	cyan := AccentCyan
+	base := BgBase
+	themeMu.RUnlock()
+
+	if bmp != nil {
+		ui.Box(c).Fill().IgnoreInput(true).Children(func() {
+			ui.Image(c, bmp).Fill().Fit(ui.Cover)
+			ui.Box(c).Absolute().Left(0).Top(0).Right(0).Bottom(0).Background(overlayCol)
+		})
+		return
+	}
+
+	ui.Box(c).Fill().IgnoreInput(true).Children(func() {
+		if hasGrad {
+			ui.Box(c).Fill().LinearGradient(grad)
+		} else {
+			ui.Box(c).Fill().Background(base)
+		}
+		if dark {
+			// Top-left accent ambient glow orb
+			ui.Box(c).Absolute().Left(-140).Top(-160).Width(620).Height(620).Radius(310).
+				RadialGradient(ui.RadialGradient{
+					Stops: []ui.GradientStop{
+						{Color: withAlpha(accent, 0.16), At: 0},
+						{Color: withAlpha(accent, 0.05), At: 0.55},
+						{Color: ui.Transparent, At: 1},
+					},
+				}).Blur(60)
+			// Bottom-right secondary cyan/indigo ambient glow orb
+			ui.Box(c).Absolute().Right(-140).Bottom(-180).Width(680).Height(680).Radius(340).
+				RadialGradient(ui.RadialGradient{
+					Stops: []ui.GradientStop{
+						{Color: withAlpha(cyan, 0.12), At: 0},
+						{Color: withAlpha(ui.Hex("#6366F1"), 0.06), At: 0.52},
+						{Color: ui.Transparent, At: 1},
+					},
+				}).Blur(70)
+		}
+	})
+}
+
+// GlassCard renders a Spatial Glass container with luminous hairline rim,
+// rounded corners, soft depth shadow, and backdrop blur when active.
+func GlassCard(c *ui.Context, fn func()) ui.Element {
+	themeMu.RLock()
+	dark := activeIsDark
+	rim := RimBorder
+	themeMu.RUnlock()
+
 	el := ui.Column(c).
 		Background(BgSurface).
-		Border(1, BorderSubtle).
-		Radius(16).
-		Padding(14).
-		Gap(10)
-	if bmp, _ := BackgroundBitmap(); bmp != nil || hasGradient || c.Vibrancy() {
-		el = el.Effect(GlassEffect())
+		Border(1, rim).
+		Radius(20).
+		Padding(16).
+		Gap(12)
+	if dark {
+		el = el.Shadow(0, 12, 32, -6, ui.RGBA(0, 0, 0, 0.48))
+	} else {
+		el = el.Shadow(0, 8, 24, -4, ui.RGBA(15, 23, 42, 0.08))
 	}
 	return el.Children(fn)
+}
+
+// BentoCard renders a Bento 2.0 modular glass tile with configurable padding and optional accent glow rim.
+func BentoCard(c *ui.Context, accent ui.Color, padding float32, fn func()) ui.Element {
+	themeMu.RLock()
+	dark := activeIsDark
+	rim := RimBorder
+	themeMu.RUnlock()
+
+	if accent.A > 0 {
+		rim = withAlpha(accent, 0.30)
+	}
+	el := ui.Column(c).
+		Background(BgSurface).
+		Border(1, rim).
+		Radius(20).
+		Padding(padding).
+		Gap(10)
+	if dark {
+		el = el.Shadow(0, 10, 26, -4, ui.RGBA(0, 0, 0, 0.42))
+	}
+	return el.Children(fn)
+}
+
+// Card renders a Spatial Glass surface container (alias of GlassCard for compatibility).
+func Card(c *ui.Context, fn func()) ui.Element {
+	return GlassCard(c, fn)
+}
+
+// StatTile renders a Bento KPI metric tile with uppercase label, large Rajdhani number, and subtle accent bar.
+func StatTile(c *ui.Context, label, value, sub string, accent ui.Color) ui.Element {
+	return BentoCard(c, accent, 14, func() {
+		RowCenter(c).FillWidth().Gap(6).Children(func() {
+			ui.Box(c).Width(6).Height(6).Radius(3).Background(accent)
+			ui.Text(c, strings.ToUpper(label)).Font("Rajdhani").FontSize(11).Bold().LetterSpacing(1.1).TextColor(TextMuted)
+			ui.Spacer(c)
+		})
+		ScoreText(c, value).FontSize(28).TextColor(TextPrimary)
+		if sub != "" {
+			ui.Text(c, sub).FontSize(11).TextColor(TextMuted)
+		}
+	})
+}
+
+// SegmentItem defines one option inside a SegmentedControl pill switcher.
+type SegmentItem struct {
+	Key   string
+	Label string
+	Icon  *ui.SVG
+}
+
+// SegmentedControl renders a modern floating pill segmented tab switcher.
+func SegmentedControl(c *ui.Context, items []SegmentItem, activeKey string, onSelect func(string)) ui.Element {
+	themeMu.RLock()
+	rim := RimBorder
+	themeMu.RUnlock()
+
+	return RowCenter(c).
+		Background(BgInput).
+		Border(1, rim).
+		Radius(14).
+		Padding(4).
+		Gap(4).
+		Children(func() {
+			for _, item := range items {
+				active := item.Key == activeKey
+				bg := ui.Transparent
+				fg := TextMuted
+				borderCol := ui.Transparent
+				if active {
+					bg = withAlpha(AccentAmber, 0.18)
+					fg = TextPrimary
+					borderCol = withAlpha(AccentAmber, 0.36)
+				}
+				btn := ui.ButtonBase(c).
+					Radius(10).
+					PaddingX(12).
+					PaddingY(6).
+					Gap(6).
+					AlignItems(ui.Center).
+					Children(func() {
+						if item.Icon != nil {
+							iconCol := TextMuted
+							if active {
+								iconCol = AccentAmber
+							}
+							RenderIcon(c, item.Icon, 14, iconCol)
+						}
+						ui.Text(c, item.Label).FontSize(12).Bold().TextColor(fg)
+					}).
+					Cursor(ui.CursorPointer).
+					Transition(ui.ElementTransition{Duration: 130 * time.Millisecond, Ease: ui.EaseOut})
+				if btn.Pressed() {
+					btn = btn.Background(BgSurface).Border(1, withAlpha(AccentAmber, 0.45))
+				} else if btn.Hovered() {
+					btn = btn.Background(BgElevated).Border(1, withAlpha(AccentAmber, 0.30))
+				} else {
+					btn = btn.Background(bg).Border(1, borderCol)
+				}
+				if btn.Clicked() && onSelect != nil {
+					onSelect(item.Key)
+				}
+			}
+		})
 }
 
 // SectionTitle renders a bold section heading in primary text color.
@@ -468,13 +641,13 @@ func MutedText(c *ui.Context, text string) ui.Element {
 	return ui.Text(c, text).FontSize(12).TextColor(TextMuted)
 }
 
-// Capsule renders a compact status badge with a tinted border and label.
-func Capsule(c *ui.Context, label string, accent ui.Color) ui.Element {
+// PillBadge renders a translucent glowing status pill without heavy solid borders.
+func PillBadge(c *ui.Context, label string, accent ui.Color) ui.Element {
 	return RowCenter(c).
 		Shrink(0).
-		Background(BgInput).
-		Border(1, accent).
-		Radius(12).
+		Background(withAlpha(accent, 0.14)).
+		Border(1, withAlpha(accent, 0.30)).
+		Radius(999).
 		PaddingX(10).
 		PaddingY(4).
 		Gap(6).
@@ -482,6 +655,32 @@ func Capsule(c *ui.Context, label string, accent ui.Color) ui.Element {
 			StatusDot(c, accent, 6)
 			ui.Text(c, label).FontSize(11).Bold().TextColor(accent)
 		})
+}
+
+// Capsule renders a compact status pill badge (delegates to PillBadge).
+func Capsule(c *ui.Context, label string, accent ui.Color) ui.Element {
+	return PillBadge(c, label, accent)
+}
+
+// EmptyStateCard renders a structured Spatial Glass empty-state guide with a centered vector icon.
+func EmptyStateCard(c *ui.Context, icon *ui.SVG, title, subtitle string) ui.Element {
+	return GlassCard(c, func() {
+		ui.Column(c).FillWidth().AlignItems(ui.Center).PaddingY(24).Gap(10).Children(func() {
+			if icon != nil {
+				ui.Box(c).Width(44).Height(44).Radius(22).
+					Background(withAlpha(AccentAmber, 0.12)).
+					Border(1, withAlpha(AccentAmber, 0.25)).
+					Center().
+					Children(func() {
+						RenderIcon(c, icon, 22, AccentAmber)
+					})
+			}
+			SectionTitle(c, title)
+			if subtitle != "" {
+				ui.Text(c, subtitle).FontSize(12).TextColor(TextMuted)
+			}
+		})
+	})
 }
 
 func withButtonMotion(el ui.Element, baseBg, hoverBg, pressBg ui.Color, hasBorder bool, baseBorder, hoverBorder ui.Color) ui.Element {
@@ -508,14 +707,60 @@ func withButtonMotion(el ui.Element, baseBg, hoverBg, pressBg ui.Color, hasBorde
 	return el
 }
 
-// ActionButton renders a themed secondary action button with hover/press motion.
+// ActionButton renders a themed secondary glass action button with hover/press motion.
 func ActionButton(c *ui.Context, label string) ui.Element {
+	themeMu.RLock()
+	rim := RimBorder
+	themeMu.RUnlock()
 	el := ui.Button(c, label).
-		Radius(10).
-		PaddingX(12).
-		PaddingY(6).
+		Radius(12).
+		PaddingX(13).
+		PaddingY(7).
 		TextColor(TextPrimary)
-	return withButtonMotion(el, BgElevated, adjustLuminance(BgElevated, 1.25), BgSurface, true, BorderSubtle, AccentAmber)
+	return withButtonMotion(el, BgElevated, adjustLuminance(BgElevated, 1.25), BgSurface, true, rim, withAlpha(AccentAmber, 0.55))
+}
+
+// IconActionButton renders a secondary glass action button with a leading vector SVG icon.
+func IconActionButton(c *ui.Context, icon *ui.SVG, label string) ui.Element {
+	themeMu.RLock()
+	rim := RimBorder
+	themeMu.RUnlock()
+	el := ui.ButtonBase(c).
+		Radius(12).
+		PaddingX(12).
+		PaddingY(7).
+		Gap(7).
+		AlignItems(ui.Center).
+		Children(func() {
+			if icon != nil {
+				RenderIcon(c, icon, 15, TextMuted)
+			}
+			ui.Text(c, label).FontSize(12).Bold().TextColor(TextPrimary)
+		})
+	return withButtonMotion(el, BgElevated, adjustLuminance(BgElevated, 1.25), BgSurface, true, rim, withAlpha(AccentAmber, 0.55))
+}
+
+// IconButton renders a compact square glass icon button with an optional unread indicator dot.
+func IconButton(c *ui.Context, icon *ui.SVG, badgeDot bool) ui.Element {
+	themeMu.RLock()
+	rim := RimBorder
+	themeMu.RUnlock()
+	el := ui.ButtonBase(c).
+		Width(34).
+		Height(34).
+		Radius(11).
+		Center().
+		Children(func() {
+			ui.Box(c).Width(20).Height(20).Center().Children(func() {
+				if icon != nil {
+					RenderIcon(c, icon, 16, TextPrimary)
+				}
+				if badgeDot {
+					ui.Box(c).Absolute().Right(0).Top(0).Width(7).Height(7).Radius(3.5).Background(AccentAmber)
+				}
+			})
+		})
+	return withButtonMotion(el, BgElevated, adjustLuminance(BgElevated, 1.25), BgSurface, true, rim, withAlpha(AccentAmber, 0.55))
 }
 
 // AccentButton renders a high-visibility primary action button with hover/press motion.
@@ -526,10 +771,32 @@ func AccentButton(c *ui.Context, label string) ui.Element {
 	pr := accentPressed
 	themeMu.RUnlock()
 	el := ui.PrimaryButton(c, label).
-		Radius(10).
-		PaddingX(14).
+		Radius(12).
+		PaddingX(15).
 		PaddingY(7).
 		TextColor(fg)
+	return withButtonMotion(el, AccentAmber, hv, pr, false, ui.Transparent, ui.Transparent)
+}
+
+// IconAccentButton renders a primary action button with a leading vector SVG icon.
+func IconAccentButton(c *ui.Context, icon *ui.SVG, label string) ui.Element {
+	themeMu.RLock()
+	fg := accentText
+	hv := accentHover
+	pr := accentPressed
+	themeMu.RUnlock()
+	el := ui.ButtonBase(c).
+		Radius(12).
+		PaddingX(14).
+		PaddingY(7).
+		Gap(7).
+		AlignItems(ui.Center).
+		Children(func() {
+			if icon != nil {
+				RenderIcon(c, icon, 15, fg)
+			}
+			ui.Text(c, label).FontSize(12).Bold().TextColor(fg)
+		})
 	return withButtonMotion(el, AccentAmber, hv, pr, false, ui.Transparent, ui.Transparent)
 }
 
@@ -554,6 +821,7 @@ func ProgressBar(c *ui.Context, progress float64, label string) ui.Element {
 		}
 		ui.Row(c).FillWidth().Height(9).Background(BgInput).Border(1, BorderSubtle).Radius(5).Clip().Children(func() {
 			if indeterminate {
+				c.Invalidate()
 				phase := float32((time.Now().UnixMilli()%1200))/1200.0 * 0.72
 				ui.Box(c).Grow(phase)
 				ui.Box(c).FillHeight().Grow(0.28).Background(AccentAmber).Radius(4)
@@ -603,35 +871,52 @@ func TabButton(c *ui.Context, label string, active bool) ui.Element {
 	return withButtonMotion(el, bg, BgElevated, BgSurface, false, ui.Transparent, ui.Transparent)
 }
 
-// NavButton renders a two-tier sidebar navigation item with an active accent bar.
+// NavButton renders a two-tier sidebar navigation item (kept for compatibility).
 func NavButton(c *ui.Context, title, subtitle string, active bool) ui.Element {
-	bg := BgSurface
-	border := BgSurface
-	bar := ui.Transparent
+	return NavButtonWithIcon(c, nil, title, subtitle, active)
+}
+
+// NavButtonWithIcon renders a Spatial Glass pill navigation item with an inline SVG icon and active glow.
+func NavButtonWithIcon(c *ui.Context, icon *ui.SVG, title, subtitle string, active bool) ui.Element {
+	bg := ui.Transparent
+	border := ui.Transparent
 	titleCol := TextMuted
 	subCol := StatusGray
+	iconCol := TextMuted
+	iconBg := withAlpha(TextMuted, 0.08)
 	if active {
-		bg = BgElevated
-		border = BorderSubtle
-		bar = AccentAmber
+		bg = withAlpha(AccentAmber, 0.14)
+		border = withAlpha(AccentAmber, 0.34)
 		titleCol = TextPrimary
 		subCol = AccentAmber
+		iconCol = AccentAmber
+		iconBg = withAlpha(AccentAmber, 0.20)
 	}
 	el := ui.ButtonBase(c).
 		FillWidth().
-		Radius(10).
+		Radius(14).
 		PaddingX(10).
 		PaddingY(9).
 		Gap(10).
 		AlignItems(ui.Center).
 		Children(func() {
-			ui.Box(c).Width(3).Height(26).Radius(2).Background(bar)
-			ui.Column(c).FillWidth().Gap(2).Children(func() {
+			if icon != nil {
+				ui.Box(c).Width(32).Height(32).Radius(10).Background(iconBg).Center().Children(func() {
+					RenderIcon(c, icon, 16, iconCol)
+				})
+			} else {
+				bar := ui.Transparent
+				if active {
+					bar = AccentAmber
+				}
+				ui.Box(c).Width(3).Height(26).Radius(2).Background(bar)
+			}
+			ui.Column(c).FillWidth().Gap(1).Children(func() {
 				ui.Text(c, title).FontSize(13).Bold().TextColor(titleCol)
-				ui.Text(c, subtitle).Font("Rajdhani").FontSize(10).LetterSpacing(0.8).TextColor(subCol)
+				ui.Text(c, subtitle).Font("Rajdhani").FontSize(10).LetterSpacing(0.9).TextColor(subCol)
 			})
 		})
-	return withButtonMotion(el, bg, BgElevated, BgSurface, true, border, BorderSubtle)
+	return withButtonMotion(el, bg, BgElevated, BgSurface, true, border, withAlpha(AccentAmber, 0.30))
 }
 
 // ParseStatusColor maps a demo parse_status value to its semantic badge color.

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"sync"
 
 	"github.com/egoist/mygo/ui"
 	"strikeye/internal/parser"
@@ -34,6 +35,7 @@ type POVMediaState struct {
 
 // View manages Spectator state, POV switching, Event Timeline, and Key HUD.
 type View struct {
+	mu              sync.RWMutex
 	db              *storage.DB
 	agent           AgentCaller
 	ffmpegPath      string
@@ -85,51 +87,91 @@ func (v *View) SelectDemo(ctx context.Context, demoID int64) error {
 	if err != nil {
 		return err
 	}
-	v.demos = demos
 	var target *storage.Demo
 	for i := range demos {
 		if demos[i].ID == demoID {
-			target = &demos[i]
+			cp := demos[i]
+			target = &cp
 			break
 		}
 	}
 	if target == nil && len(demos) > 0 {
-		target = &demos[0]
+		cp := demos[0]
+		target = &cp
 	}
-	v.selectedDemo = target
 	if target == nil {
+		v.mu.Lock()
+		v.demos = demos
+		v.selectedDemo = nil
+		v.mu.Unlock()
 		return nil
 	}
-	v.players, _ = v.db.Analysis().ListMatchPlayers(ctx, target.ID)
-	v.rounds, _ = v.db.Analysis().ListMatchRounds(ctx, target.ID)
-	v.events, _ = v.db.Analysis().ListMatchEvents(ctx, target.ID, nil)
-	v.videos, _ = v.db.Media().ListByDemo(ctx, target.ID)
+	players, _ := v.db.Analysis().ListMatchPlayers(ctx, target.ID)
+	rounds, _ := v.db.Analysis().ListMatchRounds(ctx, target.ID)
+	events, _ := v.db.Analysis().ListMatchEvents(ctx, target.ID, nil)
+	videos, _ := v.db.Media().ListByDemo(ctx, target.ID)
 	queued, _ := v.db.RenderTasks().ListByStatus(ctx, "queued")
 	running, _ := v.db.RenderTasks().ListByStatus(ctx, "running")
-	v.tasks = append(queued, running...)
+	tasks := append(queued, running...)
 
-	if len(v.rounds) > 0 {
-		v.selectedRound = v.rounds[0].RoundNumber
+	selectedRound := 1
+	if len(rounds) > 0 {
+		selectedRound = rounds[0].RoundNumber
 	}
-	if v.selectedPOVKey == "" && len(v.players) > 0 {
-		v.selectedPOVKey = v.players[0].SteamID64
+	var replayHdr parser.ReplayHeader
+	var replayRd parser.ReplayRoundData
+	hasReplay := false
+	if target.ReplayCachePath != nil && *target.ReplayCachePath != "" {
+		if hdr, rd, rerr := parser.ReadReplayRound(*target.ReplayCachePath, uint32(selectedRound)); rerr == nil {
+			replayHdr = hdr
+			replayRd = rd
+			hasReplay = true
+		}
 	}
-	v.loadReplayRound()
+
+	v.mu.Lock()
+	v.demos = demos
+	v.selectedDemo = target
+	v.players = players
+	v.rounds = rounds
+	v.events = events
+	v.videos = videos
+	v.tasks = tasks
+	v.selectedRound = selectedRound
+	if v.selectedPOVKey == "" && len(players) > 0 {
+		v.selectedPOVKey = players[0].SteamID64
+	}
+	v.replayHeader = replayHdr
+	v.replayRound = replayRd
+	v.hasReplayRound = hasReplay
+	v.mu.Unlock()
+
 	v.syncVideoForSelection(0)
 	return nil
 }
 
 func (v *View) loadReplayRound() {
-	v.hasReplayRound = false
-	if v.selectedDemo == nil || v.selectedDemo.ReplayCachePath == nil || *v.selectedDemo.ReplayCachePath == "" {
+	v.mu.RLock()
+	demo := v.selectedDemo
+	roundNum := v.selectedRound
+	v.mu.RUnlock()
+
+	if demo == nil || demo.ReplayCachePath == nil || *demo.ReplayCachePath == "" {
+		v.mu.Lock()
+		v.hasReplayRound = false
+		v.mu.Unlock()
 		return
 	}
-	hdr, rd, err := parser.ReadReplayRound(*v.selectedDemo.ReplayCachePath, uint32(v.selectedRound))
+	hdr, rd, err := parser.ReadReplayRound(*demo.ReplayCachePath, uint32(roundNum))
+	v.mu.Lock()
 	if err == nil {
 		v.replayHeader = hdr
 		v.replayRound = rd
 		v.hasReplayRound = true
+	} else {
+		v.hasReplayRound = false
 	}
+	v.mu.Unlock()
 }
 
 // ResolvePOVStates computes strict real-MP4 vs queued vs unrendered state for all 10 players + Observer.
@@ -245,12 +287,22 @@ func (v *View) currentRoundBounds() (int64, int64, float64) {
 }
 
 func (v *View) syncVideoForSelection(preserveRelSec float64) {
-	if v.selectedDemo == nil {
+	v.mu.RLock()
+	demo := v.selectedDemo
+	players := v.players
+	videos := v.videos
+	tasks := v.tasks
+	events := v.events
+	selectedRound := v.selectedRound
+	selectedPOVKey := v.selectedPOVKey
+	v.mu.RUnlock()
+
+	if demo == nil {
 		return
 	}
-	states := ResolvePOVStates(v.players, v.videos, v.tasks, v.events, v.selectedDemo.ID, v.selectedRound)
+	states := ResolvePOVStates(players, videos, tasks, events, demo.ID, selectedRound)
 	for _, st := range states {
-		if st.Key != v.selectedPOVKey {
+		if st.Key != selectedPOVKey {
 			continue
 		}
 		if st.State == "ready" && st.Video != nil {
@@ -265,12 +317,16 @@ func (v *View) syncVideoForSelection(preserveRelSec float64) {
 			if dur <= 0 && endT > startT {
 				dur = float64(endT-startT) / tickRate
 			}
+			v.mu.Lock()
 			v.loadedVideoPath = st.Video.FilePath
+			v.mu.Unlock()
 			v.playerWidget.Load(st.Video.FilePath, dur, startT, endT, tickRate, preserveRelSec)
 			return
 		}
 	}
+	v.mu.Lock()
 	v.loadedVideoPath = ""
+	v.mu.Unlock()
 	v.playerWidget.Close()
 }
 
@@ -313,52 +369,89 @@ func (v *View) roundEventAnchors() []components.TimelineAnchor {
 
 // Render draws the Spectator round selector, video/empty-state viewport, Event Timeline, Key HUD, and 10-player POV list.
 func (v *View) Render(c *ui.Context) {
-	if v.selectedDemo == nil {
-		ui.Column(c).Fill().Center().Children(func() {
-			theme.MutedText(c, "请先在 Match Library 选择一场比赛进入独立观战")
+	v.mu.RLock()
+	demo := v.selectedDemo
+	players := v.players
+	rounds := v.rounds
+	events := v.events
+	videos := v.videos
+	tasks := v.tasks
+	selectedRound := v.selectedRound
+	selectedPOVKey := v.selectedPOVKey
+	hasReplayRound := v.hasReplayRound
+	replayHeader := v.replayHeader
+	replayRound := v.replayRound
+	v.mu.RUnlock()
+
+	if demo == nil {
+		ui.Column(c).Fill().Center().Padding(32).Children(func() {
+			ui.Box(c).Width(460).Children(func() {
+				theme.EmptyStateCard(c, theme.IconSpectator, "尚未选择比赛", "请先在比赛资料库选择一场比赛进入独立观战。")
+			})
 		})
 		return
 	}
 
-	povStates := ResolvePOVStates(v.players, v.videos, v.tasks, v.events, v.selectedDemo.ID, v.selectedRound)
+	povStates := ResolvePOVStates(players, videos, tasks, events, demo.ID, selectedRound)
 	var activePOV *POVMediaState
 	for i := range povStates {
-		if povStates[i].Key == v.selectedPOVKey {
+		if povStates[i].Key == selectedPOVKey {
 			activePOV = &povStates[i]
 			break
 		}
 	}
 
-	ui.Column(c).Fill().Padding(16).Gap(12).Children(func() {
-		// Top header + round selector
-		theme.Card(c, func() {
+	ui.Column(c).Fill().Padding(14).Gap(14).Children(func() {
+		// Match Hero summary banner (same component style as Match Library & Match Analysis)
+		mapLabel := "未知地图"
+		if demo.MapName != nil {
+			mapLabel = *demo.MapName
+		}
+		theme.RenderMapScoreBanner(c, mapLabel, demo.TeamAName, demo.TeamBName, demo.TeamAScore, demo.TeamBScore, func() {
+			theme.PillBadge(c, fmt.Sprintf("R%d  •  共 %d 回合", selectedRound, len(rounds)), theme.AccentAmber)
+		})
+
+		// Round selector pill track + Key HUD toggle
+		theme.GlassCard(c, func() {
 			theme.RowCenter(c).FillWidth().Gap(10).Children(func() {
-				mapLabel := "未知地图"
-				if v.selectedDemo.MapName != nil {
-					mapLabel = *v.selectedDemo.MapName
-				}
-				theme.Capsule(c, strings.ToUpper(mapLabel), theme.AccentAmber)
-				ui.Text(c, v.selectedDemo.TeamAName).FontSize(14).Bold().TextColor(theme.TeamCT)
-				theme.ScoreText(c, fmt.Sprintf("%d : %d", v.selectedDemo.TeamAScore, v.selectedDemo.TeamBScore)).FontSize(18).TextColor(theme.TextPrimary)
-				ui.Text(c, v.selectedDemo.TeamBName).FontSize(14).Bold().TextColor(theme.TeamT)
-				ui.Spacer(c)
-				ui.Checkbox(c, &v.showKeyHUD, "显示实时按键 HUD")
-			})
-			theme.RowCenter(c).FillWidth().Gap(8).Children(func() {
-				ui.ScrollHorizontal(c).FillWidth().Children(func() {
-					theme.RowCenter(c).Gap(4).PaddingY(2).Children(func() {
-						for _, r := range v.rounds {
-							if theme.TabButton(c, fmt.Sprintf("R%d", r.RoundNumber), r.RoundNumber == v.selectedRound).Clicked() {
+				ui.ScrollHorizontal(c).FillWidth().Grow(1).MinWidth(0).Children(func() {
+					theme.RowCenter(c).Gap(6).PaddingY(2).Children(func() {
+						for _, r := range rounds {
+							active := r.RoundNumber == selectedRound
+							bg := theme.BgInput
+							fg := theme.TextMuted
+							borderCol := ui.Transparent
+							if active {
+								bg = ui.RGBA(56, 189, 248, 0.18)
+								fg = theme.TextPrimary
+								borderCol = ui.RGBA(56, 189, 248, 0.42)
+							}
+							pill := ui.ButtonBase(c).
+								Background(bg).
+								Border(1, borderCol).
+								Radius(999).
+								PaddingX(10).
+								PaddingY(4).
+								Children(func() {
+									el := theme.StatText(c, fmt.Sprintf("R%d", r.RoundNumber)).FontSize(11).TextColor(fg)
+									if active {
+										el.Bold()
+									}
+								})
+							if pill.Clicked() {
+								v.mu.Lock()
 								v.selectedRound = r.RoundNumber
+								v.mu.Unlock()
 								v.loadReplayRound()
 								v.syncVideoForSelection(0)
 							}
 						}
 					})
 				})
-				if len(v.rounds) > 16 {
-					theme.StatText(c, fmt.Sprintf("共 %d 回合 ›", len(v.rounds))).Shrink(0).FontSize(11).TextColor(theme.TextMuted)
+				if len(rounds) > 16 {
+					theme.StatText(c, fmt.Sprintf("共 %d 回合 ›", len(rounds))).Shrink(0).FontSize(11).TextColor(theme.TextMuted)
 				}
+				ui.Checkbox(c, &v.showKeyHUD, "显示实时按键 HUD")
 			})
 		})
 
@@ -372,8 +465,8 @@ func (v *View) Render(c *ui.Context) {
 						tick := v.playerWidget.CurrentTick()
 						var buttons uint16
 						hasData := false
-						if v.hasReplayRound {
-							buttons, hasData = components.ResolveButtonsAtTick(v.replayRound.InputEdges, uint8(activePOV.SpecSlot), tick, v.replayHeader.InputCap)
+						if hasReplayRound {
+							buttons, hasData = components.ResolveButtonsAtTick(replayRound.InputEdges, uint8(activePOV.SpecSlot), tick, replayHeader.InputCap)
 						}
 						components.RenderKeyHUD(c, components.KeyHUDState{
 							Visible:    true,
@@ -456,7 +549,7 @@ func (v *View) renderPOVItem(c *ui.Context, st POVMediaState) {
 		stateText = "排队中"
 	}
 	bg := theme.BgInput
-	border := theme.BorderSubtle
+	border := theme.RimBorder
 	if st.Key == v.selectedPOVKey {
 		bg = theme.BgElevated
 		border = theme.AccentAmber
@@ -465,7 +558,7 @@ func (v *View) renderPOVItem(c *ui.Context, st POVMediaState) {
 		FillWidth().
 		Background(bg).
 		Border(1, border).
-		Radius(6).
+		Radius(12).
 		PaddingX(10).
 		PaddingY(8).
 		Gap(8).
@@ -490,27 +583,34 @@ func (v *View) renderPOVItem(c *ui.Context, st POVMediaState) {
 }
 
 func (v *View) renderUnrenderedCard(c *ui.Context, st POVMediaState) {
-	theme.Card(c, func() {
+	theme.GlassCard(c, func() {
 		ui.Column(c).FillWidth().Height(380).Center().Gap(14).Children(func() {
+			ui.Box(c).Width(46).Height(46).Radius(23).
+				Background(ui.RGBA(56, 189, 248, 0.12)).
+				Border(1, ui.RGBA(56, 189, 248, 0.25)).
+				Center().
+				Children(func() {
+					theme.RenderIcon(c, theme.IconFilm, 22, theme.AccentAmber)
+				})
 			stateLabel := "未生成独立视角视频"
 			if st.State == "queued" {
 				stateLabel = "排队渲染中"
 			} else if st.State == "running" {
 				stateLabel = "正在渲染中"
 			}
-			theme.Capsule(c, stateLabel, theme.MediaStatusColor(st.State))
+			theme.PillBadge(c, stateLabel, theme.MediaStatusColor(st.State))
 			theme.RowCenter(c).Gap(10).Children(func() {
-				theme.ScoreText(c, fmt.Sprintf("R%d", v.selectedRound)).FontSize(20).TextColor(theme.AccentAmber)
+				theme.ScoreText(c, fmt.Sprintf("R%d", v.selectedRound)).FontSize(24).TextColor(theme.AccentAmber)
 				ui.Text(c, st.Label).FontSize(18).Bold().TextColor(theme.TextPrimary)
 			})
 			theme.StatText(c, fmt.Sprintf("本回合战绩: %d 击杀  /  %d 阵亡", st.KillsRound, st.DeathsRnd)).
 				FontSize(13).TextColor(theme.TextMuted)
 			theme.MutedText(c, "Strikeye 严格区分真实 MP4 与未生成视角，不会拿其他视角视频冒充。")
 			theme.RowCenter(c).Gap(10).Children(func() {
-				if theme.ActionButton(c, "加入后台渲染队列").Clicked() {
+				if theme.IconActionButton(c, theme.IconPlus, "加入后台渲染队列").Clicked() {
 					v.enqueuePOV(st)
 				}
-				if theme.AccentButton(c, "立即启动 CS2 渲染此视角").Clicked() {
+				if theme.IconAccentButton(c, theme.IconBolt, "立即启动 CS2 渲染此视角").Clicked() {
 					v.enqueuePOV(st)
 					if v.onStartRender != nil {
 						v.onStartRender()

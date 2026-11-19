@@ -26,8 +26,15 @@ func TestRadarHexPreviewLoadAndReload(t *testing.T) {
 
 	prev := NewRadarHexPreview()
 	prev.SetCard(cardPath, false)
-	if prev.bitmap == nil || prev.loadErr != "" {
-		t.Fatalf("expected loaded bitmap, got err=%q", prev.loadErr)
+	if prev.pendingImg == nil || prev.loadErr != "" {
+		t.Fatalf("expected staged preview image, got err=%q", prev.loadErr)
+	}
+	prev.mu.Lock()
+	prev.flushPendingLocked()
+	bmp := prev.bitmap
+	prev.mu.Unlock()
+	if bmp == nil {
+		t.Fatalf("expected bitmap after main-thread flush")
 	}
 	prev.SetCard(filepath.Join(tmp, "missing.png"), false)
 	if prev.loadErr == "" {

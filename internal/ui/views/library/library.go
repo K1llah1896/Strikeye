@@ -9,8 +9,10 @@ import (
 	"sync"
 
 	"github.com/egoist/mygo/ui"
+	"strikeye/internal/config"
 	"strikeye/internal/storage"
 	"strikeye/internal/ui/theme"
+	"strikeye/internal/watcher"
 )
 
 // NavTarget identifies a destination view when clicking a match card quick action.
@@ -136,13 +138,18 @@ func (v *View) Refresh(ctx context.Context) error {
 			POVCount:       povCount,
 		})
 	}
+	v.mu.Lock()
 	v.entries = entries
+	v.mu.Unlock()
 	return nil
 }
 
 // FilteredEntries applies FilterCriteria to v.entries.
 func (v *View) FilteredEntries() []MatchEntry {
-	return FilterMatches(v.entries, v.filter)
+	v.mu.RLock()
+	entries := v.entries
+	v.mu.RUnlock()
+	return FilterMatches(entries, v.filter)
 }
 
 // FilterMatches filters MatchEntry items purely in-memory for deterministic UI updates & testing.
@@ -188,9 +195,12 @@ func FilterMatches(entries []MatchEntry, f FilterCriteria) []MatchEntry {
 }
 
 func (v *View) mapOptions() []string {
+	v.mu.RLock()
+	entries := v.entries
+	v.mu.RUnlock()
 	seen := map[string]bool{}
 	opts := []string{"全部地图"}
-	for _, e := range v.entries {
+	for _, e := range entries {
 		m := derefStr(e.Demo.MapName)
 		if m != "" && !seen[m] {
 			seen[m] = true
@@ -202,34 +212,35 @@ func (v *View) mapOptions() []string {
 
 // Render draws the Match Library toolbar and scrollable match cards.
 func (v *View) Render(c *ui.Context) {
-	ui.Column(c).Fill().Padding(16).Gap(12).Children(func() {
-		// Top toolbar
-		theme.Card(c, func() {
+	ui.Column(c).Fill().Padding(14).Gap(14).Children(func() {
+		// Floating glass filter capsule bar (2-row layout so action buttons never clip at narrower widths)
+		theme.GlassCard(c, func() {
 			theme.RowCenter(c).FillWidth().Gap(8).Children(func() {
-				ui.TextInput(c, &v.filter.Keyword).Width(240).Placeholder("搜索地图 / 选手 / 备注 / 文件名")
+				theme.RowCenter(c).Grow(1).MinWidth(180).Background(theme.BgInput).Border(1, theme.RimBorder).Radius(12).PaddingX(10).Gap(6).Children(func() {
+					theme.RenderIcon(c, theme.IconSearch, 14, theme.TextMuted)
+					ui.TextInput(c, &v.filter.Keyword).FillWidth().Placeholder("搜索地图 / 选手 / 备注 / 文件名")
+				})
+				if theme.IconActionButton(c, theme.IconPlus, "+ 手动导入 Demo").Shrink(0).Clicked() {
+					v.showManualImport = !v.showManualImport
+				}
+				if theme.IconActionButton(c, theme.IconRefresh, "刷新").Shrink(0).Clicked() {
+					v.scanAndRefresh(context.Background())
+				}
+				if theme.IconActionButton(c, theme.IconFolder, "配置监听目录").Shrink(0).Clicked() && v.onNavigate != nil {
+					v.onNavigate(NavSettings, 0)
+				}
+			})
+			theme.RowCenter(c).FillWidth().Gap(8).Children(func() {
 				ui.Select(c, &v.filter.Map, v.mapOptions())
 				ui.Select(c, &v.filter.Platform, []string{"全部平台", "valve", "faceit", "5e", "perfectworld", "custom"})
 				ui.Select(c, &v.filter.ParseStatus, []string{"全部状态", "ready", "parsing", "pending", "failed"})
 				ui.Checkbox(c, &v.filter.FavoritesOnly, "仅看收藏")
 				ui.Spacer(c)
-				if theme.ActionButton(c, "+ 手动导入 Demo").Clicked() {
-					v.showManualImport = !v.showManualImport
-				}
-				if theme.ActionButton(c, "刷新").Clicked() {
-					if v.agent != nil {
-						var res map[string]any
-						_ = v.agent.Call(context.Background(), "demo.scan", nil, &res)
-					}
-					_ = v.Refresh(context.Background())
-				}
-				if theme.ActionButton(c, "配置监听目录").Clicked() && v.onNavigate != nil {
-					v.onNavigate(NavSettings, 0)
-				}
 			})
 			if v.showManualImport {
 				theme.RowCenter(c).FillWidth().Gap(8).Children(func() {
 					ui.TextInput(c, &v.manualPath).FillWidth().Placeholder("输入本地 .dem 文件绝对路径以手动导入并解析")
-					if theme.AccentButton(c, "导入并解析").Clicked() && strings.TrimSpace(v.manualPath) != "" {
+					if theme.IconAccentButton(c, theme.IconPlus, "导入并解析").Clicked() && strings.TrimSpace(v.manualPath) != "" {
 						if v.agent != nil {
 							var res map[string]any
 							if err := v.agent.Call(context.Background(), "demo.parse", map[string]any{
@@ -254,14 +265,9 @@ func (v *View) Render(c *ui.Context) {
 		// Match card list
 		filtered := v.FilteredEntries()
 		ui.Scroll(c).FillWidth().Grow(1).MinHeight(0).Children(func() {
-			ui.Column(c).FillWidth().Gap(10).Children(func() {
+			ui.Column(c).FillWidth().Gap(12).Children(func() {
 				if len(filtered) == 0 {
-					theme.Card(c, func() {
-						ui.Column(c).FillWidth().Height(140).Center().Gap(6).Children(func() {
-							theme.SectionTitle(c, "暂无符合条件的比赛 Demo")
-							theme.MutedText(c, "请将 .dem 文件放入监听目录，或在上方输入本地路径手动添加。")
-						})
-					})
+					theme.EmptyStateCard(c, theme.IconLibrary, "暂无符合条件的比赛 Demo", "请将 .dem 文件放入监听目录，或在上方输入本地路径手动添加。")
 					return
 				}
 				for _, e := range filtered {
@@ -291,18 +297,17 @@ func (v *View) renderMatchCard(c *ui.Context, e MatchEntry) {
 		teamB = "TEAM T"
 	}
 
-	theme.Card(c, func() {
-		// Header metadata row
+	theme.BentoCard(c, ui.Color{}, 16, func() {
+		// Header metadata row (map badge removed; map identity lives in the scoreline hero banner)
 		theme.RowCenter(c).FillWidth().Gap(8).Children(func() {
-			theme.Capsule(c, strings.ToUpper(mapLabel), theme.AccentAmber)
 			ui.Text(c, title).FontSize(14).Bold().TextColor(theme.TextPrimary)
 			theme.StatText(c, fmt.Sprintf("%s  •  %.0fs  •  %d 回合", strings.ToUpper(d.SourcePlatform), d.DurationSec, d.TotalRounds)).
 				FontSize(12).TextColor(theme.TextMuted)
 			ui.Spacer(c)
 			if d.IsFavorite {
-				theme.Capsule(c, "已收藏", theme.AccentAmber)
+				theme.PillBadge(c, "已收藏", theme.AccentAmber)
 			}
-			theme.Capsule(c, theme.ParseStatusLabel(d.ParseStatus), theme.ParseStatusColor(d.ParseStatus))
+			theme.PillBadge(c, theme.ParseStatusLabel(d.ParseStatus), theme.ParseStatusColor(d.ParseStatus))
 			videoBadge := "未生成视频"
 			videoCol := theme.StatusGray
 			if e.HighlightCount > 0 || e.POVCount > 0 {
@@ -312,28 +317,18 @@ func (v *View) renderMatchCard(c *ui.Context, e MatchEntry) {
 				videoBadge = "排队渲染中"
 				videoCol = theme.StatusYellow
 			}
-			theme.Capsule(c, videoBadge, videoCol)
+			theme.PillBadge(c, videoBadge, videoCol)
 		})
 
-		// Scoreline hero strip
-		theme.RowCenter(c).FillWidth().Background(theme.BgInput).Radius(10).PaddingX(16).PaddingY(12).Gap(14).Children(func() {
-			theme.RowCenter(c).Gap(12).Children(func() {
-				ui.Text(c, teamA).FontSize(14).Bold().TextColor(theme.TeamCT)
-				theme.RowCenter(c).Background(theme.BgSurface).Radius(10).PaddingX(12).PaddingY(4).Gap(8).Children(func() {
-					theme.ScoreText(c, fmt.Sprintf("%d", d.TeamAScore)).FontSize(24).TextColor(theme.TextPrimary)
-					theme.ScoreText(c, ":").FontSize(18).TextColor(theme.TextMuted)
-					theme.ScoreText(c, fmt.Sprintf("%d", d.TeamBScore)).FontSize(24).TextColor(theme.TextPrimary)
-				})
-				ui.Text(c, teamB).FontSize(14).Bold().TextColor(theme.TeamT)
-			})
-			ui.Spacer(c)
-			if d.Remark != nil && *d.Remark != "" {
-				theme.RowCenter(c).Background(theme.BgSurface).Radius(4).PaddingX(10).PaddingY(4).Gap(6).Children(func() {
-					theme.StatusDot(c, theme.AccentCyan, 5)
-					theme.MutedText(c, *d.Remark)
-				})
+		// Bento Scoreline Hero Strip with official CS2 in-game map scene & official map logo
+		var rightSlot func()
+		if d.Remark != nil && *d.Remark != "" {
+			remark := *d.Remark
+			rightSlot = func() {
+				theme.PillBadge(c, remark, theme.AccentCyan)
 			}
-		})
+		}
+		theme.RenderMapScoreBanner(c, mapLabel, teamA, teamB, d.TeamAScore, d.TeamBScore, rightSlot)
 
 		if v.editingID == d.ID {
 			theme.RowCenter(c).FillWidth().Gap(8).Children(func() {
@@ -369,30 +364,63 @@ func (v *View) renderMatchCard(c *ui.Context, e MatchEntry) {
 
 		// Action hierarchy row
 		theme.RowCenter(c).FillWidth().Gap(8).Children(func() {
-			if theme.ActionButton(c, "查看比赛分析").Clicked() && v.onNavigate != nil {
+			if theme.IconActionButton(c, theme.IconAnalysis, "查看比赛分析").Clicked() && v.onNavigate != nil {
 				v.onNavigate(NavAnalysis, d.ID)
 			}
-			if theme.ActionButton(c, "浏览精彩片段").Clicked() && v.onNavigate != nil {
+			if theme.IconActionButton(c, theme.IconHighlights, "浏览精彩片段").Clicked() && v.onNavigate != nil {
 				v.onNavigate(NavHighlights, d.ID)
 			}
 			favLabel := "收藏"
 			if d.IsFavorite {
 				favLabel = "取消收藏"
 			}
-			if theme.ActionButton(c, favLabel).Clicked() && v.db != nil {
+			if theme.IconActionButton(c, theme.IconStar, favLabel).Clicked() && v.db != nil {
 				_ = v.db.Demos().UpdateAnnotations(context.Background(), d.ID, d.DisplayName, d.Remark, !d.IsFavorite)
 				_ = v.Refresh(context.Background())
 			}
-			if theme.ActionButton(c, "编辑备注").Clicked() {
+			if theme.IconActionButton(c, theme.IconSliders, "编辑备注").Clicked() {
 				v.editingID = d.ID
 				v.remarkDraft = derefStr(d.Remark)
 			}
 			ui.Spacer(c)
-			if theme.AccentButton(c, "进入独立观战").Clicked() && v.onNavigate != nil {
+			if theme.IconAccentButton(c, theme.IconSpectator, "进入独立观战").Clicked() && v.onNavigate != nil {
 				v.onNavigate(NavSpectator, d.ID)
 			}
 		})
 	})
+}
+
+func (v *View) scanAndRefresh(ctx context.Context) {
+	var rep watcher.ScanReport
+	scannedViaAgent := false
+	if v.agent != nil {
+		if err := v.agent.Call(ctx, "demo.scan", nil, &rep); err == nil {
+			scannedViaAgent = true
+		}
+	}
+	if !scannedViaAgent && v.db != nil && v.dataRoot != "" {
+		cfg, _, err := config.Load(v.dataRoot)
+		if err == nil {
+			probe := config.ProbeToolchain(config.ProbeOptions{Configured: cfg.Paths})
+			targets := watcher.DiscoverWatchTargets(watcher.DiscoverOptions{
+				Config: cfg,
+				Probe:  probe,
+			})
+			w := watcher.New(v.db, watcher.Options{Targets: targets})
+			if localRep, scanErr := w.ScanNowWithReport(ctx); scanErr == nil {
+				rep = localRep
+			}
+		}
+	}
+	_ = v.Refresh(ctx)
+	v.mu.RLock()
+	nEntries := len(v.entries)
+	v.mu.RUnlock()
+	v.statusMsg = fmt.Sprintf("已扫描 %d 个监听目录，发现 %d 个 .dem（新增 %d，当前共 %d 场）",
+		rep.Targets, rep.Candidates, rep.Discovered, nEntries)
+	if len(rep.Warnings) > 0 {
+		v.statusMsg += " | 注意: " + rep.Warnings[0]
+	}
 }
 
 func derefStr(p *string) string {

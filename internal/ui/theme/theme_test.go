@@ -127,13 +127,13 @@ func TestPureBlackAndGradientPresets(t *testing.T) {
 
 	Apply(config.ThemeConfig{
 		Preset:      config.ThemePresetPureBlack,
-		AccentColor: "#F59E0B",
+		AccentColor: "#38BDF8",
 	})
-	if BgBase != ui.Hex("#000000") {
-		t.Fatalf("expected pure black #000000 base, got %+v", BgBase)
+	if BgBase != ui.Hex("#05070B") {
+		t.Fatalf("expected spatial obsidian #05070B base, got %+v", BgBase)
 	}
-	if _, hasGrad := BackgroundGradient(); hasGrad {
-		t.Fatalf("expected no gradient for pure_black")
+	if grad, hasGrad := BackgroundGradient(); !hasGrad || len(grad.Stops) != 3 {
+		t.Fatalf("expected 3-stop spatial obsidian gradient, got has=%v stops=%d", hasGrad, len(grad.Stops))
 	}
 
 	Apply(config.ThemeConfig{
@@ -145,4 +145,27 @@ func TestPureBlackAndGradientPresets(t *testing.T) {
 	if !hasGrad || len(grad.Stops) != 3 {
 		t.Fatalf("expected 3-stop gradient for gradient_aurora, got has=%v stops=%d", hasGrad, len(grad.Stops))
 	}
+}
+
+func TestSpatialGlassPrimitivesRender(t *testing.T) {
+	active := "overview"
+	tt := ui.NewTester(func(c *ui.Context) {
+		ui.Box(c).Fill().Children(func() {
+			AmbientBackdrop(c)
+			ui.Column(c).Absolute().Left(0).Top(0).Right(0).Bottom(0).Padding(16).Gap(12).Children(func() {
+				SegmentedControl(c, []SegmentItem{
+					{Key: "overview", Label: "总览", Icon: IconAnalysis},
+					{Key: "radar", Label: "雷达", Icon: IconRadar},
+				}, active, func(k string) { active = k })
+				GlassCard(c, func() {
+					PillBadge(c, "已解析", StatusGreen)
+					StatTile(c, "STRIKEYE RATING", "1.38", "MVP 领跑", AccentAmber)
+					NavButtonWithIcon(c, IconLibrary, "比赛资料库", "MATCH LIBRARY", true)
+					IconActionButton(c, IconPlus, "导入 Demo")
+				})
+				EmptyStateCard(c, IconFilm, "暂无片段", "等待渲染完成")
+			})
+		})
+	}, 640, 480)
+	tt.Frame()
 }

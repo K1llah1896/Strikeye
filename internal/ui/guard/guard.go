@@ -184,15 +184,21 @@ func (g *Controller) RunModal(ctx context.Context) (Decision, error) {
 			MinHeight: 260,
 			Content: ui.View(func(c *ui.Context) {
 				snap, aborting, errText := g.Snapshot()
-				ui.Themed(c, theme.EsportsTheme()).Fill().Children(func() {
-					ui.Column(c).Fill().Background(theme.BgBase).Padding(20).Gap(14).Children(func() {
+				ui.Themed(c, theme.ActiveTheme()).Fill().Children(func() {
+					theme.AmbientBackdrop(c)
+					ui.Column(c).Absolute().Left(0).Top(0).Right(0).Bottom(0).Padding(20).Gap(14).Children(func() {
 						theme.RowCenter(c).FillWidth().Gap(10).Children(func() {
-							theme.StatusDot(c, theme.AccentAmber, 8)
+							ui.Box(c).Width(30).Height(30).Radius(10).
+								Background(ui.RGBA(56, 189, 248, 0.14)).
+								Center().
+								Children(func() {
+									theme.RenderIcon(c, theme.IconShield, 16, theme.AccentAmber)
+								})
 							theme.SectionTitle(c, "Strikeye 正在后台使用 CS2 引擎渲染视频")
 							ui.Spacer(c)
-							theme.Capsule(c, fmt.Sprintf("待渲染: %d", snap.QueuedCount), theme.AccentAmber)
+							theme.PillBadge(c, fmt.Sprintf("待渲染: %d", snap.QueuedCount), theme.AccentAmber)
 						})
-						theme.Card(c, func() {
+						theme.GlassCard(c, func() {
 							label := snap.CurrentTaskLabel
 							if label == "" {
 								label = "正在准备或执行 HLAE + CS2 录制任务..."

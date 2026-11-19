@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"sync"
+	"time"
 
 	"github.com/egoist/mygo"
 	mygoui "github.com/egoist/mygo/ui"
@@ -43,28 +44,43 @@ type AppOptions struct {
 	OnExitNow  func()
 }
 
+const strikeyeGitHubURL = "https://github.com/K1llah1896/Strikeye"
+
+// NotificationItem represents an in-app notification shown in the top-right Notification Center.
+type NotificationItem struct {
+	Title  string
+	Detail string
+	Time   string
+	Accent mygoui.Color
+	Unread bool
+}
+
 // App manages the top-level MyGo Native UI window, navigation, and live agent events.
 type App struct {
-	mu               sync.RWMutex
-	opts             AppOptions
-	activeView       ViewID
-	agentStatusText  string
-	parseActive      bool
-	parseProgress    float64
-	parseStage       string
-	navLoading       bool
-	navProgress      float64
-	navStage         string
-	navSeq           uint64
-	queuedCount      int
-	availUpdateVer   string
-	showRenderModal  bool
-	libraryView      *library.View
-	spectatorView    *spectator.View
-	analysisView     *analysis.View
-	highlightsView   *highlights.View
-	settingsView     *settings.View
-	win              *mygo.Window
+	mu                sync.RWMutex
+	opts              AppOptions
+	activeView        ViewID
+	agentStatusText   string
+	parseActive       bool
+	parseProgress     float64
+	parseStage        string
+	navLoading        bool
+	navProgress       float64
+	navStage          string
+	navSeq            uint64
+	selectedDemoID    int64
+	queuedCount       int
+	availUpdateVer    string
+	showRenderModal   bool
+	renderNowExit     bool
+	showNotifications bool
+	notifications     []NotificationItem
+	libraryView       *library.View
+	spectatorView     *spectator.View
+	analysisView      *analysis.View
+	highlightsView    *highlights.View
+	settingsView      *settings.View
+	win               *mygo.Window
 }
 
 // NewApp constructs the MyGo Native UI application shell and wires all 5 views.
@@ -99,6 +115,11 @@ func NewApp(opts AppOptions) *App {
 	app.highlightsView = highlights.NewView(opts.DB, caller, probe.FFmpeg.Path, triggerRenderModal)
 	app.settingsView = settings.NewView(opts.DB, caller, opts.DataRoot)
 	app.settingsView.SetCallbacks(app.invalidateWindow, app.RestartForUpdate)
+	app.settingsView.SetTasksChanged(func() {
+		app.refreshQueuedCount()
+		app.invalidateWindow()
+	})
+	app.refreshQueuedCount()
 
 	if cfg.Update.AutoCheck {
 		go func() {
@@ -115,6 +136,55 @@ func NewApp(opts AppOptions) *App {
 	return app
 }
 
+// AddNotification records a notification item for the in-app Notification Center.
+func (a *App) AddNotification(title, detail string, accent mygoui.Color) {
+	a.mu.Lock()
+	a.appendNotificationLocked(title, detail, accent)
+	a.mu.Unlock()
+}
+
+func (a *App) appendNotificationLocked(title, detail string, accent mygoui.Color) {
+	item := NotificationItem{
+		Title:  title,
+		Detail: detail,
+		Time:   time.Now().Format("15:04"),
+		Accent: accent,
+		Unread: true,
+	}
+	a.notifications = append([]NotificationItem{item}, a.notifications...)
+	if len(a.notifications) > 30 {
+		a.notifications = a.notifications[:30]
+	}
+}
+
+// UnreadNotificationCount returns the number of unread notifications.
+func (a *App) UnreadNotificationCount() int {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	n := 0
+	for _, it := range a.notifications {
+		if it.Unread {
+			n++
+		}
+	}
+	return n
+}
+
+func (a *App) refreshQueuedCount() {
+	if a.opts.DB == nil {
+		return
+	}
+	ctx := context.Background()
+	queued, err1 := a.opts.DB.RenderTasks().ListByStatus(ctx, "queued")
+	running, err2 := a.opts.DB.RenderTasks().ListByStatus(ctx, "running")
+	if err1 != nil && err2 != nil {
+		return
+	}
+	a.mu.Lock()
+	a.queuedCount = len(queued) + len(running)
+	a.mu.Unlock()
+}
+
 func (a *App) invalidateWindow() {
 	a.mu.RLock()
 	win := a.win
@@ -127,10 +197,16 @@ func (a *App) invalidateWindow() {
 // NavigateTo switches the active workspace view and loads demoID asynchronously when applicable.
 func (a *App) NavigateTo(view ViewID, demoID int64) {
 	a.mu.Lock()
+	prevView := a.activeView
 	a.activeView = view
+	if demoID > 0 {
+		a.selectedDemoID = demoID
+	} else if view == ViewHighlights && a.selectedDemoID > 0 {
+		demoID = a.selectedDemoID
+	}
 	a.navSeq++
 	seq := a.navSeq
-	needsAsync := (view == ViewSpectator && demoID > 0) || (view == ViewAnalysis && demoID > 0) || view == ViewHighlights
+	needsAsync := (view == ViewSpectator && demoID > 0) || (view == ViewAnalysis && demoID > 0) || (view == ViewHighlights && demoID > 0)
 	if needsAsync {
 		a.navLoading = true
 		a.navProgress = -1
@@ -148,6 +224,9 @@ func (a *App) NavigateTo(view ViewID, demoID int64) {
 		a.navStage = ""
 	}
 	a.mu.Unlock()
+	if prevView == ViewAnalysis && view != ViewAnalysis && a.analysisView != nil {
+		a.analysisView.Close()
+	}
 	a.invalidateWindow()
 
 	ctx := context.Background()
@@ -226,6 +305,7 @@ func (a *App) ApplyAgentEvent(ev ipc.EventNotification) {
 		a.parseActive = false
 		a.parseProgress = 0
 		a.parseStage = ""
+		a.appendNotificationLocked("Demo 解析完成", fmt.Sprintf("Demo #%d 已就绪，可进入比赛分析与观战。", demoID), theme.StatusGreen)
 		if a.libraryView != nil {
 			a.libraryView.ClearParseProgress(demoID)
 		}
@@ -234,6 +314,7 @@ func (a *App) ApplyAgentEvent(ev ipc.EventNotification) {
 		a.parseActive = false
 		a.parseProgress = 0
 		a.parseStage = ""
+		a.appendNotificationLocked("Demo 解析失败", fmt.Sprintf("Demo #%d 解析异常，请检查文件完整性。", demoID), theme.StatusRed)
 		if a.libraryView != nil {
 			a.libraryView.ClearParseProgress(demoID)
 		}
@@ -249,14 +330,29 @@ func (a *App) ApplyAgentEvent(ev ipc.EventNotification) {
 		a.highlightsView.SetExportProgress("running", p, "")
 	case "montage.completed":
 		a.highlightsView.SetExportProgress("completed", 1.0, "合辑导出完成")
+		a.appendNotificationLocked("合辑导出完成", "视频已合成并注册至本地媒体索引。", theme.StatusGreen)
 	case "montage.failed":
 		errMsg, _ := payload["error"].(string)
 		a.highlightsView.SetExportProgress("failed", 0, "合辑导出失败: "+errMsg)
+		a.appendNotificationLocked("合辑导出失败", errMsg, theme.StatusRed)
 	}
 	a.mu.Unlock()
 
 	if ev.Topic == "parse.completed" || ev.Topic == "parse.failed" || ev.Topic == "demo.discovered" {
 		_ = a.libraryView.Refresh(context.Background())
+	}
+	if ev.Topic == "render.cancelled" || ev.Topic == "render.retried" || ev.Topic == "render.completed" || ev.Topic == "render.failed" {
+		a.refreshQueuedCount()
+	}
+	if ev.Topic == "render.planned" && a.opts.DB != nil {
+		ctx := context.Background()
+		queued, err1 := a.opts.DB.RenderTasks().ListByStatus(ctx, "queued")
+		running, err2 := a.opts.DB.RenderTasks().ListByStatus(ctx, "running")
+		if err1 == nil && err2 == nil && len(queued)+len(running) > 0 {
+			a.mu.Lock()
+			a.queuedCount = len(queued) + len(running)
+			a.mu.Unlock()
+		}
 	}
 	a.mu.RLock()
 	win := a.win
@@ -274,6 +370,9 @@ func (a *App) ConfirmStartRenderNow() error {
 			return err
 		}
 	}
+	a.mu.Lock()
+	a.renderNowExit = true
+	a.mu.Unlock()
 	a.Close()
 	if a.opts.OnExitNow != nil {
 		a.opts.OnExitNow()
@@ -283,9 +382,21 @@ func (a *App) ConfirmStartRenderNow() error {
 	return nil
 }
 
-// RestartForUpdate closes the current UI session, launches the newly replaced
-// executable, and exits the current process.
+// ShouldKeepAgentOnExit reports whether the UI exited intentionally for background rendering.
+func (a *App) ShouldKeepAgentOnExit() bool {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.renderNowExit
+}
+
+// RestartForUpdate closes the current UI session, stops the background agent,
+// launches the newly replaced executable, and exits the current process.
 func (a *App) RestartForUpdate() {
+	if a.opts.Agent != nil {
+		sctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+		_ = a.opts.Agent.Call(sctx, "agent.shutdown", nil, nil)
+		cancel()
+	}
 	a.Close()
 	_ = updater.RelaunchCurrentExecutable()
 	if a.opts.OnExitNow != nil {
@@ -295,8 +406,11 @@ func (a *App) RestartForUpdate() {
 	}
 }
 
-// Close releases view resources (such as active video decoders).
+// Close releases view resources (such as active video decoders and replay tickers).
 func (a *App) Close() {
+	if a.analysisView != nil {
+		a.analysisView.Close()
+	}
 	if a.spectatorView != nil {
 		a.spectatorView.Close()
 	}
@@ -327,7 +441,7 @@ func (a *App) Run(ctx context.Context) error {
 	}
 
 	mygo.App.WhenReady(func() {
-		a.win = mygo.NewWindow(mygo.WindowOptions{
+		win := mygo.NewWindow(mygo.WindowOptions{
 			Title:          "Strikeye — CS2 Demo 观战与分析工作台",
 			Width:          1360,
 			Height:         840,
@@ -338,6 +452,9 @@ func (a *App) Run(ctx context.Context) error {
 			Vibrancy:       mygo.VibrancySidebar,
 			Content:        mygoui.View(a.Render),
 		})
+		a.mu.Lock()
+		a.win = win
+		a.mu.Unlock()
 	})
 
 	err := mygo.App.Run()
@@ -359,12 +476,19 @@ func (a *App) Render(c *mygoui.Context) {
 	queued := a.queuedCount
 	availUpdate := a.availUpdateVer
 	showModal := a.showRenderModal
+	showNotif := a.showNotifications
+	notifs := append([]NotificationItem(nil), a.notifications...)
+	unreadNotifs := 0
+	for _, it := range notifs {
+		if it.Unread {
+			unreadNotifs++
+		}
+	}
 	a.mu.RUnlock()
 
-	bmp, overlayCol := theme.BackgroundBitmap()
-	grad, hasGrad := theme.BackgroundGradient()
+	bmp, _ := theme.BackgroundBitmap()
+	_, hasGrad := theme.BackgroundGradient()
 	hasBackdrop := bmp != nil || hasGrad
-	glassActive := hasBackdrop || c.Vibrancy()
 	shellBg := theme.BgBase
 	panelBg := theme.BgSurface
 	if hasBackdrop {
@@ -375,84 +499,121 @@ func (a *App) Render(c *mygoui.Context) {
 	}
 
 	mygoui.Themed(c, theme.ActiveTheme()).Fill().Children(func() {
-		if bmp != nil {
-			mygoui.Box(c).Fill().IgnoreInput(true).Children(func() {
-				mygoui.Image(c, bmp).Fill().Fit(mygoui.Cover)
-				mygoui.Box(c).Absolute().Left(0).Top(0).Right(0).Bottom(0).Background(overlayCol)
-			})
-		} else if hasGrad {
-			mygoui.Box(c).Fill().IgnoreInput(true).LinearGradient(grad)
-		}
-		shellCol := mygoui.Column(c).Fill().Background(shellBg)
-		if hasBackdrop {
-			shellCol = mygoui.Column(c).Absolute().Left(0).Top(0).Right(0).Bottom(0).Background(shellBg)
-		}
+		theme.AmbientBackdrop(c)
+		shellCol := mygoui.Column(c).Absolute().Left(0).Top(0).Right(0).Bottom(0).Background(shellBg)
 		shellCol.Children(func() {
-			// Top Header Bar (flush with top edge so OS window controls align cleanly at y=0)
+			// Seamless borderless top header bar (drag-enabled, flush with OS window controls)
 			tb := c.TitleBar()
-			headerH := float32(54)
+			headerH := float32(60)
 			if tb.Height > headerH {
 				headerH = tb.Height
 			}
 			headerBar := theme.RowCenter(c).FillWidth().Height(headerH).
-				Background(panelBg).Border(1, theme.BorderSubtle).
-				Padding(0, tb.Right+16, 0, tb.Left+16).Gap(12).
+				Background(mygoui.RGBA(5, 7, 11, 0.42)).
+				Padding(0, tb.Right+18, 0, tb.Left+18).Gap(12).
 				DragWindow()
-			if glassActive {
-				headerBar = headerBar.Effect(theme.GlassEffect())
-			}
 			headerBar.Children(func() {
-				mygoui.Row(c).AlignItems(mygoui.Center).Gap(8).Children(func() {
-					mygoui.Box(c).Width(4).Height(18).Radius(2).Background(theme.AccentAmber)
-					mygoui.Text(c, "STRIKEYE").Font("Rajdhani").FontSize(20).Bold().LetterSpacing(1.4).TextColor(theme.AccentAmber)
+				mygoui.Row(c).AlignItems(mygoui.Center).Gap(10).Children(func() {
+					mygoui.Box(c).Width(32).Height(32).Radius(10).
+						Background(mygoui.RGBA(56, 189, 248, 0.16)).
+						Border(1, mygoui.RGBA(56, 189, 248, 0.35)).
+						Center().
+						Children(func() {
+							theme.RenderIcon(c, theme.IconRadar, 17, theme.AccentAmber)
+						})
+					mygoui.Text(c, "STRIKEYE").Font("Rajdhani").FontSize(26).Bold().LetterSpacing(1.6).TextColor(theme.TextPrimary)
 				})
-				mygoui.Text(c, "SEE THE ROUND. OWN THE MOMENT.").Font("Rajdhani").FontSize(11).LetterSpacing(1.2).TextColor(theme.TextMuted)
+				mygoui.Text(c, "SEE THE ROUND. OWN THE MOMENT.").Font("Rajdhani").FontSize(12).LetterSpacing(1.4).TextColor(theme.TextMuted)
 				mygoui.Spacer(c)
 				if parseActive {
-					mygoui.Box(c).Width(200).Children(func() {
+					mygoui.Box(c).Width(210).Children(func() {
 						theme.ProgressBar(c, parseProg, parseStage)
 					})
 				}
-				theme.Capsule(c, fmt.Sprintf("后台状态: %s | 待渲染: %d", statusText, queued), theme.AccentCyan)
 				if queued > 0 {
-					if theme.AccentButton(c, "立即启动渲染").Clicked() {
+					if theme.IconAccentButton(c, theme.IconBolt, "立即启动渲染").Clicked() {
 						a.mu.Lock()
 						a.showRenderModal = true
 						a.mu.Unlock()
 					}
 				}
 				if availUpdate != "" {
-					if theme.AccentButton(c, "发现新版本 "+availUpdate).Clicked() {
+					if theme.IconAccentButton(c, theme.IconRefresh, "新版本 "+availUpdate).Clicked() {
 						a.NavigateTo(ViewSettings, 0)
 					}
 				}
-				if theme.ActionButton(c, "设置").Clicked() {
-					a.NavigateTo(ViewSettings, 0)
+				bellBtn := theme.IconButton(c, theme.IconBell, unreadNotifs > 0).Tooltip("通知中心").Label("通知中心")
+				if bellBtn.Clicked() {
+					a.mu.Lock()
+					a.showNotifications = !a.showNotifications
+					a.mu.Unlock()
+					showNotif = !showNotif
+				}
+				if theme.IconButton(c, theme.IconGitHub, false).Tooltip("GitHub 仓库").Label("GitHub 仓库").Clicked() {
+					c.OpenURL(strikeyeGitHubURL)
+				}
+				notifOpen := showNotif
+				if mygoui.Popover(c, bellBtn, &notifOpen, func() {
+					a.renderNotificationsPopover(c, notifs, unreadNotifs)
+				}).Dismissed() {
+					a.mu.Lock()
+					a.showNotifications = false
+					a.mu.Unlock()
 				}
 			})
 
-			// Main Split: Left Nav Rail + Workspace
-			mygoui.Row(c).FillWidth().Grow(1).MinHeight(0).Padding(10).Gap(10).Children(func() {
-				navRail := mygoui.Column(c).Width(196).FillHeight().Background(panelBg).Border(1, theme.BorderSubtle).Radius(14).Padding(12).Gap(6)
-				if glassActive {
-					navRail = navRail.Effect(theme.GlassEffect())
-				}
+			// Main Split: Floating Glass Nav Rail + Workspace
+			mygoui.Row(c).FillWidth().Grow(1).MinHeight(0).Padding(12).Gap(14).Children(func() {
+				navRail := mygoui.Column(c).Width(208).FillHeight().
+					Background(panelBg).
+					Border(1, theme.RimBorder).
+					Radius(20).
+					Padding(12).
+					Gap(6).
+					Shadow(0, 12, 32, -6, mygoui.RGBA(0, 0, 0, 0.45))
 				navRail.Children(func() {
+					mygoui.Text(c, "WORKSPACE").Font("Rajdhani").FontSize(10).Bold().LetterSpacing(1.4).TextColor(theme.TextMuted).PaddingX(8).PaddingY(4)
 					navItems := []struct {
 						id    ViewID
+						icon  *mygoui.SVG
 						title string
 						sub   string
 					}{
-						{ViewLibrary, "比赛资料库", "MATCH LIBRARY"},
-						{ViewSpectator, "独立观战", "SPECTATOR"},
-						{ViewAnalysis, "比赛分析", "ANALYSIS"},
-						{ViewHighlights, "精彩片段", "HIGHLIGHTS"},
-						{ViewSettings, "任务与设置", "SYSTEM & TASKS"},
+						{ViewLibrary, theme.IconLibrary, "比赛资料库", "MATCH LIBRARY"},
+						{ViewSpectator, theme.IconSpectator, "独立观战", "SPECTATOR"},
+						{ViewAnalysis, theme.IconAnalysis, "比赛分析", "ANALYSIS"},
+						{ViewHighlights, theme.IconHighlights, "精彩片段", "HIGHLIGHTS"},
+						{ViewSettings, theme.IconSettings, "任务与设置", "SYSTEM & TASKS"},
 					}
 					for _, item := range navItems {
-						if theme.NavButton(c, item.title, item.sub, active == item.id).Clicked() {
+						if theme.NavButtonWithIcon(c, item.icon, item.title, item.sub, active == item.id).Clicked() {
 							a.NavigateTo(item.id, 0)
 						}
+					}
+					mygoui.Spacer(c)
+					queueBtn := mygoui.ButtonBase(c).
+						FillWidth().
+						Radius(14).
+						Background(theme.BgInput).
+						Border(1, theme.RimBorder).
+						Padding(10).
+						Cursor(mygoui.CursorPointer).
+						Children(func() {
+							mygoui.Column(c).FillWidth().Gap(4).Children(func() {
+								theme.RowCenter(c).FillWidth().Gap(6).Children(func() {
+									theme.StatusDot(c, theme.StatusGreen, 6)
+									mygoui.Text(c, "AGENT TELEMETRY").Font("Rajdhani").FontSize(10).Bold().LetterSpacing(1.1).TextColor(theme.TextMuted)
+									mygoui.Spacer(c)
+									mygoui.Text(c, "查看队列 ›").FontSize(10).TextColor(theme.AccentAmber)
+								})
+								mygoui.Text(c, fmt.Sprintf("%s · 队列 %d", statusText, queued)).FontSize(11).TextColor(theme.TextPrimary)
+							})
+						})
+					if queueBtn.Hovered() {
+						queueBtn = queueBtn.Background(theme.BgElevated).Border(1, theme.AccentAmber)
+					}
+					if queueBtn.Clicked() {
+						a.NavigateTo(ViewSettings, 0)
 					}
 				})
 
@@ -460,7 +621,7 @@ func (a *App) Render(c *mygoui.Context) {
 					if navLoading {
 						mygoui.Column(c).Fill().Center().Padding(32).Children(func() {
 							mygoui.Box(c).Width(460).Children(func() {
-								theme.Card(c, func() {
+								theme.GlassCard(c, func() {
 									theme.SectionTitle(c, "正在准备视图")
 									theme.ProgressBar(c, navProg, navStage)
 								})
@@ -496,15 +657,21 @@ func (a *App) Render(c *mygoui.Context) {
 }
 
 func (a *App) renderConfirmModal(c *mygoui.Context) {
-	modal := mygoui.Column(c).Width(460).Background(theme.BgSurface).Border(1, theme.BorderSubtle).Radius(16).Padding(20).Gap(14)
-	bmp, _ := theme.BackgroundBitmap()
-	_, hasGrad := theme.BackgroundGradient()
-	if bmp != nil || hasGrad || c.Vibrancy() {
-		modal = modal.Effect(theme.GlassEffect())
-	}
+	modal := mygoui.Column(c).Width(460).
+		Background(theme.BgSurface).
+		Border(1, theme.RimBorder).
+		Radius(22).
+		Padding(22).
+		Gap(14).
+		Shadow(0, 18, 40, -6, mygoui.RGBA(0, 0, 0, 0.55))
 	modal.Children(func() {
-		theme.RowCenter(c).Gap(8).Children(func() {
-			theme.StatusDot(c, theme.AccentAmber, 8)
+		theme.RowCenter(c).Gap(10).Children(func() {
+			mygoui.Box(c).Width(32).Height(32).Radius(10).
+				Background(mygoui.RGBA(56, 189, 248, 0.14)).
+				Center().
+				Children(func() {
+					theme.RenderIcon(c, theme.IconBolt, 16, theme.AccentAmber)
+				})
 			theme.SectionTitle(c, "确认启动 CS2 后台渲染")
 		})
 		mygoui.Text(c, "即将启动 CS2 原生引擎进行视频渲染。为保证渲染稳定性，Strikeye 主界面将自动关闭，渲染完成后将通过系统通知提醒您。").
@@ -516,9 +683,71 @@ func (a *App) renderConfirmModal(c *mygoui.Context) {
 				a.showRenderModal = false
 				a.mu.Unlock()
 			}
-			if theme.AccentButton(c, "确认并退出主界面").Clicked() {
+			if theme.IconAccentButton(c, theme.IconBolt, "确认并退出主界面").Clicked() {
 				_ = a.ConfirmStartRenderNow()
 			}
+		})
+	})
+}
+
+func (a *App) renderNotificationsPopover(c *mygoui.Context, items []NotificationItem, unread int) {
+	panel := mygoui.Column(c).Width(340).
+		Background(theme.BgSurface).
+		Border(1, theme.RimBorder).
+		Radius(18).
+		Padding(14).
+		Gap(10).
+		Shadow(0, 14, 34, -4, mygoui.RGBA(0, 0, 0, 0.52))
+	panel.Children(func() {
+		theme.RowCenter(c).FillWidth().Gap(8).Children(func() {
+			theme.RenderIcon(c, theme.IconBell, 15, theme.AccentAmber)
+			theme.SectionTitle(c, "通知中心")
+			if unread > 0 {
+				theme.PillBadge(c, fmt.Sprintf("%d 条未读", unread), theme.AccentAmber)
+			}
+			mygoui.Spacer(c)
+			if len(items) > 0 {
+				if theme.ActionButton(c, "全部已读").Clicked() {
+					a.mu.Lock()
+					for i := range a.notifications {
+						a.notifications[i].Unread = false
+					}
+					a.mu.Unlock()
+				}
+				if theme.ActionButton(c, "清空").Clicked() {
+					a.mu.Lock()
+					a.notifications = nil
+					a.mu.Unlock()
+				}
+			}
+		})
+		if len(items) == 0 {
+			mygoui.Column(c).FillWidth().PaddingY(20).Center().Gap(6).Children(func() {
+				theme.RenderIcon(c, theme.IconCheck, 20, theme.TextMuted)
+				theme.MutedText(c, "暂无新通知")
+			})
+			return
+		}
+		mygoui.Scroll(c).FillWidth().MaxHeight(260).Children(func() {
+			mygoui.Column(c).FillWidth().Gap(8).Children(func() {
+				for _, it := range items {
+					bg := theme.BgInput
+					if it.Unread {
+						bg = theme.BgElevated
+					}
+					mygoui.Column(c).FillWidth().Background(bg).Border(1, theme.RimBorder).Radius(12).Padding(10).Gap(4).Children(func() {
+						theme.RowCenter(c).FillWidth().Gap(6).Children(func() {
+							theme.StatusDot(c, it.Accent, 6)
+							mygoui.Text(c, it.Title).FontSize(12).Bold().TextColor(theme.TextPrimary)
+							mygoui.Spacer(c)
+							theme.StatText(c, it.Time).FontSize(10).TextColor(theme.TextMuted)
+						})
+						if it.Detail != "" {
+							theme.MutedText(c, it.Detail)
+						}
+					})
+				}
+			})
 		})
 	})
 }

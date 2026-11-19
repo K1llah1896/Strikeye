@@ -41,8 +41,8 @@ func RenderKeyHUD(c *ui.Context, st KeyHUDState) {
 	}
 	ui.Column(c).
 		Background(theme.BgSurface).
-		Border(1, theme.BorderSubtle).
-		Radius(8).
+		Border(1, theme.RimBorder).
+		Radius(14).
 		Padding(10).
 		Gap(6).
 		Children(func() {

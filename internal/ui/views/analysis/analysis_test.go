@@ -126,3 +126,98 @@ func TestReplay2DSpeedAdvance(t *testing.T) {
 		t.Fatalf("expected 64 frames after 0.5s at 4x 32Hz, got %d", v.replayFrameIdx)
 	}
 }
+
+func TestReplayAndHeatmapTiming(t *testing.T) {
+	v := NewView(nil, "", "")
+	mapName := "de_mirage"
+	v.demo = &storage.Demo{ID: 1, MapName: &mapName}
+	var frames []parser.ReplayFrame
+	for i := 0; i < 3200; i++ {
+		frames = append(frames, parser.ReplayFrame{
+			Tick: int64(i * 2),
+			Players: []parser.ReplayPlayerPose{
+				{Alive: true, Team: 1, X: float32(-500 + (i % 400)), Y: float32(200 - (i % 300))},
+				{Alive: true, Team: 2, X: float32(300 - (i % 350)), Y: float32(-100 + (i % 250))},
+			},
+		})
+	}
+	v.replayRound = parser.ReplayRoundData{Frames: frames}
+
+	t0 := time.Now()
+	v.ensureReplayReady()
+	dReplay := time.Since(t0)
+
+	t1 := time.Now()
+	v.ensureHeatmapReady()
+	dHeatmap := time.Since(t1)
+
+	t.Logf("ensureReplayReady=%v, ensureHeatmapReady=%v", dReplay, dHeatmap)
+}
+
+func TestAsyncTabSwitchAndPlaybackLifecycle(t *testing.T) {
+	v := NewView(nil, "", "")
+	defer v.Close()
+
+	mapName := "de_mirage"
+	v.demo = &storage.Demo{ID: 1, MapName: &mapName}
+	frames := make([]parser.ReplayFrame, 128)
+	for i := range frames {
+		frames[i] = parser.ReplayFrame{
+			Tick: int64(i * 2),
+			Players: []parser.ReplayPlayerPose{
+				{Slot: 1, Alive: true, Team: 1, Health: 100, X: float32(-500 + i), Y: 200},
+				{Slot: 2, Alive: true, Team: 2, Health: 100, X: float32(300 - i), Y: -100},
+			},
+		}
+	}
+	v.replayRound = parser.ReplayRoundData{Frames: frames}
+
+	doneCh := make(chan struct{}, 16)
+	v.SetInvalidate(func() {
+		select {
+		case doneCh <- struct{}{}:
+		default:
+		}
+	})
+
+	// Switching tabs must return immediately without blocking on rasterization/KDE.
+	v.SetActiveTab(TabReplay2D)
+	v.SetActiveTab(TabHeatmaps)
+	v.SetActiveTab(TabReplay2D)
+
+	// Start background 32Hz playback and confirm it advances frames and stops cleanly.
+	v.mu.Lock()
+	v.startPlaybackLocked()
+	v.mu.Unlock()
+
+	select {
+	case <-doneCh:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("expected background invalidation callback")
+	}
+
+	v.SetActiveTab(TabOverview)
+	v.mu.RLock()
+	stillPlaying := v.replayPlaying
+	v.mu.RUnlock()
+	if stillPlaying {
+		t.Fatalf("expected playback to stop when leaving TabReplay2D")
+	}
+}
+
+func TestTrimLeadingStationaryFrames(t *testing.T) {
+	rd := parser.ReplayRoundData{
+		Frames: []parser.ReplayFrame{
+			{Tick: 10, Players: []parser.ReplayPlayerPose{{Slot: 1, Alive: true, X: 100, Y: 200}}},
+			{Tick: 12, Players: []parser.ReplayPlayerPose{{Slot: 1, Alive: true, X: 100.5, Y: 200.5}}},
+			{Tick: 14, Players: []parser.ReplayPlayerPose{{Slot: 1, Alive: true, X: 101, Y: 200}}},
+			{Tick: 16, Players: []parser.ReplayPlayerPose{{Slot: 1, Alive: true, X: 120, Y: 200}}},
+			{Tick: 18, Players: []parser.ReplayPlayerPose{{Slot: 1, Alive: true, X: 140, Y: 200}}},
+		},
+	}
+	trimmed := TrimLeadingStationaryFrames(rd)
+	if len(trimmed.Frames) != 3 || trimmed.Frames[0].Tick != 14 {
+		t.Fatalf("expected 3 frames starting at tick 14 (1 frame before move), got len=%d firstTick=%d",
+			len(trimmed.Frames), trimmed.Frames[0].Tick)
+	}
+}

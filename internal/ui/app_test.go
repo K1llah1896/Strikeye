@@ -126,12 +126,66 @@ func TestBackgroundImageRendersBehindUIContent(t *testing.T) {
 	if !tt.HasText("STRIKEYE") {
 		t.Fatalf("expected STRIKEYE header text to be rendered")
 	}
-	// Clicking the "设置" button in the top header should still hit-test above the background image.
-	if err := tt.Click("设置"); err != nil {
-		t.Fatalf("Click 设置 failed: %v", err)
+	// Clicking the "任务与设置" item in the nav rail should hit-test above the background image.
+	if err := tt.Click("任务与设置"); err != nil {
+		t.Fatalf("Click 任务与设置 failed: %v", err)
 	}
 	tt.Frame()
 	if app.ActiveView() != ViewSettings {
-		t.Fatalf("expected ViewSettings after clicking 设置 over background image, got %s", app.ActiveView())
+		t.Fatalf("expected ViewSettings after clicking 任务与设置 over background image, got %s", app.ActiveView())
+	}
+}
+
+func TestTopRightNotificationsAndGitHub(t *testing.T) {
+	tmp := t.TempDir()
+	db, err := storage.OpenDefault(tmp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	app := NewApp(AppOptions{DataRoot: tmp, DB: db})
+	defer app.Close()
+	app.AddNotification("Demo 解析完成", "de_mirage 已就绪", theme.StatusGreen)
+	if app.UnreadNotificationCount() != 1 {
+		t.Fatalf("expected 1 unread notification, got %d", app.UnreadNotificationCount())
+	}
+
+	tt := mygoui.NewTester(app.Render, 1360, 840)
+	tt.Frame()
+
+	// Click notification center button via accessibility label
+	if err := tt.Click("通知中心"); err != nil {
+		t.Fatalf("click 通知中心 failed: %v", err)
+	}
+	tt.Frame()
+	if !tt.HasText("Demo 解析完成") {
+		t.Fatalf("expected notification item text inside popover")
+	}
+	if err := tt.Click("全部已读"); err != nil {
+		t.Fatalf("click 全部已读 failed: %v", err)
+	}
+	tt.Frame()
+	if app.UnreadNotificationCount() != 0 {
+		t.Fatalf("expected 0 unread notifications after 全部已读, got %d", app.UnreadNotificationCount())
+	}
+
+	// Click GitHub icon button
+	if err := tt.Click("GitHub 仓库"); err != nil {
+		t.Fatalf("click GitHub 仓库 failed: %v", err)
+	}
+	tt.Frame()
+	opened := tt.OpenedURLs()
+	if len(opened) == 0 || opened[len(opened)-1] != strikeyeGitHubURL {
+		t.Fatalf("expected %s in OpenedURLs, got %+v", strikeyeGitHubURL, opened)
+	}
+
+	// Clicking bottom-left render queue telemetry navigates to ViewSettings
+	if err := tt.Click("查看队列 ›"); err != nil {
+		t.Fatalf("click 查看队列 › failed: %v", err)
+	}
+	tt.Frame()
+	if app.ActiveView() != ViewSettings {
+		t.Fatalf("expected ViewSettings after clicking render queue widget, got %s", app.ActiveView())
 	}
 }

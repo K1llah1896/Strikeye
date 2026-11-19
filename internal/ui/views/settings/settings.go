@@ -36,10 +36,12 @@ type View struct {
 	fpsChoice   string
 	aliasesText string
 	watchDirsTx string
-	tasks       []storage.RenderTask
-	taskFilter  string
-	agentLogs   string
-	statusMsg   string
+	tasks           []storage.RenderTask
+	taskFilter      string
+	agentLogs       string
+	statusMsg       string
+	statusExpiresAt time.Time
+	statusSeq       uint64
 
 	updateMu       sync.RWMutex
 	updateBusy     bool
@@ -48,8 +50,16 @@ type View struct {
 	updateResult   *updater.CheckResult
 	updateApplied  bool
 	updateError    string
+	toolBusy       bool
+	toolProgress   float64
+	toolStage      string
+	toolError      string
+	pendingPaths   *config.ToolPaths
+	pendingProbe   *config.ProbeReport
+	pendingStatus  string
 	onInvalidate   func()
 	onRestart      func()
+	onTasksChanged func()
 }
 
 // SetCallbacks registers UI invalidation and app restart callbacks for async update flows.
@@ -58,6 +68,45 @@ func (v *View) SetCallbacks(onInvalidate func(), onRestart func()) {
 	v.onInvalidate = onInvalidate
 	v.onRestart = onRestart
 	v.updateMu.Unlock()
+}
+
+// SetTasksChanged registers a callback invoked when the render task queue is modified.
+func (v *View) SetTasksChanged(fn func()) {
+	v.updateMu.Lock()
+	v.onTasksChanged = fn
+	v.updateMu.Unlock()
+}
+
+func (v *View) setStatus(msg string) {
+	v.updateMu.Lock()
+	v.statusSeq++
+	seq := v.statusSeq
+	v.statusMsg = msg
+	if msg == "" {
+		v.statusExpiresAt = time.Time{}
+		v.updateMu.Unlock()
+		return
+	}
+	ttl := 4 * time.Second
+	if strings.Contains(msg, "失败") {
+		ttl = 8 * time.Second
+	}
+	v.statusExpiresAt = time.Now().Add(ttl)
+	v.updateMu.Unlock()
+
+	time.AfterFunc(ttl, func() {
+		v.updateMu.Lock()
+		cleared := false
+		if v.statusSeq == seq && v.statusMsg != "" {
+			v.statusMsg = ""
+			v.statusExpiresAt = time.Time{}
+			cleared = true
+		}
+		v.updateMu.Unlock()
+		if cleared {
+			v.invalidate()
+		}
+	})
 }
 
 func (v *View) invalidate() {
@@ -143,12 +192,30 @@ func ApplyChoicesToConfig(cfg *config.Config, resChoice, fpsChoice, aliasesText,
 	cfg.PrimaryPlayerAliases = aliases
 
 	var dirs []string
-	for _, line := range strings.Split(watchDirsText, "\n") {
-		if t := strings.TrimSpace(line); t != "" {
+	for _, line := range strings.Split(strings.ReplaceAll(watchDirsText, "\r\n", "\n"), "\n") {
+		t := strings.TrimSpace(line)
+		t = strings.Trim(t, `"'`)
+		t = strings.TrimSpace(t)
+		if t != "" {
 			dirs = append(dirs, t)
 		}
 	}
 	cfg.DemoWatchDirs = dirs
+}
+
+func (v *View) saveConfigAndReload() {
+	ApplyChoicesToConfig(&v.cfg, v.resChoice, v.fpsChoice, v.aliasesText, v.watchDirsTx)
+	if err := config.Save(v.dataRoot, v.cfg); err != nil {
+		v.setStatus("保存失败: " + err.Error())
+		return
+	}
+	v.setStatus(fmt.Sprintf("配置已保存（监听目录 %d 个）", len(v.cfg.DemoWatchDirs)))
+	if v.agent != nil {
+		go func() {
+			_ = v.agent.Call(context.Background(), "config.reload", nil, nil)
+			v.invalidate()
+		}()
+	}
 }
 
 // BackupDatabase copies strikeye.db to <DataRoot>/backup/manual_<ts>.db.
@@ -200,18 +267,73 @@ func CleanInvalidCache(dataRoot string) (int, error) {
 
 // Render draws the Settings & Tasks workspace.
 func (v *View) Render(c *ui.Context) {
+	// Apply any completed background tool-install updates on the UI main thread.
+	var pendingStatus string
+	v.updateMu.Lock()
+	if v.pendingPaths != nil {
+		v.cfg.Paths = *v.pendingPaths
+		v.pendingPaths = nil
+	}
+	if v.pendingProbe != nil {
+		v.probe = *v.pendingProbe
+		v.pendingProbe = nil
+	}
+	if v.pendingStatus != "" {
+		pendingStatus = v.pendingStatus
+		v.pendingStatus = ""
+	}
+	if v.statusMsg != "" && !v.statusExpiresAt.IsZero() && time.Now().After(v.statusExpiresAt) {
+		v.statusMsg = ""
+		v.statusExpiresAt = time.Time{}
+	}
+	statusMsg := v.statusMsg
+	v.updateMu.Unlock()
+
+	if pendingStatus != "" {
+		v.setStatus(pendingStatus)
+		statusMsg = pendingStatus
+	}
+
 	ui.Scroll(c).Fill().Children(func() {
-		ui.Column(c).FillWidth().Padding(14).Gap(8).Children(func() {
-			if v.statusMsg != "" {
-				theme.Capsule(c, v.statusMsg, theme.AccentCyan)
+		ui.Column(c).FillWidth().Padding(12).Gap(10).Children(func() {
+			if statusMsg != "" {
+				statusCol := theme.AccentAmber
+				if strings.Contains(statusMsg, "失败") {
+					statusCol = theme.StatusRed
+				}
+				theme.RowCenter(c).FillWidth().Gap(8).Children(func() {
+					theme.PillBadge(c, statusMsg, statusCol)
+					ui.Spacer(c)
+					if theme.ActionButton(c, "关闭").Clicked() {
+						v.setStatus("")
+					}
+				})
 			}
 
 			// 1. Environment probe & path overrides
-			theme.Card(c, func() {
+			v.updateMu.RLock()
+			toolBusy := v.toolBusy
+			toolProg := v.toolProgress
+			toolStage := v.toolStage
+			toolErr := v.toolError
+			v.updateMu.RUnlock()
+
+			theme.BentoCard(c, ui.Color{}, 12, func() {
 				theme.RowCenter(c).FillWidth().Gap(10).Children(func() {
+					theme.RenderIcon(c, theme.IconSliders, 15, theme.AccentAmber)
 					theme.SectionTitle(c, "1. 环境检测与工具路径")
 					ui.Spacer(c)
-					if theme.ActionButton(c, "重新探测").Clicked() {
+					if !toolBusy && (!v.probe.HLAE.Available || !v.probe.AfxHookSource2.Available) {
+						if theme.ActionButton(c, "下载安装 HLAE").Clicked() {
+							v.startInstallTool(updater.ToolHLAE)
+						}
+					}
+					if !toolBusy && (!v.probe.FFmpeg.Available || !v.probe.FFprobe.Available) {
+						if theme.ActionButton(c, "下载安装 FFmpeg").Clicked() {
+							v.startInstallTool(updater.ToolFFmpeg)
+						}
+					}
+					if theme.IconActionButton(c, theme.IconRefresh, "重新探测").Clicked() {
 						v.probe = config.ProbeToolchain(config.ProbeOptions{Configured: v.cfg.Paths})
 					}
 				})
@@ -225,31 +347,45 @@ func (v *View) Render(c *ui.Context) {
 				toolRow(c, "HLAE.exe", v.probe.HLAE, &v.cfg.Paths.HLAEExe)
 				toolRow(c, ffmpegLabel, v.probe.FFmpeg, &v.cfg.Paths.FFmpegExe)
 				toolRow(c, ffprobeLabel, v.probe.FFprobe, &v.cfg.Paths.FFprobeExe)
+				if toolBusy {
+					theme.ProgressBar(c, toolProg, toolStage)
+				} else if toolErr != "" {
+					theme.PillBadge(c, "工具安装失败: "+toolErr, theme.StatusRed)
+				}
 			})
 
 			// 2. Directories & Storage maintenance
-			theme.Card(c, func() {
-				theme.SectionTitle(c, "2. 目录与存储管理")
+			theme.BentoCard(c, ui.Color{}, 12, func() {
+				theme.RowCenter(c).Gap(8).Children(func() {
+					theme.RenderIcon(c, theme.IconFolder, 15, theme.AccentAmber)
+					theme.SectionTitle(c, "2. 目录与存储管理")
+				})
 				theme.MutedText(c, "Demo 监听目录（每行一个路径）：")
-				ui.TextArea(c, &v.watchDirsTx).FillWidth().Height(38)
+				ui.TextArea(c, &v.watchDirsTx).FillWidth().Height(48)
 				theme.RowCenter(c).Gap(10).Children(func() {
+					if theme.AccentButton(c, "保存监听目录").Clicked() {
+						v.saveConfigAndReload()
+					}
 					if theme.ActionButton(c, "一键备份数据库与媒体索引").Clicked() {
 						if dst, err := BackupDatabase(v.dataRoot); err != nil {
-							v.statusMsg = "备份失败: " + err.Error()
+							v.setStatus("备份失败: " + err.Error())
 						} else {
-							v.statusMsg = "数据库已备份至: " + dst
+							v.setStatus("数据库已备份至: " + dst)
 						}
 					}
 					if theme.ActionButton(c, "清理无效缓存").Clicked() {
 						n, _ := CleanInvalidCache(v.dataRoot)
-						v.statusMsg = fmt.Sprintf("已清理 %d 项临时缓存", n)
+						v.setStatus(fmt.Sprintf("已清理 %d 项临时缓存", n))
 					}
 				})
 			})
 
 			// 3. Render Policy & Quality
-			theme.Card(c, func() {
-				theme.SectionTitle(c, "3. 后台渲染策略与画质配置")
+			theme.BentoCard(c, ui.Color{}, 12, func() {
+				theme.RowCenter(c).Gap(8).Children(func() {
+					theme.RenderIcon(c, theme.IconBolt, 15, theme.AccentAmber)
+					theme.SectionTitle(c, "3. 后台渲染策略与画质配置")
+				})
 				theme.RowCenter(c).FillWidth().Gap(12).Children(func() {
 					ui.Column(c).Gap(4).Children(func() {
 						theme.MutedText(c, "自动渲染策略")
@@ -276,28 +412,21 @@ func (v *View) Render(c *ui.Context) {
 				})
 				theme.RowCenter(c).FillWidth().Children(func() {
 					if theme.AccentButton(c, "保存配置并通知 Agent 重载").Clicked() {
-						ApplyChoicesToConfig(&v.cfg, v.resChoice, v.fpsChoice, v.aliasesText, v.watchDirsTx)
-						if err := config.Save(v.dataRoot, v.cfg); err != nil {
-							v.statusMsg = "保存失败: " + err.Error()
-						} else {
-							v.statusMsg = "配置已保存"
-							if v.agent != nil {
-								_ = v.agent.Call(context.Background(), "config.reload", nil, nil)
-							}
-						}
+						v.saveConfigAndReload()
 					}
 				})
 			})
 
 			// 4. Live Render Task Queue
-			theme.Card(c, func() {
+			theme.BentoCard(c, ui.Color{}, 12, func() {
 				theme.RowCenter(c).FillWidth().Gap(8).Children(func() {
+					theme.RenderIcon(c, theme.IconFilm, 15, theme.AccentAmber)
 					theme.SectionTitle(c, "4. 后台渲染任务队列")
 					ui.Spacer(c)
 					if ui.Select(c, &v.taskFilter, []string{"全部任务", "queued", "running", "completed", "failed", "cancelled"}).Changed() {
 						_ = v.RefreshTasks(context.Background())
 					}
-					if theme.ActionButton(c, "刷新队列").Clicked() {
+					if theme.IconActionButton(c, theme.IconRefresh, "刷新队列").Clicked() {
 						_ = v.RefreshTasks(context.Background())
 					}
 				})
@@ -379,9 +508,9 @@ func (v *View) Render(c *ui.Context) {
 					if theme.AccentButton(c, "应用并保存主题").Clicked() {
 						theme.Apply(v.cfg.Theme)
 						if err := config.Save(v.dataRoot, v.cfg); err != nil {
-							v.statusMsg = "主题保存失败: " + err.Error()
+							v.setStatus("主题保存失败: " + err.Error())
 						} else {
-							v.statusMsg = "主题配置已保存并生效"
+							v.setStatus("主题配置已保存并生效")
 						}
 					}
 				})
@@ -391,6 +520,70 @@ func (v *View) Render(c *ui.Context) {
 			v.renderUpdateCard(c)
 		})
 	})
+}
+
+func (v *View) startInstallTool(toolID string) {
+	v.updateMu.Lock()
+	if v.toolBusy {
+		v.updateMu.Unlock()
+		return
+	}
+	v.toolBusy = true
+	v.toolProgress = 0.02
+	v.toolStage = "准备下载安装 " + strings.ToUpper(toolID) + "..."
+	v.toolError = ""
+	dataRoot := v.dataRoot
+	cfgCopy := v.cfg
+	v.updateMu.Unlock()
+	v.invalidate()
+
+	go func() {
+		res, err := updater.InstallTool(context.Background(), nil, updater.InstallToolOptions{
+			Tool:     toolID,
+			DataRoot: dataRoot,
+		}, func(st string, p float64) {
+			v.updateMu.Lock()
+			v.toolStage = st
+			v.toolProgress = p
+			v.updateMu.Unlock()
+			v.invalidate()
+		})
+
+		if err != nil {
+			v.updateMu.Lock()
+			v.toolBusy = false
+			v.toolError = err.Error()
+			v.updateMu.Unlock()
+			v.invalidate()
+			return
+		}
+		if res.HLAEExe != "" {
+			cfgCopy.Paths.HLAEExe = res.HLAEExe
+		}
+		if res.AfxHookSource2DLL != "" {
+			cfgCopy.Paths.AfxHookSource2DLL = res.AfxHookSource2DLL
+		}
+		if res.FFmpegExe != "" {
+			cfgCopy.Paths.FFmpegExe = res.FFmpegExe
+		}
+		if res.FFprobeExe != "" {
+			cfgCopy.Paths.FFprobeExe = res.FFprobeExe
+		}
+		_ = config.Save(dataRoot, cfgCopy)
+		probeRep := config.ProbeToolchain(config.ProbeOptions{Configured: cfgCopy.Paths})
+		pathsCopy := cfgCopy.Paths
+
+		v.updateMu.Lock()
+		v.toolBusy = false
+		v.pendingPaths = &pathsCopy
+		v.pendingProbe = &probeRep
+		v.pendingStatus = strings.ToUpper(toolID) + " 已下载安装并配置完成"
+		v.updateMu.Unlock()
+		if v.agent != nil {
+			_ = v.agent.Call(context.Background(), "config.reload", nil, nil)
+		}
+		v.invalidate()
+	}()
 }
 
 func (v *View) renderUpdateCard(c *ui.Context) {
@@ -407,7 +600,7 @@ func (v *View) renderUpdateCard(c *ui.Context) {
 		theme.RowCenter(c).FillWidth().Gap(8).Children(func() {
 			theme.SectionTitle(c, "6. 版本信息与在线热更新")
 			ui.Spacer(c)
-			theme.Capsule(c, "当前版本: "+version.AppVersion, theme.AccentCyan)
+			theme.PillBadge(c, "当前版本: "+version.AppVersion, theme.AccentAmber)
 		})
 		theme.RowCenter(c).FillWidth().Gap(10).Children(func() {
 			if ui.Checkbox(c, &v.cfg.Update.AutoCheck, "启动时自动检查更新").Changed() {
@@ -539,17 +732,29 @@ func (v *View) renderTaskRow(c *ui.Context, t storage.RenderTask) {
 			if theme.ActionButton(c, "置顶").Clicked() {
 				_ = v.agent.Call(context.Background(), "render.priority", map[string]any{"task_id": t.ID, "priority": t.Priority + 50}, nil)
 				_ = v.RefreshTasks(context.Background())
+				v.notifyTasksChanged()
 			}
 			if theme.DangerButton(c, "取消").Clicked() {
 				_ = v.agent.Call(context.Background(), "render.cancel", map[string]any{"task_id": t.ID}, nil)
 				_ = v.RefreshTasks(context.Background())
+				v.notifyTasksChanged()
 			}
 		}
 		if (t.Status == "failed" || t.Status == "cancelled") && v.agent != nil {
 			if theme.AccentButton(c, "重试").Clicked() {
 				_ = v.agent.Call(context.Background(), "render.retry", map[string]any{"task_id": t.ID}, nil)
 				_ = v.RefreshTasks(context.Background())
+				v.notifyTasksChanged()
 			}
 		}
 	})
+}
+
+func (v *View) notifyTasksChanged() {
+	v.updateMu.RLock()
+	fn := v.onTasksChanged
+	v.updateMu.RUnlock()
+	if fn != nil {
+		fn()
+	}
 }

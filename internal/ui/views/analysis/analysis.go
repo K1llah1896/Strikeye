@@ -35,6 +35,7 @@ const (
 
 // View manages Match Analysis state across all 6 tabs.
 type View struct {
+	mu                sync.RWMutex
 	db                *storage.DB
 	dataRoot          string
 	ffmpegPath        string
@@ -66,12 +67,20 @@ type View struct {
 	replayFramePos    float64
 	replaySpeed       float64
 	replayPlaying     bool
+	playStop          chan struct{}
 	lastStepAt        time.Time
 	lowerLayer        bool
 	hmPlayer          string
 	hmTeam            string
 	hmMode            string
 	hmRoundType       string
+	replayMapReady    bool
+	replayLoading     bool
+	heatmapReady      bool
+	heatmapLoading    bool
+	replaySeq         uint64
+	frameRenderSeq    uint64
+	heatmapSeq        uint64
 	statusMsg         string
 	opMu              sync.RWMutex
 	opLoading         bool
@@ -85,6 +94,79 @@ func (v *View) SetInvalidate(fn func()) {
 	v.opMu.Lock()
 	v.onInvalidate = fn
 	v.opMu.Unlock()
+}
+
+func (v *View) invalidate() {
+	v.opMu.RLock()
+	inv := v.onInvalidate
+	v.opMu.RUnlock()
+	if inv != nil {
+		inv()
+	}
+}
+
+// Close stops any active 2D replay playback goroutine.
+func (v *View) Close() {
+	v.mu.Lock()
+	v.stopPlaybackLocked()
+	v.mu.Unlock()
+}
+
+func (v *View) stopPlaybackLocked() {
+	v.replayPlaying = false
+	if v.playStop != nil {
+		close(v.playStop)
+		v.playStop = nil
+	}
+}
+
+func (v *View) startPlaybackLocked() {
+	if v.playStop != nil {
+		close(v.playStop)
+		v.playStop = nil
+	}
+	if len(v.replayRound.Frames) == 0 {
+		v.replayPlaying = false
+		return
+	}
+	v.replayPlaying = true
+	v.replayFramePos = float64(v.replayFrameIdx)
+	v.lastStepAt = time.Now()
+	stopCh := make(chan struct{})
+	v.playStop = stopCh
+
+	go func(stop <-chan struct{}) {
+		ticker := time.NewTicker(33 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-stop:
+				return
+			case now := <-ticker.C:
+				v.mu.Lock()
+				if !v.replayPlaying || len(v.replayRound.Frames) == 0 {
+					v.mu.Unlock()
+					return
+				}
+				elapsed := now.Sub(v.lastStepAt)
+				v.lastStepAt = now
+				changed := v.advanceReplayLocked(elapsed)
+				round := v.replayRound
+				frameIdx := v.replayFrameIdx
+				stillPlaying := v.replayPlaying
+				v.mu.Unlock()
+
+				if changed {
+					v.radarCanvas.RenderReplayFrame(round, frameIdx)
+					v.invalidate()
+				}
+				if !stillPlaying {
+					v.invalidate()
+					return
+				}
+			}
+		}
+	}(stopCh)
 }
 
 func (v *View) setOpProgress(loading bool, progress float64, stage string) {
@@ -120,12 +202,190 @@ func NewView(db *storage.DB, dataRoot, ffmpegPath string) *View {
 	}
 }
 
-// SetActiveTab switches the active Analysis sub-view tab.
+// SetActiveTab switches the active Analysis sub-view tab and asynchronously prepares heavy tab assets.
 func (v *View) SetActiveTab(tab Tab) {
+	v.mu.Lock()
 	v.activeTab = tab
+	if tab != TabReplay2D {
+		v.stopPlaybackLocked()
+	}
+	v.mu.Unlock()
+	if tab == TabReplay2D {
+		v.ensureReplayReadyAsync()
+	} else if tab == TabHeatmaps {
+		v.ensureHeatmapReadyAsync()
+	}
+}
+
+func (v *View) ensureReplayReady() {
+	v.mu.RLock()
+	if v.replayMapReady || v.demo == nil {
+		v.mu.RUnlock()
+		return
+	}
+	mapName := ""
+	if v.demo.MapName != nil {
+		mapName = *v.demo.MapName
+	}
+	lower := v.lowerLayer
+	firstRound := 0
+	if len(v.replayIndex) > 0 {
+		firstRound = int(v.replayIndex[0].RoundNumber)
+	}
+	v.mu.RUnlock()
+
+	v.radarCanvas.ConfigureMap(mapName, lower, [4]float64{-2500, 2500, -2500, 2500})
+	if firstRound > 0 {
+		v.loadReplayRound(firstRound)
+	}
+	v.mu.Lock()
+	v.replayMapReady = true
+	v.mu.Unlock()
+}
+
+// TrimLeadingStationaryFrames drops leading frames at round start where no alive player has moved yet
+// (e.g. freeze-time spawn idle frames), keeping one frame right before movement begins.
+func TrimLeadingStationaryFrames(rd parser.ReplayRoundData) parser.ReplayRoundData {
+	if len(rd.Frames) <= 1 {
+		return rd
+	}
+	type pos2D struct{ x, y float32 }
+	origin := make(map[uint8]pos2D, len(rd.Frames[0].Players))
+	for _, p := range rd.Frames[0].Players {
+		if p.Alive {
+			origin[p.Slot] = pos2D{x: p.X, y: p.Y}
+		}
+	}
+	if len(origin) == 0 {
+		return rd
+	}
+	const moveThreshSq = 4.0 // > 2.0 CS2 units in XY plane
+	for i := 1; i < len(rd.Frames); i++ {
+		for _, p := range rd.Frames[i].Players {
+			if !p.Alive {
+				continue
+			}
+			o, ok := origin[p.Slot]
+			if !ok {
+				continue
+			}
+			dx := float64(p.X - o.x)
+			dy := float64(p.Y - o.y)
+			if dx*dx+dy*dy > moveThreshSq {
+				startIdx := i - 1
+				if startIdx > 0 {
+					rd.Frames = rd.Frames[startIdx:]
+				}
+				return rd
+			}
+		}
+	}
+	return rd
+}
+
+func (v *View) ensureReplayReadyAsync() {
+	v.mu.Lock()
+	if v.replayMapReady || v.replayLoading || v.demo == nil {
+		v.mu.Unlock()
+		return
+	}
+	v.replayLoading = true
+	v.replaySeq++
+	seq := v.replaySeq
+	mapName := ""
+	if v.demo.MapName != nil {
+		mapName = *v.demo.MapName
+	}
+	cachePath := ""
+	if v.demo.ReplayCachePath != nil {
+		cachePath = *v.demo.ReplayCachePath
+	}
+	lower := v.lowerLayer
+	firstRound := 0
+	if len(v.replayIndex) > 0 {
+		firstRound = int(v.replayIndex[0].RoundNumber)
+	}
+	v.mu.Unlock()
+	v.invalidate()
+
+	go func() {
+		v.radarCanvas.ConfigureMap(mapName, lower, [4]float64{-2500, 2500, -2500, 2500})
+		var rd parser.ReplayRoundData
+		loaded := false
+		if firstRound > 0 && cachePath != "" {
+			if _, decoded, err := parser.ReadReplayRound(cachePath, uint32(firstRound)); err == nil {
+				rd = TrimLeadingStationaryFrames(decoded)
+				loaded = true
+				if len(rd.Frames) > 0 {
+					v.radarCanvas.RenderReplayFrame(rd, 0)
+				}
+			}
+		}
+		v.mu.Lock()
+		if v.replaySeq == seq {
+			if loaded {
+				v.replayRound = rd
+				v.replayRoundNum = firstRound
+				v.replayFrameIdx = 0
+				v.replayFramePos = 0
+			}
+			v.replayMapReady = true
+			v.replayLoading = false
+		}
+		v.mu.Unlock()
+		v.invalidate()
+	}()
+}
+
+func (v *View) ensureHeatmapReady() {
+	v.mu.RLock()
+	if v.heatmapReady || v.demo == nil {
+		v.mu.RUnlock()
+		return
+	}
+	mapName := ""
+	if v.demo.MapName != nil {
+		mapName = *v.demo.MapName
+	}
+	lower := v.lowerLayer
+	needRound := len(v.replayRound.Frames) == 0 && len(v.replayIndex) > 0 && v.demo.ReplayCachePath != nil && *v.demo.ReplayCachePath != ""
+	cachePath := ""
+	firstRound := uint32(0)
+	if needRound {
+		cachePath = *v.demo.ReplayCachePath
+		firstRound = v.replayIndex[0].RoundNumber
+	}
+	v.mu.RUnlock()
+
+	v.heatmapCanvas.ConfigureMap(mapName, lower, [4]float64{-2500, 2500, -2500, 2500})
+	if needRound {
+		if _, rd, err := parser.ReadReplayRound(cachePath, firstRound); err == nil {
+			v.mu.Lock()
+			if len(v.replayRound.Frames) == 0 {
+				v.replayRound = rd
+			}
+			v.mu.Unlock()
+		}
+	}
+	v.refreshHeatmap()
+	v.mu.Lock()
+	v.heatmapReady = true
+	v.mu.Unlock()
+}
+
+func (v *View) ensureHeatmapReadyAsync() {
+	v.mu.RLock()
+	if v.heatmapReady || v.heatmapLoading || v.demo == nil {
+		v.mu.RUnlock()
+		return
+	}
+	v.mu.RUnlock()
+	v.refreshHeatmapAsync(true)
 }
 
 // SelectDemo loads analysis data, radar cards, and CS2RPL01 replay index for demoID.
+// Heavy 2D replay frames and KDE heatmaps are lazily initialized on tab switch so
+// opening Match Analysis from Match Library remains instantaneous.
 func (v *View) SelectDemo(ctx context.Context, demoID int64) error {
 	if v.db == nil {
 		return nil
@@ -134,75 +394,273 @@ func (v *View) SelectDemo(ctx context.Context, demoID int64) error {
 	if err != nil {
 		return err
 	}
-	v.demo = &d
-	v.players, _ = v.db.Analysis().ListMatchPlayers(ctx, demoID)
-	v.playerSides, _ = v.db.Analysis().ListMatchPlayerSides(ctx, demoID)
-	v.rounds, _ = v.db.Analysis().ListMatchRounds(ctx, demoID)
-	v.events, _ = v.db.Analysis().ListMatchEvents(ctx, demoID, nil)
-	v.cards, _ = v.db.Analysis().ListRadarCards(ctx, demoID)
-	v.expandedPlayerSID = ""
-	v.selectedRoundNum = 0
+	players, _ := v.db.Analysis().ListMatchPlayers(ctx, demoID)
+	playerSides, _ := v.db.Analysis().ListMatchPlayerSides(ctx, demoID)
+	rounds, _ := v.db.Analysis().ListMatchRounds(ctx, demoID)
+	events, _ := v.db.Analysis().ListMatchEvents(ctx, demoID, nil)
+	cards, _ := v.db.Analysis().ListRadarCards(ctx, demoID)
 
-	if len(v.players) >= 2 {
-		v.compareA = v.players[0].PlayerName
-		v.compareB = v.players[1].PlayerName
-	}
-	if len(v.cards) > 0 {
-		v.selectedCardID = v.cards[0].ID
-		v.radarPreview.SetCard(v.cards[0].StaticImagePath, false)
-	}
-
-	mapName := ""
-	if d.MapName != nil {
-		mapName = *d.MapName
-	}
-	v.radarCanvas.ConfigureMap(mapName, v.lowerLayer, [4]float64{-2500, 2500, -2500, 2500})
-	v.heatmapCanvas.ConfigureMap(mapName, v.lowerLayer, [4]float64{-2500, 2500, -2500, 2500})
-
+	var replayIndex []parser.RoundIndexEntry
 	if d.ReplayCachePath != nil && *d.ReplayCachePath != "" {
 		if _, entries, err := parser.ReadReplayIndex(*d.ReplayCachePath); err == nil && len(entries) > 0 {
-			v.replayIndex = entries
-			v.loadReplayRound(int(entries[0].RoundNumber))
+			replayIndex = entries
 		}
 	}
-	v.refreshHeatmap()
+
+	var firstCardPath string
+	var firstCardID string
+	if len(cards) > 0 {
+		firstCardID = cards[0].ID
+		firstCardPath = cards[0].StaticImagePath
+	}
+	if firstCardPath != "" {
+		v.radarPreview.SetCard(firstCardPath, false)
+	}
+
+	v.mu.Lock()
+	v.stopPlaybackLocked()
+	v.replaySeq++
+	v.frameRenderSeq++
+	v.heatmapSeq++
+	v.demo = &d
+	v.players = players
+	v.playerSides = playerSides
+	v.rounds = rounds
+	v.events = events
+	v.cards = cards
+	v.expandedPlayerSID = ""
+	v.selectedRoundNum = 0
+	v.replayIndex = replayIndex
+	v.replayRound = parser.ReplayRoundData{}
+	v.replayRoundNum = 0
+	v.replayFrameIdx = 0
+	v.replayFramePos = 0
+	v.replayMapReady = false
+	v.replayLoading = false
+	v.heatmapReady = false
+	v.heatmapLoading = false
+	v.selectedCardID = firstCardID
+	if len(players) >= 2 {
+		v.compareA = players[0].PlayerName
+		v.compareB = players[1].PlayerName
+	}
+	activeTab := v.activeTab
+	v.mu.Unlock()
+
+	if activeTab == TabReplay2D {
+		v.ensureReplayReadyAsync()
+	} else if activeTab == TabHeatmaps {
+		v.ensureHeatmapReadyAsync()
+	}
 	return nil
 }
 
 func (v *View) loadReplayRound(roundNum int) {
+	v.mu.RLock()
 	if v.demo == nil || v.demo.ReplayCachePath == nil || *v.demo.ReplayCachePath == "" {
+		v.mu.RUnlock()
 		return
 	}
-	if _, rd, err := parser.ReadReplayRound(*v.demo.ReplayCachePath, uint32(roundNum)); err == nil {
+	cachePath := *v.demo.ReplayCachePath
+	v.mu.RUnlock()
+
+	if _, rd, err := parser.ReadReplayRound(cachePath, uint32(roundNum)); err == nil {
+		rd = TrimLeadingStationaryFrames(rd)
+		if len(rd.Frames) > 0 {
+			v.radarCanvas.RenderReplayFrame(rd, 0)
+		}
+		v.mu.Lock()
+		v.stopPlaybackLocked()
 		v.replayRound = rd
 		v.replayRoundNum = roundNum
 		v.replayFrameIdx = 0
 		v.replayFramePos = 0
-		v.replayPlaying = false
-		if len(rd.Frames) > 0 {
-			v.radarCanvas.RenderReplayFrame(rd, 0)
-		}
+		v.mu.Unlock()
 	}
 }
 
+func (v *View) loadReplayRoundAsync(roundNum int) {
+	v.mu.Lock()
+	if v.demo == nil || v.demo.ReplayCachePath == nil || *v.demo.ReplayCachePath == "" {
+		v.mu.Unlock()
+		return
+	}
+	v.stopPlaybackLocked()
+	v.replaySeq++
+	seq := v.replaySeq
+	v.replayLoading = true
+	cachePath := *v.demo.ReplayCachePath
+	mapName := ""
+	if v.demo.MapName != nil {
+		mapName = *v.demo.MapName
+	}
+	lower := v.lowerLayer
+	v.mu.Unlock()
+	v.invalidate()
+
+	go func() {
+		v.radarCanvas.ConfigureMap(mapName, lower, [4]float64{-2500, 2500, -2500, 2500})
+		_, rd, err := parser.ReadReplayRound(cachePath, uint32(roundNum))
+		if err == nil {
+			rd = TrimLeadingStationaryFrames(rd)
+			if len(rd.Frames) > 0 {
+				v.radarCanvas.RenderReplayFrame(rd, 0)
+			}
+		}
+		v.mu.Lock()
+		if v.replaySeq == seq {
+			if err == nil {
+				v.replayRound = rd
+				v.replayRoundNum = roundNum
+				v.replayFrameIdx = 0
+				v.replayFramePos = 0
+				v.replayMapReady = true
+			}
+			v.replayLoading = false
+		}
+		v.mu.Unlock()
+		v.invalidate()
+	}()
+}
+
+func (v *View) renderReplayFrameAsync(frameIdx int, reconfigureMap bool) {
+	v.mu.Lock()
+	v.frameRenderSeq++
+	seq := v.frameRenderSeq
+	round := v.replayRound
+	mapName := ""
+	if v.demo != nil && v.demo.MapName != nil {
+		mapName = *v.demo.MapName
+	}
+	lower := v.lowerLayer
+	v.mu.Unlock()
+
+	go func() {
+		if reconfigureMap {
+			v.radarCanvas.ConfigureMap(mapName, lower, [4]float64{-2500, 2500, -2500, 2500})
+		}
+		v.mu.RLock()
+		stale := v.frameRenderSeq != seq
+		v.mu.RUnlock()
+		if stale {
+			return
+		}
+		v.radarCanvas.RenderReplayFrame(round, frameIdx)
+		v.invalidate()
+	}()
+}
+
 func (v *View) refreshHeatmap() {
+	v.mu.RLock()
+	players := v.players
+	events := v.events
+	rounds := v.rounds
+	rd := v.replayRound
+	hmPlayer := v.hmPlayer
+	hmTeam := v.hmTeam
+	hmMode := v.hmMode
+	hmRoundType := v.hmRoundType
+	v.mu.RUnlock()
+
 	var steamID string
-	if v.hmPlayer != "" && v.hmPlayer != "全部选手" {
-		for _, p := range v.players {
-			if p.PlayerName == v.hmPlayer {
+	if hmPlayer != "" && hmPlayer != "全部选手" {
+		for _, p := range players {
+			if p.PlayerName == hmPlayer {
 				steamID = p.SteamID64
 				break
 			}
 		}
 	}
-	pts := BuildHeatmapPoints(v.events, v.rounds, v.replayRound, HeatmapFilter{
-		PlayerName:    v.hmPlayer,
+	pts := BuildHeatmapPoints(events, rounds, rd, HeatmapFilter{
+		PlayerName:    hmPlayer,
 		PlayerSteamID: steamID,
-		Team:          v.hmTeam,
-		Mode:          v.hmMode,
-		RoundType:     v.hmRoundType,
+		Team:          hmTeam,
+		Mode:          hmMode,
+		RoundType:     hmRoundType,
 	})
 	v.heatmapCanvas.RenderHeatmap(pts)
+}
+
+func (v *View) refreshHeatmapAsync(reconfigureMap bool) {
+	v.mu.Lock()
+	if v.demo == nil {
+		v.mu.Unlock()
+		return
+	}
+	v.heatmapSeq++
+	seq := v.heatmapSeq
+	v.heatmapLoading = true
+	mapName := ""
+	if v.demo.MapName != nil {
+		mapName = *v.demo.MapName
+	}
+	cachePath := ""
+	if v.demo.ReplayCachePath != nil {
+		cachePath = *v.demo.ReplayCachePath
+	}
+	lower := v.lowerLayer
+	players := v.players
+	events := v.events
+	rounds := v.rounds
+	rd := v.replayRound
+	var firstRound uint32
+	if len(rd.Frames) == 0 && len(v.replayIndex) > 0 {
+		firstRound = v.replayIndex[0].RoundNumber
+	}
+	hmPlayer := v.hmPlayer
+	hmTeam := v.hmTeam
+	hmMode := v.hmMode
+	hmRoundType := v.hmRoundType
+	v.mu.Unlock()
+	v.invalidate()
+
+	go func() {
+		if reconfigureMap {
+			v.heatmapCanvas.ConfigureMap(mapName, lower, [4]float64{-2500, 2500, -2500, 2500})
+		}
+		loadedRound := false
+		if len(rd.Frames) == 0 && firstRound > 0 && cachePath != "" {
+			if _, decoded, err := parser.ReadReplayRound(cachePath, firstRound); err == nil {
+				rd = decoded
+				loadedRound = true
+			}
+		}
+		v.mu.RLock()
+		stale := v.heatmapSeq != seq
+		v.mu.RUnlock()
+		if stale {
+			return
+		}
+
+		var steamID string
+		if hmPlayer != "" && hmPlayer != "全部选手" {
+			for _, p := range players {
+				if p.PlayerName == hmPlayer {
+					steamID = p.SteamID64
+					break
+				}
+			}
+		}
+		pts := BuildHeatmapPoints(events, rounds, rd, HeatmapFilter{
+			PlayerName:    hmPlayer,
+			PlayerSteamID: steamID,
+			Team:          hmTeam,
+			Mode:          hmMode,
+			RoundType:     hmRoundType,
+		})
+		v.heatmapCanvas.RenderHeatmap(pts)
+
+		v.mu.Lock()
+		if v.heatmapSeq == seq {
+			if loadedRound && len(v.replayRound.Frames) == 0 {
+				v.replayRound = rd
+			}
+			v.heatmapReady = true
+			v.heatmapLoading = false
+		}
+		v.mu.Unlock()
+		v.invalidate()
+	}()
 }
 
 // HeatmapFilter controls KDE sample extraction.
@@ -243,7 +701,12 @@ func BuildHeatmapPoints(events []storage.MatchEvent, rounds []storage.MatchRound
 
 	var pts []components.HeatmapPoint
 	if f.Mode == "position" {
-		for _, fr := range rd.Frames {
+		stride := 1
+		if len(rd.Frames) > 400 {
+			stride = 4
+		}
+		for i := 0; i < len(rd.Frames); i += stride {
+			fr := rd.Frames[i]
 			for _, p := range fr.Players {
 				if !p.Alive {
 					continue
@@ -343,38 +806,51 @@ func SortPlayers(players []storage.MatchPlayer, key string, desc bool) []storage
 	return out
 }
 
-// Render draws the 5-tab Match Analysis workspace.
+// Render draws the 6-tab Match Analysis workspace.
 func (v *View) Render(c *ui.Context) {
-	if v.demo == nil {
-		ui.Column(c).Fill().Center().Children(func() {
-			theme.MutedText(c, "请先在 Match Library 选择一场已解析的比赛")
+	v.mu.RLock()
+	demo := v.demo
+	activeTab := v.activeTab
+	statusMsg := v.statusMsg
+	v.mu.RUnlock()
+
+	if demo == nil {
+		ui.Column(c).Fill().Center().Padding(32).Children(func() {
+			ui.Box(c).Width(460).Children(func() {
+				theme.EmptyStateCard(c, theme.IconAnalysis, "尚未选择比赛", "请先在比赛资料库选择一场已解析的 Demo 以查看深度数据与 2D 战术回放。")
+			})
 		})
 		return
 	}
 
-	ui.Column(c).Fill().Padding(16).Gap(12).Children(func() {
-		// Tab bar
-		theme.RowCenter(c).FillWidth().Gap(8).Children(func() {
-			tabs := []struct {
-				id    Tab
-				label string
-			}{
-				{TabOverview, "1. 概览与记分板"},
-				{TabEconomy, "2. 回合与经济走势"},
-				{TabPerformance, "3. 对位与武器表现"},
-				{TabRadar, "4. 选手对比与战力雷达图"},
-				{TabReplay2D, "5. 2D 雷达战术回放"},
-				{TabHeatmaps, "6. 战术热力图"},
-			}
-			for _, tb := range tabs {
-				if theme.TabButton(c, tb.label, v.activeTab == tb.id).Clicked() {
-					v.activeTab = tb.id
+	ui.Column(c).Fill().Padding(14).Gap(14).Children(func() {
+		// Match Hero summary banner (aligned with Match Library map logo + scene scoreline style)
+		mapName := "未知地图"
+		if demo.MapName != nil {
+			mapName = *demo.MapName
+		}
+		theme.RenderMapScoreBanner(c, mapName, demo.TeamAName, demo.TeamBName, demo.TeamAScore, demo.TeamBScore, func() {
+			theme.RowCenter(c).Gap(8).Children(func() {
+				if statusMsg != "" {
+					theme.PillBadge(c, statusMsg, theme.AccentCyan)
 				}
-			}
+				theme.PillBadge(c, fmt.Sprintf("总回合 %d  •  %.0fs", demo.TotalRounds, demo.DurationSec), theme.AccentAmber)
+			})
+		})
+
+		// Segmented pill tab bar
+		theme.RowCenter(c).FillWidth().Children(func() {
+			theme.SegmentedControl(c, []theme.SegmentItem{
+				{Key: string(TabOverview), Label: "1. 概览与记分板", Icon: theme.IconAnalysis},
+				{Key: string(TabEconomy), Label: "2. 回合与经济走势", Icon: theme.IconBolt},
+				{Key: string(TabPerformance), Label: "3. 对位与武器表现", Icon: theme.IconSliders},
+				{Key: string(TabRadar), Label: "4. 选手对比与雷达图", Icon: theme.IconRadar},
+				{Key: string(TabReplay2D), Label: "5. 2D 雷达回放", Icon: theme.IconSpectator},
+				{Key: string(TabHeatmaps), Label: "6. 战术热力图", Icon: theme.IconHighlights},
+			}, string(activeTab), func(k string) {
+				v.SetActiveTab(Tab(k))
+			})
 			ui.Spacer(c)
-			if v.statusMsg != "" {
-				theme.MutedText(c, v.statusMsg)
-			}
 		})
 
 		ui.Scroll(c).FillWidth().Grow(1).MinHeight(0).Children(func() {
@@ -388,8 +864,9 @@ func (v *View) Render(c *ui.Context) {
 					theme.Card(c, func() {
 						theme.ProgressBar(c, opProg, opStage)
 					})
+					return
 				}
-				switch v.activeTab {
+				switch activeTab {
 				case TabOverview:
 					v.renderOverview(c)
 				case TabEconomy:
@@ -409,43 +886,34 @@ func (v *View) Render(c *ui.Context) {
 }
 
 func (v *View) renderOverview(c *ui.Context) {
-	activePlayers, hasSideData := MergeSideStats(v.players, v.playerSides, v.sideFilter)
+	v.mu.RLock()
+	demo := v.demo
+	players := v.players
+	playerSides := v.playerSides
+	v.mu.RUnlock()
+	if demo == nil {
+		return
+	}
+	activePlayers, hasSideData := MergeSideStats(players, playerSides, v.sideFilter)
 	sorted := SortPlayers(activePlayers, v.sortKey, v.sortDesc)
-	theme.Card(c, func() {
-		mapName := "未知地图"
-		if v.demo.MapName != nil {
-			mapName = *v.demo.MapName
-		}
-		theme.RowCenter(c).FillWidth().Gap(14).Children(func() {
-			theme.Capsule(c, strings.ToUpper(mapName), theme.AccentAmber)
-			ui.Text(c, v.demo.TeamAName).FontSize(15).Bold().TextColor(theme.TeamCT)
-			theme.ScoreText(c, fmt.Sprintf("%d", v.demo.TeamAScore)).FontSize(22).TextColor(theme.TextPrimary)
-			theme.ScoreText(c, ":").FontSize(18).TextColor(theme.TextMuted)
-			theme.ScoreText(c, fmt.Sprintf("%d", v.demo.TeamBScore)).FontSize(22).TextColor(theme.TextPrimary)
-			ui.Text(c, v.demo.TeamBName).FontSize(15).Bold().TextColor(theme.TeamT)
-			ui.Spacer(c)
-			theme.StatText(c, fmt.Sprintf("总回合 %d  •  时长 %.0fs", v.demo.TotalRounds, v.demo.DurationSec)).
-				FontSize(12).TextColor(theme.TextMuted)
+	if len(sorted) > 0 {
+		mvp := SortPlayers(activePlayers, "rating", true)[0]
+		topADR := SortPlayers(activePlayers, "adr", true)[0]
+		topFK := SortPlayers(activePlayers, "fk", true)[0]
+		topSwing := SortPlayers(activePlayers, "swing", true)[0]
+		ui.Row(c).FillWidth().Gap(12).Children(func() {
+			ratingVal := mvp.StrikeyeRating
+			ratingLbl := "MVP (STRIKEYE RATING)"
+			if v.ecoAdjusted && mvp.EcoAdjRating > 0 {
+				ratingVal = mvp.EcoAdjRating
+				ratingLbl = "MVP (ECO-ADJUSTED)"
+			}
+			leaderCard(c, ratingLbl, mvp.PlayerName, fmt.Sprintf("%.2f", ratingVal))
+			leaderCard(c, "TOP ADR", topADR.PlayerName, fmt.Sprintf("%.1f", topADR.ADR))
+			leaderCard(c, "FIRST KILLS (FK)", topFK.PlayerName, fmt.Sprintf("%d", topFK.FirstKills))
+			leaderCard(c, "ROUND SWING", topSwing.PlayerName, fmtSwing(topSwing.RoundSwing))
 		})
-		if len(sorted) > 0 {
-			mvp := SortPlayers(activePlayers, "rating", true)[0]
-			topADR := SortPlayers(activePlayers, "adr", true)[0]
-			topFK := SortPlayers(activePlayers, "fk", true)[0]
-			topSwing := SortPlayers(activePlayers, "swing", true)[0]
-			ui.Row(c).FillWidth().Gap(10).Children(func() {
-				ratingVal := mvp.StrikeyeRating
-				ratingLbl := "MVP (Strikeye Rating)"
-				if v.ecoAdjusted && mvp.EcoAdjRating > 0 {
-					ratingVal = mvp.EcoAdjRating
-					ratingLbl = "MVP (Eco-Adjusted)"
-				}
-				leaderCard(c, ratingLbl, mvp.PlayerName, fmt.Sprintf("%.2f", ratingVal))
-				leaderCard(c, "最高 ADR", topADR.PlayerName, fmt.Sprintf("%.1f", topADR.ADR))
-				leaderCard(c, "最多首杀 (FK)", topFK.PlayerName, fmt.Sprintf("%d", topFK.FirstKills))
-				leaderCard(c, "最大回合贡献 (Swing)", topSwing.PlayerName, fmtSwing(topSwing.RoundSwing))
-			})
-		}
-	})
+	}
 
 	theme.Card(c, func() {
 		// Side-split & Eco-Adjusted toolbar
@@ -525,10 +993,10 @@ func (v *View) renderOverview(c *ui.Context) {
 			}
 		})
 
-		groupA, groupB := SplitPlayersByTeam(sorted, v.demo.TeamAName)
+		groupA, groupB := SplitPlayersByTeam(sorted, demo.TeamAName)
 		if len(groupA) > 0 && len(groupB) > 0 {
-			v.renderScoreboardGroup(c, v.demo.TeamAName, theme.TeamCT, groupA)
-			v.renderScoreboardGroup(c, v.demo.TeamBName, theme.TeamT, groupB)
+			v.renderScoreboardGroup(c, demo.TeamAName, theme.TeamCT, groupA)
+			v.renderScoreboardGroup(c, demo.TeamBName, theme.TeamT, groupB)
 		} else {
 			v.renderScoreboardGroup(c, "全场选手数据", theme.AccentAmber, sorted)
 		}
@@ -542,9 +1010,9 @@ func (v *View) renderScoreboardGroup(c *ui.Context, title string, accent ui.Colo
 		ui.Text(c, title).Font("Rajdhani").FontSize(12).Bold().TextColor(accent)
 	})
 	for idx, p := range rows {
-		bg := theme.BgSurface
+		bg := ui.Transparent
 		if idx%2 == 1 {
-			bg = theme.BgInput
+			bg = ui.RGBA(255, 255, 255, 0.03)
 		}
 		isExpanded := v.expandedPlayerSID == p.SteamID64
 		adrVal := p.ADR
@@ -560,7 +1028,7 @@ func (v *View) renderScoreboardGroup(c *ui.Context, title string, accent ui.Colo
 			swingCol = theme.StatusRed
 		}
 
-		rowBtn := ui.ButtonBase(c).FillWidth().Background(bg).Radius(4).PaddingX(6).PaddingY(5).Children(func() {
+		rowBtn := ui.ButtonBase(c).FillWidth().Background(bg).Radius(10).PaddingX(6).PaddingY(6).Children(func() {
 			theme.RowCenter(c).FillWidth().Gap(4).Children(func() {
 				theme.RowCenter(c).Width(150).Gap(6).Children(func() {
 					theme.StatusDot(c, accent, 6)
@@ -626,10 +1094,8 @@ func (v *View) renderPlayerDetailDrawer(c *ui.Context, p storage.MatchPlayer) {
 }
 
 func leaderCard(c *ui.Context, title, player, val string) {
-	ui.Column(c).FillWidth().Background(theme.BgInput).Border(1, theme.BorderSubtle).Radius(6).Padding(12).Gap(4).Children(func() {
-		theme.MutedText(c, title)
-		ui.Text(c, player).FontSize(14).Bold().TextColor(theme.TextPrimary)
-		theme.ScoreText(c, val).FontSize(20).TextColor(theme.AccentAmber)
+	ui.Column(c).Grow(1).MinWidth(0).Children(func() {
+		theme.StatTile(c, title, val, player, theme.AccentAmber)
 	})
 }
 
@@ -647,7 +1113,14 @@ func kpiRateText(wins, total int) string {
 }
 
 func (v *View) renderEconomy(c *ui.Context) {
-	kpis := ComputeEconomyKPIs(v.rounds, v.demo.TeamAName)
+	v.mu.RLock()
+	demo := v.demo
+	rounds := v.rounds
+	v.mu.RUnlock()
+	if demo == nil {
+		return
+	}
+	kpis := ComputeEconomyKPIs(rounds, demo.TeamAName)
 	theme.Card(c, func() {
 		theme.SectionTitle(c, "战术与经济胜率总览")
 		ui.Row(c).FillWidth().Gap(8).Children(func() {
@@ -662,8 +1135,8 @@ func (v *View) renderEconomy(c *ui.Context) {
 	})
 
 	htRound := 13
-	if v.demo.HalftimeRound != nil && *v.demo.HalftimeRound > 1 {
-		htRound = *v.demo.HalftimeRound
+	if demo.HalftimeRound != nil && *demo.HalftimeRound > 1 {
+		htRound = *demo.HalftimeRound
 	}
 
 	theme.Card(c, func() {
@@ -679,7 +1152,7 @@ func (v *View) renderEconomy(c *ui.Context) {
 		})
 		ui.ScrollHorizontal(c).FillWidth().Children(func() {
 			theme.RowCenter(c).Gap(4).PaddingY(4).Children(func() {
-				for _, r := range v.rounds {
+				for _, r := range rounds {
 					if r.RoundNumber == htRound || (r.RoundNumber == 25 && htRound == 13) {
 						lbl := "HT"
 						if r.RoundNumber == 25 {
@@ -697,7 +1170,7 @@ func (v *View) renderEconomy(c *ui.Context) {
 							col = theme.TeamT
 						}
 					} else if r.WinnerTeamKey != nil {
-						if isTeamAKey(*r.WinnerTeamKey, v.demo.TeamAName) {
+						if isTeamAKey(*r.WinnerTeamKey, demo.TeamAName) {
 							col = theme.TeamCT
 						} else {
 							col = theme.TeamT
@@ -729,10 +1202,10 @@ func (v *View) renderEconomy(c *ui.Context) {
 		theme.RowCenter(c).FillWidth().Background(theme.BgInput).Radius(4).PaddingX(8).PaddingY(6).Gap(10).Children(func() {
 			ui.Text(c, "回合").Width(36).FontSize(11).Bold().TextColor(theme.TextMuted)
 			ui.Text(c, "胜方与方式").Width(150).FontSize(11).Bold().TextColor(theme.TextMuted)
-			ui.Text(c, fmt.Sprintf("%s 装备 / 经济", v.demo.TeamAName)).Width(58+barMaxW+84+20).FontSize(11).Bold().TextColor(theme.TeamCT)
-			ui.Text(c, fmt.Sprintf("%s 装备 / 经济", v.demo.TeamBName)).Width(58+barMaxW+84+20).FontSize(11).Bold().TextColor(theme.TeamT)
+			ui.Text(c, fmt.Sprintf("%s 装备 / 经济", demo.TeamAName)).Width(58+barMaxW+84+20).FontSize(11).Bold().TextColor(theme.TeamCT)
+			ui.Text(c, fmt.Sprintf("%s 装备 / 经济", demo.TeamBName)).Width(58+barMaxW+84+20).FontSize(11).Bold().TextColor(theme.TeamT)
 		})
-		for idx, r := range v.rounds {
+		for idx, r := range rounds {
 			sideA := strings.ToUpper(strings.TrimSpace(r.TeamASide))
 			if sideA == "" {
 				sideA = "CT"
@@ -754,11 +1227,11 @@ func (v *View) renderEconomy(c *ui.Context) {
 			winCol := theme.TextMuted
 			if r.WinnerTeamKey != nil {
 				winner = *r.WinnerTeamKey
-				if isTeamAKey(winner, v.demo.TeamAName) {
-					winner = v.demo.TeamAName
+				if isTeamAKey(winner, demo.TeamAName) {
+					winner = demo.TeamAName
 					winCol = colA
 				} else {
-					winner = v.demo.TeamBName
+					winner = demo.TeamBName
 					winCol = colB
 				}
 			}
@@ -816,9 +1289,12 @@ func (v *View) renderEconomy(c *ui.Context) {
 }
 
 func (v *View) renderRoundDetailDrawer(c *ui.Context, r storage.MatchRound) {
+	v.mu.RLock()
+	events := v.events
+	v.mu.RUnlock()
 	econRows := ParsePlayerEconomy(r.PlayerEconomyJSON)
 	var roundKills []storage.MatchEvent
-	for _, ev := range v.events {
+	for _, ev := range events {
 		if ev.RoundNumber == r.RoundNumber && ev.EventType == "kill" {
 			roundKills = append(roundKills, ev)
 		}
@@ -832,8 +1308,8 @@ func (v *View) renderRoundDetailDrawer(c *ui.Context, r storage.MatchRound) {
 			}
 			ui.Spacer(c)
 			if theme.AccentButton(c, fmt.Sprintf("跳转 2D 回放 (R%d)", r.RoundNumber)).Clicked() {
-				v.loadReplayRound(r.RoundNumber)
 				v.SetActiveTab(TabReplay2D)
+				v.loadReplayRoundAsync(r.RoundNumber)
 			}
 		})
 
@@ -899,7 +1375,15 @@ func (v *View) renderRoundDetailDrawer(c *ui.Context, r storage.MatchRound) {
 }
 
 func (v *View) renderPerformance(c *ui.Context) {
-	pm := BuildPerformanceMatrix(v.players, v.events, v.demo.TeamAName)
+	v.mu.RLock()
+	demo := v.demo
+	players := v.players
+	events := v.events
+	v.mu.RUnlock()
+	if demo == nil {
+		return
+	}
+	pm := BuildPerformanceMatrix(players, events, demo.TeamAName)
 
 	renderMatrixCard := func(title string, matrix map[string]map[string]H2HCell) {
 		theme.Card(c, func() {
@@ -910,7 +1394,7 @@ func (v *View) renderPerformance(c *ui.Context) {
 			}
 			// Column header row (Team B)
 			theme.RowCenter(c).FillWidth().Background(theme.BgInput).Radius(4).PaddingX(8).PaddingY(6).Gap(6).Children(func() {
-				ui.Text(c, fmt.Sprintf("%s \\ %s", v.demo.TeamAName, v.demo.TeamBName)).Width(130).FontSize(11).Bold().TextColor(theme.TextMuted)
+				ui.Text(c, fmt.Sprintf("%s \\ %s", demo.TeamAName, demo.TeamBName)).Width(130).FontSize(11).Bold().TextColor(theme.TextMuted)
 				for _, b := range pm.TeamB {
 					ui.Text(c, b.PlayerName).Width(96).FontSize(11).Bold().TextColor(theme.TeamT)
 				}
@@ -980,14 +1464,27 @@ func (v *View) renderPerformance(c *ui.Context) {
 }
 
 func (v *View) renderRadarWorkbench(c *ui.Context) {
+	v.mu.RLock()
+	demo := v.demo
+	players := v.players
+	cards := v.cards
+	selectedCardID := v.selectedCardID
+	v.mu.RUnlock()
+	if demo == nil {
+		return
+	}
+
 	layout, _ := config.ResolveDataLayout(v.dataRoot)
-	svc := radar.NewService(v.db.Analysis(), layout)
+	var svc *radar.Service
+	if v.db != nil {
+		svc = radar.NewService(v.db.Analysis(), layout)
+	}
 
 	// Side-by-side two-player comparison card
-	if len(v.players) >= 2 {
-		names := make([]string, 0, len(v.players))
-		byName := make(map[string]storage.MatchPlayer, len(v.players))
-		for _, p := range v.players {
+	if len(players) >= 2 {
+		names := make([]string, 0, len(players))
+		byName := make(map[string]storage.MatchPlayer, len(players))
+		for _, p := range players {
 			names = append(names, p.PlayerName)
 			byName[p.PlayerName] = p
 		}
@@ -1039,31 +1536,43 @@ func (v *View) renderRadarWorkbench(c *ui.Context) {
 
 	theme.Card(c, func() {
 		theme.RowCenter(c).FillWidth().Gap(10).Children(func() {
-			if theme.AccentButton(c, "一键生成 10 人战力雷达图 (2560x1440)").Clicked() {
-				demoID := v.demo.ID
+			if theme.AccentButton(c, "一键生成 10 人战力雷达图 (2560x1440)").Clicked() && svc != nil {
+				demoID := demo.ID
 				v.setOpProgress(true, -1, "正在生成 10 人六维战力雷达图...")
 				go func() {
-					cards, err := svc.GenerateMatchCards(context.Background(), demoID)
+					genCards, err := svc.GenerateMatchCards(context.Background(), demoID)
 					if err != nil {
+						v.mu.Lock()
 						v.statusMsg = "生成失败: " + err.Error()
+						v.mu.Unlock()
 					} else {
-						v.cards = cards
-						if len(cards) > 0 {
-							v.selectedCardID = cards[0].ID
-							v.radarPreview.SetCard(cards[0].StaticImagePath, true)
+						var firstPath string
+						var firstID string
+						if len(genCards) > 0 {
+							firstID = genCards[0].ID
+							firstPath = genCards[0].StaticImagePath
 						}
-						v.statusMsg = fmt.Sprintf("已生成 %d 张雷达图", len(cards))
+						if firstPath != "" {
+							v.radarPreview.SetCard(firstPath, true)
+						}
+						v.mu.Lock()
+						v.cards = genCards
+						if firstID != "" {
+							v.selectedCardID = firstID
+						}
+						v.statusMsg = fmt.Sprintf("已生成 %d 张雷达图", len(genCards))
+						v.mu.Unlock()
 					}
 					v.setOpProgress(false, 1.0, "")
 				}()
 			}
-			if theme.ActionButton(c, "批量生成 4.0s 开场动画 MP4").Clicked() {
-				demoID := v.demo.ID
-				cards := append([]storage.RadarCard(nil), v.cards...)
+			if theme.ActionButton(c, "批量生成 4.0s 开场动画 MP4").Clicked() && svc != nil {
+				demoID := demo.ID
+				cardsCopy := append([]storage.RadarCard(nil), cards...)
 				v.setOpProgress(true, 0, "正在导出 4.0s 开场动画...")
 				go func() {
-					total := len(cards)
-					for idx, card := range cards {
+					total := len(cardsCopy)
+					for idx, card := range cardsCopy {
 						if total > 0 {
 							v.setOpProgress(true, float64(idx)/float64(total), fmt.Sprintf("正在导出开场动画: %s (%d/%d)", card.PlayerName, idx+1, total))
 						}
@@ -1071,8 +1580,11 @@ func (v *View) renderRadarWorkbench(c *ui.Context) {
 							FFmpegExe: v.ffmpegPath,
 						})
 					}
-					v.cards, _ = v.db.Analysis().ListRadarCards(context.Background(), demoID)
+					refreshed, _ := v.db.Analysis().ListRadarCards(context.Background(), demoID)
+					v.mu.Lock()
+					v.cards = refreshed
 					v.statusMsg = "4.0s 开场动画批量导出完成"
+					v.mu.Unlock()
 					v.setOpProgress(false, 1.0, "")
 				}()
 			}
@@ -1081,19 +1593,22 @@ func (v *View) renderRadarWorkbench(c *ui.Context) {
 		// Player selector + custom avatar/logo binding
 		ui.ScrollHorizontal(c).FillWidth().Children(func() {
 			theme.RowCenter(c).Gap(8).Children(func() {
-				for _, card := range v.cards {
-					if theme.TabButton(c, card.PlayerName, card.ID == v.selectedCardID).Clicked() {
+				for _, card := range cards {
+					if theme.TabButton(c, card.PlayerName, card.ID == selectedCardID).Clicked() {
+						v.mu.Lock()
 						v.selectedCardID = card.ID
-						v.radarPreview.SetCard(card.StaticImagePath, false)
+						v.mu.Unlock()
+						selectedCardID = card.ID
+						v.radarPreview.SetCardAsync(card.StaticImagePath, false, v.invalidate)
 					}
 				}
 			})
 		})
 
 		var activeCard *storage.RadarCard
-		for i := range v.cards {
-			if v.cards[i].ID == v.selectedCardID {
-				activeCard = &v.cards[i]
+		for i := range cards {
+			if cards[i].ID == selectedCardID {
+				activeCard = &cards[i]
 				break
 			}
 		}
@@ -1102,7 +1617,7 @@ func (v *View) renderRadarWorkbench(c *ui.Context) {
 			theme.RowCenter(c).FillWidth().Gap(8).Children(func() {
 				ui.TextInput(c, &v.portraitInput).Width(240).Placeholder("自定义写真头像 PNG/JPG 路径")
 				ui.TextInput(c, &v.logoInput).Width(240).Placeholder("自定义战队 Logo PNG 路径")
-				if theme.AccentButton(c, "绑定并重绘卡片").Clicked() {
+				if theme.AccentButton(c, "绑定并重绘卡片").Clicked() && svc != nil {
 					var pPtr, lPtr *string
 					if strings.TrimSpace(v.portraitInput) != "" {
 						s := strings.TrimSpace(v.portraitInput)
@@ -1112,16 +1627,27 @@ func (v *View) renderRadarWorkbench(c *ui.Context) {
 						s := strings.TrimSpace(v.logoInput)
 						lPtr = &s
 					}
-					updated, err := svc.UpdateCardAppearance(context.Background(), v.demo.ID, activeCard.SteamID64, pPtr, lPtr, radar.RenderAnimOptions{
-						FFmpegExe: v.ffmpegPath,
-					})
-					if err != nil {
-						v.statusMsg = "重绘失败: " + err.Error()
-					} else {
-						v.cards, _ = v.db.Analysis().ListRadarCards(context.Background(), v.demo.ID)
-						v.radarPreview.SetCard(updated.StaticImagePath, true)
-						v.statusMsg = "已重绘雷达图: " + updated.PlayerName
-					}
+					demoID := demo.ID
+					steamID := activeCard.SteamID64
+					v.setOpProgress(true, -1, "正在重绘选手雷达图卡片...")
+					go func() {
+						updated, err := svc.UpdateCardAppearance(context.Background(), demoID, steamID, pPtr, lPtr, radar.RenderAnimOptions{
+							FFmpegExe: v.ffmpegPath,
+						})
+						if err != nil {
+							v.mu.Lock()
+							v.statusMsg = "重绘失败: " + err.Error()
+							v.mu.Unlock()
+						} else {
+							refreshed, _ := v.db.Analysis().ListRadarCards(context.Background(), demoID)
+							v.radarPreview.SetCard(updated.StaticImagePath, true)
+							v.mu.Lock()
+							v.cards = refreshed
+							v.statusMsg = "已重绘雷达图: " + updated.PlayerName
+							v.mu.Unlock()
+						}
+						v.setOpProgress(false, 1.0, "")
+					}()
 				}
 			})
 		}
@@ -1140,6 +1666,12 @@ func (v *View) renderRadarWorkbench(c *ui.Context) {
 
 // advanceReplay advances 2D replay playback by elapsed wall-clock time scaled by replaySpeed.
 func (v *View) advanceReplay(elapsed time.Duration) bool {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	return v.advanceReplayLocked(elapsed)
+}
+
+func (v *View) advanceReplayLocked(elapsed time.Duration) bool {
 	if !v.replayPlaying || len(v.replayRound.Frames) == 0 || elapsed <= 0 {
 		return false
 	}
@@ -1163,19 +1695,18 @@ func (v *View) advanceReplay(elapsed time.Duration) bool {
 }
 
 func (v *View) renderReplay2D(c *ui.Context) {
-	if v.replayPlaying && len(v.replayRound.Frames) > 0 {
-		now := time.Now()
-		if v.lastStepAt.IsZero() {
-			v.lastStepAt = now
-		}
-		elapsed := now.Sub(v.lastStepAt)
-		v.lastStepAt = now
-		if v.advanceReplay(elapsed) {
-			v.radarCanvas.RenderReplayFrame(v.replayRound, v.replayFrameIdx)
-		}
-		if v.replayPlaying {
-			c.Invalidate()
-		}
+	v.mu.RLock()
+	demo := v.demo
+	replayIndex := v.replayIndex
+	replayRoundNum := v.replayRoundNum
+	replayPlaying := v.replayPlaying
+	replaySpeed := v.replaySpeed
+	replayFrameIdx := v.replayFrameIdx
+	frameCount := len(v.replayRound.Frames)
+	replayLoading := v.replayLoading
+	v.mu.RUnlock()
+	if demo == nil {
+		return
 	}
 
 	theme.Card(c, func() {
@@ -1185,9 +1716,14 @@ func (v *View) renderReplay2D(c *ui.Context) {
 
 			// Right tactical control & legend panel
 			ui.Column(c).Fill().Gap(12).Children(func() {
-				theme.SectionTitle(c, "32Hz 2D 战术雷达回放")
+				theme.RowCenter(c).FillWidth().Gap(8).Children(func() {
+					theme.SectionTitle(c, "32Hz 2D 战术雷达回放")
+					if replayLoading {
+						theme.PillBadge(c, "加载中...", theme.AccentCyan)
+					}
+				})
 				theme.MutedText(c, "回合选择:")
-				if len(v.replayIndex) == 0 {
+				if len(replayIndex) == 0 {
 					theme.RowCenter(c).FillWidth().Background(theme.BgInput).Radius(6).PaddingX(10).PaddingY(8).Gap(8).Children(func() {
 						theme.StatusDot(c, theme.StatusGray, 6)
 						theme.MutedText(c, "暂无 32Hz 回放索引（需先完成 Demo 解析）")
@@ -1195,9 +1731,9 @@ func (v *View) renderReplay2D(c *ui.Context) {
 				} else {
 					ui.ScrollHorizontal(c).FillWidth().Children(func() {
 						theme.RowCenter(c).Gap(6).Children(func() {
-							for _, ent := range v.replayIndex {
-								if theme.TabButton(c, fmt.Sprintf("R%d", ent.RoundNumber), int(ent.RoundNumber) == v.replayRoundNum).Clicked() {
-									v.loadReplayRound(int(ent.RoundNumber))
+							for _, ent := range replayIndex {
+								if theme.TabButton(c, fmt.Sprintf("R%d", ent.RoundNumber), int(ent.RoundNumber) == replayRoundNum).Clicked() {
+									v.loadReplayRoundAsync(int(ent.RoundNumber))
 								}
 							}
 						})
@@ -1206,21 +1742,22 @@ func (v *View) renderReplay2D(c *ui.Context) {
 
 				theme.RowCenter(c).FillWidth().Gap(8).Children(func() {
 					playLbl := "播放 32Hz"
-					if v.replayPlaying {
+					if replayPlaying {
 						playLbl = "暂停"
 					}
 					if theme.AccentButton(c, playLbl).Clicked() {
-						v.replayPlaying = !v.replayPlaying
-						v.replayFramePos = float64(v.replayFrameIdx)
-						v.lastStepAt = time.Now()
+						v.mu.Lock()
 						if v.replayPlaying {
-							c.Invalidate()
+							v.stopPlaybackLocked()
+						} else {
+							v.startPlaybackLocked()
 						}
+						v.mu.Unlock()
 					}
 					for _, spd := range []float64{0.5, 1.0, 2.0, 4.0, 8.0} {
 						lbl := fmt.Sprintf("%.2gx", spd)
 						btn := theme.ActionButton(c, lbl)
-						activeSpd := v.replaySpeed
+						activeSpd := replaySpeed
 						if activeSpd <= 0 {
 							activeSpd = 1.0
 						}
@@ -1228,30 +1765,35 @@ func (v *View) renderReplay2D(c *ui.Context) {
 							btn = btn.Border(1, theme.AccentAmber)
 						}
 						if btn.Clicked() {
+							v.mu.Lock()
 							v.replaySpeed = spd
+							v.mu.Unlock()
 						}
 					}
-					if v.demo.MapName != nil && maps.HasLowerLayer(*v.demo.MapName) {
+					if demo.MapName != nil && maps.HasLowerLayer(*demo.MapName) {
 						if ui.Checkbox(c, &v.lowerLayer, "下层地图 (Lower)").Changed() {
-							v.radarCanvas.ConfigureMap(*v.demo.MapName, v.lowerLayer, [4]float64{-2500, 2500, -2500, 2500})
-							v.radarCanvas.RenderReplayFrame(v.replayRound, v.replayFrameIdx)
+							v.renderReplayFrameAsync(replayFrameIdx, true)
 						}
 					}
 					ui.Spacer(c)
-					theme.StatText(c, fmt.Sprintf("帧 %d / %d", v.replayFrameIdx, maxInt(0, len(v.replayRound.Frames)-1))).
+					theme.StatText(c, fmt.Sprintf("帧 %d / %d", replayFrameIdx, maxInt(0, frameCount-1))).
 						FontSize(12).TextColor(theme.AccentCyan)
 				})
 
-				frameVal := float64(v.replayFrameIdx)
-				maxF := float64(maxInt(1, len(v.replayRound.Frames)-1))
+				frameVal := float64(replayFrameIdx)
+				maxF := float64(maxInt(1, frameCount-1))
 				if ui.Slider(c, &frameVal, 0, maxF).FillWidth().Changed() {
-					v.replayFrameIdx = int(frameVal)
+					newIdx := int(frameVal)
+					v.mu.Lock()
+					v.stopPlaybackLocked()
+					v.replayFrameIdx = newIdx
 					v.replayFramePos = frameVal
-					v.radarCanvas.RenderReplayFrame(v.replayRound, v.replayFrameIdx)
+					v.mu.Unlock()
+					v.renderReplayFrameAsync(newIdx, false)
 				}
 
 				// Tactical legend
-				ui.Column(c).FillWidth().Background(theme.BgInput).Border(1, theme.BorderSubtle).Radius(6).Padding(10).Gap(6).Children(func() {
+				ui.Column(c).FillWidth().Background(theme.BgInput).Border(1, theme.RimBorder).Radius(14).Padding(12).Gap(6).Children(func() {
 					theme.MutedText(c, "图例说明")
 					theme.RowCenter(c).Gap(12).Children(func() {
 						theme.StatusDot(c, theme.TeamCT, 8)
@@ -1274,8 +1816,17 @@ func (v *View) renderReplay2D(c *ui.Context) {
 }
 
 func (v *View) renderHeatmaps(c *ui.Context) {
+	v.mu.RLock()
+	demo := v.demo
+	players := v.players
+	heatmapLoading := v.heatmapLoading
+	v.mu.RUnlock()
+	if demo == nil {
+		return
+	}
+
 	playerOpts := []string{"全部选手"}
-	for _, p := range v.players {
+	for _, p := range players {
 		playerOpts = append(playerOpts, p.PlayerName)
 	}
 
@@ -1286,47 +1837,47 @@ func (v *View) renderHeatmaps(c *ui.Context) {
 
 			// Right filter & density legend panel
 			ui.Column(c).Fill().Gap(12).Children(func() {
-				theme.SectionTitle(c, "KDE 战术热力图")
+				theme.RowCenter(c).FillWidth().Gap(8).Children(func() {
+					theme.SectionTitle(c, "KDE 战术热力图")
+					if heatmapLoading {
+						theme.PillBadge(c, "计算中...", theme.AccentCyan)
+					}
+				})
 				theme.MutedText(c, "通过核密度估计 (KDE) 叠加展示交火、击杀与站位分布。")
 
-				ui.Column(c).FillWidth().Background(theme.BgInput).Border(1, theme.BorderSubtle).Radius(6).Padding(12).Gap(10).Children(func() {
+				ui.Column(c).FillWidth().Background(theme.BgInput).Border(1, theme.RimBorder).Radius(14).Padding(14).Gap(10).Children(func() {
 					theme.RowCenter(c).FillWidth().Gap(8).Children(func() {
 						theme.MutedText(c, "分析维度").Width(72)
 						if ui.Select(c, &v.hmMode, []string{"position", "firefight", "kill", "death"}).Width(220).Changed() {
-							v.refreshHeatmap()
+							v.refreshHeatmapAsync(false)
 						}
 					})
 					theme.RowCenter(c).FillWidth().Gap(8).Children(func() {
 						theme.MutedText(c, "目标选手").Width(72)
 						if ui.Select(c, &v.hmPlayer, playerOpts).Width(220).Changed() {
-							v.refreshHeatmap()
+							v.refreshHeatmapAsync(false)
 						}
 					})
 					theme.RowCenter(c).FillWidth().Gap(8).Children(func() {
 						theme.MutedText(c, "阵营筛选").Width(72)
 						if ui.Select(c, &v.hmTeam, []string{"全部阵营", "T", "CT"}).Width(220).Changed() {
-							v.refreshHeatmap()
+							v.refreshHeatmapAsync(false)
 						}
 					})
 					theme.RowCenter(c).FillWidth().Gap(8).Children(func() {
 						theme.MutedText(c, "回合类型").Width(72)
 						if ui.Select(c, &v.hmRoundType, []string{"全部回合", "手枪局", "长枪局", "Eco"}).Width(220).Changed() {
-							v.refreshHeatmap()
+							v.refreshHeatmapAsync(false)
 						}
 					})
-					if v.demo.MapName != nil && maps.HasLowerLayer(*v.demo.MapName) {
+					if demo.MapName != nil && maps.HasLowerLayer(*demo.MapName) {
 						if ui.Checkbox(c, &v.lowerLayer, "切换下层地图 (Lower)").Changed() {
-							v.heatmapCanvas.ConfigureMap(*v.demo.MapName, v.lowerLayer, [4]float64{-2500, 2500, -2500, 2500})
-							v.refreshHeatmap()
+							v.refreshHeatmapAsync(true)
 						}
 					}
 					theme.RowCenter(c).FillWidth().Children(func() {
 						if theme.AccentButton(c, "重算热力图").Clicked() {
-							v.setOpProgress(true, -1, "正在计算 KDE 战术热力图...")
-							go func() {
-								v.refreshHeatmap()
-								v.setOpProgress(false, 1.0, "")
-							}()
+							v.refreshHeatmapAsync(false)
 						}
 					})
 				})

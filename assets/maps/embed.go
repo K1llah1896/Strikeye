@@ -7,7 +7,7 @@ import (
 	"strings"
 )
 
-//go:embed *.png map-data.json
+//go:embed *.png map-data.json icons/*.png scenes/*.jpg
 var fs embed.FS
 
 // MapMeta describes CS2 radar image world-to-pixel coordinate transformation.
@@ -74,6 +74,32 @@ func HasLowerLayer(name string) bool {
 	}
 	_, err := fs.ReadFile(key + "_lower.png")
 	return err == nil
+}
+
+// LoadMapIconPNG returns the official embedded CS2 map logo PNG bytes, if bundled.
+func LoadMapIconPNG(name string) ([]byte, bool) {
+	key := strings.ToLower(strings.TrimSpace(name))
+	if key == "" {
+		return nil, false
+	}
+	data, err := fs.ReadFile("icons/" + key + ".png")
+	if err != nil {
+		return nil, false
+	}
+	return data, true
+}
+
+// LoadMapSceneJPG returns the official embedded CS2 in-game map scene JPEG bytes, if bundled.
+func LoadMapSceneJPG(name string) ([]byte, bool) {
+	key := strings.ToLower(strings.TrimSpace(name))
+	if key == "" {
+		return nil, false
+	}
+	data, err := fs.ReadFile("scenes/" + key + ".jpg")
+	if err != nil {
+		return nil, false
+	}
+	return data, true
 }
 
 // IsLowerLevel reports whether a world Z coordinate belongs to the lower radar layer.

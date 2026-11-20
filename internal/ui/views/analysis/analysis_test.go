@@ -4,6 +4,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/egoist/mygo/ui"
 	"strikeye/internal/parser"
 	"strikeye/internal/storage"
 )
@@ -219,5 +220,150 @@ func TestTrimLeadingStationaryFrames(t *testing.T) {
 	if len(trimmed.Frames) != 3 || trimmed.Frames[0].Tick != 14 {
 		t.Fatalf("expected 3 frames starting at tick 14 (1 frame before move), got len=%d firstTick=%d",
 			len(trimmed.Frames), trimmed.Frames[0].Tick)
+	}
+}
+
+func TestRoundEconomySideLoadoutAndRemainingMoney(t *testing.T) {
+	r := storage.MatchRound{RoundNumber: 5, TeamASide: "T", TeamBSide: "CT"}
+
+	peExplicit := parser.PlayerRoundEconomy{
+		PlayerName:     "donk",
+		TeamKey:        "team_a",
+		Side:           "T",
+		EquipValue:     4700,
+		AccountStart:   5400,
+		CashSpent:      4200,
+		MoneyRemaining: 1200,
+		Weapons:        []string{"AK-47", "Glock-18", "Smoke", "Flash"},
+		HasArmor:       true,
+		HasHelmet:      true,
+	}
+	if got := resolvePlayerEconomySide(peExplicit, r, "Team A"); got != "T" {
+		t.Fatalf("expected T, got %s", got)
+	}
+	if got := playerRemainingMoney(peExplicit); got != 1200 {
+		t.Fatalf("expected remaining 1200, got %d", got)
+	}
+	if got := formatPlayerLoadout(peExplicit); got != "全甲 · AK-47 · Glock-18 · Smoke · Flash" {
+		t.Fatalf("unexpected loadout: %q", got)
+	}
+
+	peLegacy := parser.PlayerRoundEconomy{
+		PlayerName:   "sh1ro",
+		TeamKey:      "team_b",
+		EquipValue:   5500,
+		AccountStart: 6000,
+		CashSpent:    4750,
+		EconomyType:  "full",
+		HasArmor:     true,
+		HasDefuseKit: true,
+	}
+	if got := resolvePlayerEconomySide(peLegacy, r, "Team A"); got != "CT" {
+		t.Fatalf("expected legacy CT fallback, got %s", got)
+	}
+	if got := playerRemainingMoney(peLegacy); got != 1250 {
+		t.Fatalf("expected legacy remaining 1250, got %d", got)
+	}
+	if got := formatPlayerLoadout(peLegacy); got != "半甲 · 钳" {
+		t.Fatalf("unexpected legacy gear loadout: %q", got)
+	}
+}
+
+func TestBuildHeatmapPointsMultiFilters(t *testing.T) {
+	slot1, slot2 := 1, 2
+	players := []storage.MatchPlayer{
+		{SteamID64: "S1", PlayerName: "donk", TeamKey: "team_a", SpecSlot: &slot1},
+		{SteamID64: "S2", PlayerName: "ropz", TeamKey: "team_b", SpecSlot: &slot2},
+	}
+	rounds := []storage.MatchRound{
+		{RoundNumber: 1, TeamASide: "T", TeamBSide: "CT", TeamAEconomyType: "pistol", TeamBEconomyType: "pistol"},
+		{RoundNumber: 4, TeamASide: "T", TeamBSide: "CT", TeamAEconomyType: "full", TeamBEconomyType: "full"},
+	}
+	replays := map[int]parser.ReplayRoundData{
+		1: {
+			RoundNumber: 1,
+			Frames: []parser.ReplayFrame{
+				{Tick: 100, Players: []parser.ReplayPlayerPose{
+					{Slot: 1, Alive: true, Team: 1, X: -100, Y: 200},
+					{Slot: 2, Alive: true, Team: 2, X: 300, Y: -400},
+				}},
+			},
+		},
+		4: {
+			RoundNumber: 4,
+			Frames: []parser.ReplayFrame{
+				{Tick: 500, Players: []parser.ReplayPlayerPose{
+					{Slot: 1, Alive: true, Team: 1, X: -500, Y: 600},
+					{Slot: 2, Alive: true, Team: 2, X: 700, Y: -800},
+				}},
+			},
+		},
+	}
+
+	s1, s2 := "S1", "S2"
+	tkA, tkB := "team_a", "team_b"
+	events := []storage.MatchEvent{
+		{RoundNumber: 4, Tick: 500, EventType: "kill", ActorSteamID64: &s1, ActorTeamKey: &tkA, TargetSteamID64: &s2, TargetTeamKey: &tkB},
+	}
+
+	// 1. position mode filtered by player + round type
+	fPos := resolveHeatmapFilter(players, "donk", "全部阵营", "position", "长枪局", "Team A")
+	ptsPos := BuildHeatmapPointsMulti(events, rounds, players, replays, fPos)
+	if len(ptsPos) != 1 || ptsPos[0].X != -500 {
+		t.Fatalf("expected 1 position point for donk in full round, got %+v", ptsPos)
+	}
+
+	// 2. kill mode with nil ExtraJSON falls back to .cs2rpl frames
+	fKill := resolveHeatmapFilter(players, "donk", "T", "kill", "长枪局", "Team A")
+	ptsKill := BuildHeatmapPointsMulti(events, rounds, players, replays, fKill)
+	if len(ptsKill) != 1 || ptsKill[0].X != -500 {
+		t.Fatalf("expected 1 kill point at -500, got %+v", ptsKill)
+	}
+
+	// 3. death mode for ropz falls back to victim coords (700, -800)
+	fDeath := resolveHeatmapFilter(players, "ropz", "CT", "death", "长枪局", "Team A")
+	ptsDeath := BuildHeatmapPointsMulti(events, rounds, players, replays, fDeath)
+	if len(ptsDeath) != 1 || ptsDeath[0].X != 700 {
+		t.Fatalf("expected 1 death point at 700, got %+v", ptsDeath)
+	}
+
+	// 4. firefight mode with no matching round type returns 0 points (not all rounds)
+	fEco := resolveHeatmapFilter(players, "全部选手", "全部阵营", "firefight", "Eco", "Team A")
+	ptsEco := BuildHeatmapPointsMulti(events, rounds, players, replays, fEco)
+	if len(ptsEco) != 0 {
+		t.Fatalf("expected 0 eco points when no eco rounds exist, got %+v", ptsEco)
+	}
+}
+
+func TestKillFeedRendersOfficialWeaponAndModifierSVGs(t *testing.T) {
+	v := NewView(nil, "", "")
+	v.demo = &storage.Demo{ID: 1, TeamAName: "Team A", TeamBName: "Team B"}
+	att, vic, wep, ass := "donk", "ropz", "AK-47", "magixx"
+	tkA, tkB := "team_a", "team_b"
+	v.events = []storage.MatchEvent{
+		{
+			RoundNumber:     3,
+			RoundTimeSec:    24.5,
+			EventType:       "kill",
+			ActorName:       &att,
+			ActorTeamKey:    &tkA,
+			TargetName:      &vic,
+			TargetTeamKey:   &tkB,
+			AssisterName:    &ass,
+			Weapon:          &wep,
+			IsHeadshot:      true,
+			IsWallbang:      true,
+			IsThroughSmoke:  true,
+			IsAssistedFlash: true,
+		},
+	}
+	r := storage.MatchRound{RoundNumber: 3, TeamASide: "T", TeamBSide: "CT"}
+
+	tt := ui.NewTester(func(c *ui.Context) {
+		v.renderRoundDetailDrawer(c, r)
+	}, 1100, 600)
+	tt.Frame()
+	if !tt.HasText("donk") || !tt.HasText("ropz") {
+		t.Fatalf("expected attacker and victim names in killfeed")
 	}
 }

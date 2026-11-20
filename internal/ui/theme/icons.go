@@ -1,6 +1,11 @@
 package theme
 
-import "github.com/egoist/mygo/ui"
+import (
+	"sync"
+
+	"github.com/egoist/mygo/ui"
+	"strikeye/assets/weapons"
+)
 
 func mustIconSVG(body string) *ui.SVG {
 	return ui.MustParseSVG([]byte(`<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">` + body + `</svg>`))
@@ -38,4 +43,49 @@ func RenderIcon(c *ui.Context, svg *ui.SVG, size float32, col ui.Color) ui.Eleme
 		return ui.Box(c).Width(size).Height(size)
 	}
 	return ui.Icon(c, svg).Width(size).Height(size).TextColor(col).Shrink(0)
+}
+
+var (
+	weaponSVGMu    sync.RWMutex
+	weaponSVGCache = map[string]*ui.SVG{}
+)
+
+// CachedWeaponSVG lazily parses and caches an official CS2 weapon or killfeed modifier SVG.
+func CachedWeaponSVG(name string) *ui.SVG {
+	key := weapons.NormalizeWeaponKey(name)
+	if key == "" {
+		return nil
+	}
+	weaponSVGMu.RLock()
+	svg, ok := weaponSVGCache[key]
+	weaponSVGMu.RUnlock()
+	if ok {
+		return svg
+	}
+
+	var parsed *ui.SVG
+	if raw, found := weapons.LoadSVG(key); found {
+		if s, err := ui.ParseSVG(raw); err == nil {
+			parsed = s
+		}
+	}
+	weaponSVGMu.Lock()
+	weaponSVGCache[key] = parsed
+	weaponSVGMu.Unlock()
+	return parsed
+}
+
+// RenderWeaponIcon renders a weapon or killfeed modifier SVG preserving its natural aspect ratio.
+func RenderWeaponIcon(c *ui.Context, name string, height float32, col ui.Color) bool {
+	svg := CachedWeaponSVG(name)
+	if svg == nil {
+		return false
+	}
+	w, h := ui.ImageSize(svg)
+	dispW := height
+	if w > 0 && h > 0 {
+		dispW = height * (w / h)
+	}
+	ui.Icon(c, svg).Width(dispW).Height(height).TextColor(col).Shrink(0)
+	return true
 }

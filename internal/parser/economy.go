@@ -18,13 +18,19 @@ var economyOrder = []string{
 
 // PlayerRoundEconomy captures one player's freeze-time-end economy snapshot.
 type PlayerRoundEconomy struct {
-	SteamID64    string `json:"steam_id64"`
-	PlayerName   string `json:"player_name"`
-	TeamKey      string `json:"team_key"`
-	EquipValue   int    `json:"equip_value"`
-	AccountStart int    `json:"account_start"`
-	CashSpent    int    `json:"cash_spent"`
-	EconomyType  string `json:"economy_type"`
+	SteamID64      string   `json:"steam_id64"`
+	PlayerName     string   `json:"player_name"`
+	TeamKey        string   `json:"team_key"`
+	Side           string   `json:"side,omitempty"`
+	EquipValue     int      `json:"equip_value"`
+	AccountStart   int      `json:"account_start"`
+	CashSpent      int      `json:"cash_spent"`
+	MoneyRemaining int      `json:"money_remaining"`
+	EconomyType    string   `json:"economy_type"`
+	Weapons        []string `json:"weapons,omitempty"`
+	HasArmor       bool     `json:"has_armor,omitempty"`
+	HasHelmet      bool     `json:"has_helmet,omitempty"`
+	HasDefuseKit   bool     `json:"has_defuse_kit,omitempty"`
 }
 
 // ClassifyPlayerEconomy classifies a player's round economy into pistol, full,

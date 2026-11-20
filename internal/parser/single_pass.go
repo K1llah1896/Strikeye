@@ -445,17 +445,30 @@ func executeSinglePass(ctx context.Context, demo storage.Demo, opts ParseOptions
 			}
 			ev := pl.EquipmentValueCurrent()
 			spent := pl.MoneySpentThisRound()
-			acctStart := pl.Money() + spent
+			moneyRem := pl.Money()
+			acctStart := moneyRem + spent
 			etype := ClassifyPlayerEconomy(rw.RoundNumber, rt.HalftimeRound(), ev, acctStart, spent)
+			side := ""
+			if pl.Team == common.TeamCounterTerrorists {
+				side = "CT"
+			} else if pl.Team == common.TeamTerrorists {
+				side = "T"
+			}
 			equipValues[sid] = append(equipValues[sid], ev)
 			peList = append(peList, PlayerRoundEconomy{
-				SteamID64:    sid,
-				PlayerName:   pl.Name,
-				TeamKey:      tk,
-				EquipValue:   ev,
-				AccountStart: acctStart,
-				CashSpent:    spent,
-				EconomyType:  etype,
+				SteamID64:      sid,
+				PlayerName:     pl.Name,
+				TeamKey:        tk,
+				Side:           side,
+				EquipValue:     ev,
+				AccountStart:   acctStart,
+				CashSpent:      spent,
+				MoneyRemaining: moneyRem,
+				EconomyType:    etype,
+				Weapons:        extractPlayerEquipment(pl),
+				HasArmor:       pl.Armor() > 0,
+				HasHelmet:      pl.HasHelmet(),
+				HasDefuseKit:   pl.HasDefuseKit(),
 			})
 			if tk == "team_a" {
 				equipA += ev
@@ -689,6 +702,27 @@ func executeSinglePass(ctx context.Context, demo storage.Demo, opts ParseOptions
 		}
 		kills = append(kills, ke)
 
+		var extraJSONPtr *string
+		{
+			coords := map[string]float64{}
+			if e.Killer != nil {
+				kp := e.Killer.Position()
+				coords["pos_x"] = kp.X
+				coords["pos_y"] = kp.Y
+			}
+			if e.Victim != nil {
+				vp := e.Victim.Position()
+				coords["victim_x"] = vp.X
+				coords["victim_y"] = vp.Y
+			}
+			if len(coords) > 0 {
+				if raw, mErr := json.Marshal(coords); mErr == nil {
+					s := string(raw)
+					extraJSONPtr = &s
+				}
+			}
+		}
+
 		matchEvents = append(matchEvents, storage.MatchEvent{
 			RoundNumber:     rw.RoundNumber,
 			Tick:            tick,
@@ -709,6 +743,7 @@ func executeSinglePass(ctx context.Context, demo storage.Demo, opts ParseOptions
 			IsNoscope:       e.NoScope,
 			IsAttackerBlind: e.AttackerBlind,
 			IsAssistedFlash: e.AssistedFlash,
+			ExtraJSON:       extraJSONPtr,
 		})
 	})
 
@@ -1037,4 +1072,58 @@ func clampInt(v, lo, hi int) int {
 		return hi
 	}
 	return v
+}
+
+func extractPlayerEquipment(pl *common.Player) []string {
+	if pl == nil {
+		return nil
+	}
+	var primary, pistols, nades []string
+	for _, eq := range pl.Weapons() {
+		if eq == nil {
+			continue
+		}
+		switch eq.Type {
+		case common.EqKnife, common.EqKevlar, common.EqHelmet, common.EqDefuseKit, common.EqUnknown:
+			continue
+		case common.EqSmoke:
+			nades = append(nades, "Smoke")
+			continue
+		case common.EqFlash:
+			nades = append(nades, "Flash")
+			continue
+		case common.EqHE:
+			nades = append(nades, "HE")
+			continue
+		case common.EqMolotov:
+			nades = append(nades, "Molotov")
+			continue
+		case common.EqIncendiary:
+			nades = append(nades, "Inc")
+			continue
+		case common.EqDecoy:
+			nades = append(nades, "Decoy")
+			continue
+		case common.EqBomb:
+			nades = append(nades, "C4")
+			continue
+		}
+		name := eq.Type.String()
+		if name == "" {
+			continue
+		}
+		switch eq.Class() {
+		case common.EqClassRifle, common.EqClassSMG, common.EqClassHeavy:
+			primary = append(primary, name)
+		case common.EqClassPistols:
+			pistols = append(pistols, name)
+		default:
+			nades = append(nades, name)
+		}
+	}
+	out := make([]string, 0, len(primary)+len(pistols)+len(nades))
+	out = append(out, primary...)
+	out = append(out, pistols...)
+	out = append(out, nades...)
+	return out
 }

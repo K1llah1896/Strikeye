@@ -6,7 +6,9 @@ require (
 	github.com/Microsoft/go-winio v0.6.4
 	github.com/egoist/mygo v0.10.0
 	github.com/fogleman/gg v1.3.0
+	github.com/klauspost/compress v1.18.7
 	github.com/markus-wa/demoinfocs-golang/v5 v5.3.0
+	github.com/pion/opus v0.1.0
 	golang.org/x/image v0.48.0
 	golang.org/x/sys v0.50.0
 	google.golang.org/protobuf v1.36.11

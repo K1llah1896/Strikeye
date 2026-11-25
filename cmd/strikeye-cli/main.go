@@ -8,10 +8,14 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"time"
 
 	"strikeye/internal/config"
+	"strikeye/internal/export"
 	"strikeye/internal/ipc"
+	"strikeye/internal/mapgeom"
 	"strikeye/internal/parser"
 	"strikeye/internal/recorder"
 	"strikeye/internal/storage"
@@ -89,6 +93,624 @@ func main() {
 			}
 			return
 
+		case "export":
+			fs := flag.NewFlagSet("export", flag.ExitOnError)
+			dataRootFlag := fs.String("data-root", "", "Override Strikeye DataRoot directory")
+			demoIDFlag := fs.Int64("demo-id", 0, "Export one parsed match by demo ID")
+			steamIDFlag := fs.String("steamid", "", "Export cross-match aggregate for one SteamID64")
+			allFlag := fs.Bool("all", false, "Export every parsed match, one directory per match")
+			teamFlag := fs.String("team", "", "Batch export: only matches featuring this team")
+			mapFlag := fs.String("map", "", "Batch export: only matches on this map")
+			limitFlag := fs.Int("limit", 0, "Batch export: stop after N matches")
+			outFlag := fs.String("out", "", "Output directory (default <DataRoot>/media/exports)")
+			formatFlag := fs.String("format", "both", "csv, json, html, xlsx, or both")
+			_ = fs.Parse(flag.Args()[1:])
+
+			dataRoot := resolveDataRootOrExit(*dataRootFlag)
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+			defer cancel()
+			filter := export.BatchFilter{Team: *teamFlag, Map: *mapFlag, Limit: *limitFlag}
+			if err := runExportBatch(ctx, dataRoot, *demoIDFlag, *steamIDFlag, *outFlag, *formatFlag, filter, *allFlag, os.Stdout); err != nil {
+				fmt.Fprintf(os.Stderr, "export failed: %v\n", err)
+				os.Exit(1)
+			}
+			return
+
+		case "profile":
+			fs := flag.NewFlagSet("profile", flag.ExitOnError)
+			dataRootFlag := fs.String("data-root", "", "Override Strikeye DataRoot directory")
+			steamIDFlag := fs.String("steamid", "", "SteamID64 to inspect or annotate")
+			nameFlag := fs.String("name", "", "Set the display-name override")
+			noteFlag := fs.String("note", "", "Set a free-form scouting note")
+			tagsFlag := fs.String("tags", "", "Comma-separated tags replacing the current list")
+			_ = fs.Parse(flag.Args()[1:])
+
+			dataRoot := resolveDataRootOrExit(*dataRootFlag)
+			ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+			defer cancel()
+			if err := runProfile(ctx, dataRoot, *steamIDFlag, *nameFlag, *noteFlag, *tagsFlag, os.Stdout); err != nil {
+				fmt.Fprintf(os.Stderr, "profile failed: %v\n", err)
+				os.Exit(1)
+			}
+			return
+
+		case "series":
+			fs := flag.NewFlagSet("series", flag.ExitOnError)
+			dataRootFlag := fs.String("data-root", "", "Override Strikeye DataRoot directory")
+			minMapsFlag := fs.Int("min-maps", 2, "Only list series with at least this many maps")
+			_ = fs.Parse(flag.Args()[1:])
+
+			dataRoot := resolveDataRootOrExit(*dataRootFlag)
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			if err := runSeries(ctx, dataRoot, *minMapsFlag, os.Stdout); err != nil {
+				fmt.Fprintf(os.Stderr, "series failed: %v\n", err)
+				os.Exit(1)
+			}
+			return
+
+		case "maps":
+			fs := flag.NewFlagSet("maps", flag.ExitOnError)
+			dataRootFlag := fs.String("data-root", "", "Override Strikeye DataRoot directory")
+			_ = fs.Parse(flag.Args()[1:])
+			dataRoot := resolveDataRootOrExit(*dataRootFlag)
+			if err := runMapsList(dataRoot, os.Stdout); err != nil {
+				fmt.Fprintf(os.Stderr, "maps failed: %v\n", err)
+				os.Exit(1)
+			}
+			return
+
+		case "maps-fetch":
+			fs := flag.NewFlagSet("maps-fetch", flag.ExitOnError)
+			dataRootFlag := fs.String("data-root", "", "Override Strikeye DataRoot directory")
+			baseURLFlag := fs.String("base-url", "", "Override geometry dataset base URL")
+			allFlag := fs.Bool("all", false, "Fetch every map in the manifest")
+			var maps mapListFlag
+			fs.Var(&maps, "map", "Map name to fetch (repeatable)")
+			_ = fs.Parse(flag.Args()[1:])
+			dataRoot := resolveDataRootOrExit(*dataRootFlag)
+			if err := runMapsFetch(dataRoot, *baseURLFlag, append(maps, fs.Args()...), *allFlag, os.Stdout); err != nil {
+				fmt.Fprintf(os.Stderr, "maps fetch failed: %v\n", err)
+				os.Exit(1)
+			}
+			return
+
+		case "navs":
+			fs := flag.NewFlagSet("navs", flag.ExitOnError)
+			dataRootFlag := fs.String("data-root", "", "Override Strikeye DataRoot directory")
+			_ = fs.Parse(flag.Args()[1:])
+			dataRoot := resolveDataRootOrExit(*dataRootFlag)
+			if err := runNavsList(dataRoot, os.Stdout); err != nil {
+				fmt.Fprintf(os.Stderr, "navs failed: %v\n", err)
+				os.Exit(1)
+			}
+			return
+
+		case "navs-fetch":
+			fs := flag.NewFlagSet("navs-fetch", flag.ExitOnError)
+			dataRootFlag := fs.String("data-root", "", "Override Strikeye DataRoot directory")
+			baseURLFlag := fs.String("base-url", "", "Override awpy-data release base URL")
+			allFlag := fs.Bool("all", false, "Fetch navigation meshes for every map in the release")
+			var maps mapListFlag
+			fs.Var(&maps, "map", "Map name to fetch (repeatable)")
+			_ = fs.Parse(flag.Args()[1:])
+			dataRoot := resolveDataRootOrExit(*dataRootFlag)
+			if err := runNavsFetch(dataRoot, *baseURLFlag, append(maps, fs.Args()...), *allFlag, os.Stdout); err != nil {
+				fmt.Fprintf(os.Stderr, "navs-fetch failed: %v\n", err)
+				os.Exit(1)
+			}
+			return
+
+		case "callouts-fetch":
+			fs := flag.NewFlagSet("callouts-fetch", flag.ExitOnError)
+			dataRootFlag := fs.String("data-root", "", "Override Strikeye DataRoot directory")
+			_ = fs.Parse(flag.Args()[1:])
+			dataRoot := resolveDataRootOrExit(*dataRootFlag)
+			if err := runCalloutsFetch(dataRoot, os.Stdout); err != nil {
+				fmt.Fprintf(os.Stderr, "callouts-fetch failed: %v\n", err)
+				os.Exit(1)
+			}
+			return
+
+		case "area":
+			fs := flag.NewFlagSet("area", flag.ExitOnError)
+			dataRootFlag := fs.String("data-root", "", "Override Strikeye DataRoot directory")
+			mapFlag := fs.String("map", "", "Map name (e.g. de_dust2)")
+			xFlag := fs.Float64("x", 0, "World X")
+			yFlag := fs.Float64("y", 0, "World Y")
+			zFlag := fs.Float64("z", 0, "World Z")
+			_ = fs.Parse(flag.Args()[1:])
+			if *mapFlag == "" {
+				fmt.Fprintln(os.Stderr, "area failed: --map is required")
+				os.Exit(2)
+			}
+			dataRoot := resolveDataRootOrExit(*dataRootFlag)
+			point := mapgeom.Vec3{float32(*xFlag), float32(*yFlag), float32(*zFlag)}
+			if err := runArea(dataRoot, *mapFlag, point, os.Stdout); err != nil {
+				fmt.Fprintf(os.Stderr, "area failed: %v\n", err)
+				os.Exit(1)
+			}
+			return
+
+		case "navpath":
+			fs := flag.NewFlagSet("navpath", flag.ExitOnError)
+			dataRootFlag := fs.String("data-root", "", "Override Strikeye DataRoot directory")
+			mapFlag := fs.String("map", "", "Map name (e.g. de_dust2)")
+			fromFlag := fs.String("from", "", "Start callout ID or label")
+			toFlag := fs.String("to", "", "End callout ID or label")
+			_ = fs.Parse(flag.Args()[1:])
+			if *mapFlag == "" || *fromFlag == "" || *toFlag == "" {
+				fmt.Fprintln(os.Stderr, "navpath failed: --map, --from and --to are required")
+				os.Exit(2)
+			}
+			dataRoot := resolveDataRootOrExit(*dataRootFlag)
+			if err := runNavPath(dataRoot, *mapFlag, *fromFlag, *toFlag, os.Stdout); err != nil {
+				fmt.Fprintf(os.Stderr, "navpath failed: %v\n", err)
+				os.Exit(1)
+			}
+			return
+
+		case "play":
+			fs := flag.NewFlagSet("play", flag.ExitOnError)
+			dataRootFlag := fs.String("data-root", "", "Override Strikeye DataRoot directory")
+			demoIDFlag := fs.Int64("demo-id", 0, "Demo ID to prepare for CS2 playback")
+			tickFlag := fs.Int64("tick", 0, "Optional start tick for the generated cfg")
+			_ = fs.Parse(flag.Args()[1:])
+
+			dataRoot := resolveDataRootOrExit(*dataRootFlag)
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			if err := runPlay(ctx, dataRoot, *demoIDFlag, *tickFlag, os.Stdout); err != nil {
+				fmt.Fprintf(os.Stderr, "play failed: %v\n", err)
+				os.Exit(1)
+			}
+			return
+
+		case "sharecode":
+			fs := flag.NewFlagSet("sharecode", flag.ExitOnError)
+			codeFlag := fs.String("code", "", "Match share code (CSGO-xxxxx-xxxxx-xxxxx-xxxxx-xxxxx)")
+			_ = fs.Parse(flag.Args()[1:])
+			if err := runSharecode(*codeFlag, os.Stdout); err != nil {
+				fmt.Fprintf(os.Stderr, "sharecode failed: %v\n", err)
+				os.Exit(1)
+			}
+			return
+
+		case "mapcontrol":
+			fs := flag.NewFlagSet("mapcontrol", flag.ExitOnError)
+			dataRootFlag := fs.String("data-root", "", "Override Strikeye DataRoot directory")
+			demoIDFlag := fs.Int64("demo-id", 0, "Demo ID (default: first parsed demo)")
+			stepFlag := fs.Float64("step", 5, "Sampling interval in seconds")
+			radiusFlag := fs.Float64("radius", 1100, "Control reach radius in world units")
+			effectsFlag := fs.Bool("effects", true, "Discount areas hidden by smoke or cut by fire")
+			_ = fs.Parse(flag.Args()[1:])
+
+			dataRoot := resolveDataRootOrExit(*dataRootFlag)
+			if err := runMapControl(context.Background(), dataRoot, *demoIDFlag, *stepFlag, *radiusFlag, *effectsFlag, os.Stdout); err != nil {
+				fmt.Fprintf(os.Stderr, "mapcontrol failed: %v\n", err)
+				os.Exit(1)
+			}
+			return
+
+		case "sql":
+			fs := flag.NewFlagSet("sql", flag.ExitOnError)
+			dataRootFlag := fs.String("data-root", "", "Override Strikeye DataRoot directory")
+			queryFlag := fs.String("query", "", "Read-only SQL query")
+			formatFlag := fs.String("format", "json", "json or csv")
+			limitFlag := fs.Int("limit", 200, "Maximum rows to return (0 = no cap)")
+			_ = fs.Parse(flag.Args()[1:])
+
+			if *queryFlag == "" {
+				fmt.Fprintln(os.Stderr, "sql: --query is required")
+				os.Exit(2)
+			}
+			dataRoot := resolveDataRootOrExit(*dataRootFlag)
+			if err := runSQL(context.Background(), dataRoot, *queryFlag, *formatFlag, *limitFlag, os.Stdout); err != nil {
+				fmt.Fprintf(os.Stderr, "sql failed: %v\n", err)
+				os.Exit(1)
+			}
+			return
+
+		case "killctx":
+			fs := flag.NewFlagSet("killctx", flag.ExitOnError)
+			dataRootFlag := fs.String("data-root", "", "Override Strikeye DataRoot directory")
+			demoIDFlag := fs.Int64("demo-id", 0, "Demo ID (default: first parsed demo)")
+			storeFlag := fs.Bool("store", false, "Persist the annotations into the kill_context table")
+			_ = fs.Parse(flag.Args()[1:])
+
+			dataRoot := resolveDataRootOrExit(*dataRootFlag)
+			if err := runKillContext(context.Background(), dataRoot, *demoIDFlag, *storeFlag, os.Stdout); err != nil {
+				fmt.Fprintf(os.Stderr, "killctx failed: %v\n", err)
+				os.Exit(1)
+			}
+			return
+
+		case "zones":
+			fs := flag.NewFlagSet("zones", flag.ExitOnError)
+			dataRootFlag := fs.String("data-root", "", "Override Strikeye DataRoot directory")
+			demoIDFlag := fs.Int64("demo-id", 0, "Demo ID (default: first parsed demo)")
+			_ = fs.Parse(flag.Args()[1:])
+
+			dataRoot := resolveDataRootOrExit(*dataRootFlag)
+			if err := runZones(context.Background(), dataRoot, *demoIDFlag, os.Stdout); err != nil {
+				fmt.Fprintf(os.Stderr, "zones failed: %v\n", err)
+				os.Exit(1)
+			}
+			return
+
+		case "nades":
+			fs := flag.NewFlagSet("nades", flag.ExitOnError)
+			dataRootFlag := fs.String("data-root", "", "Override Strikeye DataRoot directory")
+			demoIDFlag := fs.Int64("demo-id", 0, "Demo ID (default: first parsed demo)")
+			minThrowsFlag := fs.Int("min-throws", 1, "Only report line-ups thrown at least this many times")
+			_ = fs.Parse(flag.Args()[1:])
+
+			dataRoot := resolveDataRootOrExit(*dataRootFlag)
+			if err := runNades(context.Background(), dataRoot, *demoIDFlag, *minThrowsFlag, os.Stdout); err != nil {
+				fmt.Fprintf(os.Stderr, "nades failed: %v\n", err)
+				os.Exit(1)
+			}
+			return
+
+		case "gsi":
+			fs := flag.NewFlagSet("gsi", flag.ExitOnError)
+			dataRootFlag := fs.String("data-root", "", "Override Strikeye DataRoot directory")
+			listenFlag := fs.String("listen", "127.0.0.1:32123", "Address to listen on")
+			tokenFlag := fs.String("token", "", "Shared token required in the Authorization header")
+			configFlag := fs.String("config-out", "", "Where to write gamestate_integration cfg")
+			latestFlag := fs.String("latest", "", "Where to mirror the latest state JSON")
+			onceFlag := fs.Bool("once", false, "Exit after the first payload")
+			timeoutFlag := fs.Duration("timeout", 30*time.Second, "How long --once waits for a payload")
+			_ = fs.Parse(flag.Args()[1:])
+
+			dataRoot := resolveDataRootOrExit(*dataRootFlag)
+			ctx, cancel := signalContext()
+			defer cancel()
+			err := runGSI(ctx, dataRoot, gsiOptions{
+				listen:     *listenFlag,
+				token:      *tokenFlag,
+				configOut:  *configFlag,
+				latestPath: *latestFlag,
+				once:       *onceFlag,
+				timeout:    *timeoutFlag,
+			}, os.Stdout)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "gsi failed: %v\n", err)
+				os.Exit(1)
+			}
+			return
+
+		case "tendencies":
+			fs := flag.NewFlagSet("tendencies", flag.ExitOnError)
+			dataRootFlag := fs.String("data-root", "", "Override Strikeye DataRoot directory")
+			teamFlag := fs.String("team", "", "Team name (as stored in demos)")
+			topFlag := fs.Int("top", 8, "How many opening callouts to report")
+			formatFlag := fs.String("format", "json", "Output format: json or csv")
+			outFlag := fs.String("out", "", "Write to this file instead of stdout")
+			_ = fs.Parse(flag.Args()[1:])
+
+			dataRoot := resolveDataRootOrExit(*dataRootFlag)
+			rest := []string{"-team", *teamFlag, "-top", strconv.Itoa(*topFlag), "-format", *formatFlag}
+			if *outFlag != "" {
+				rest = append(rest, "-out", *outFlag)
+			}
+			if err := runTendencies(context.Background(), dataRoot, rest, os.Stdout); err != nil {
+				fmt.Fprintf(os.Stderr, "tendencies failed: %v\n", err)
+				os.Exit(1)
+			}
+			return
+
+		case "h2h":
+			fs := flag.NewFlagSet("h2h", flag.ExitOnError)
+			dataRootFlag := fs.String("data-root", "", "Override Strikeye DataRoot directory")
+			teamAFlag := fs.String("team-a", "", "First team")
+			teamBFlag := fs.String("team-b", "", "Second team")
+			formatFlag := fs.String("format", "json", "Output format: json or csv")
+			_ = fs.Parse(flag.Args()[1:])
+
+			dataRoot := resolveDataRootOrExit(*dataRootFlag)
+			rest := []string{"-team-a", *teamAFlag, "-team-b", *teamBFlag, "-format", *formatFlag}
+			if err := runHeadToHead(context.Background(), dataRoot, rest, os.Stdout); err != nil {
+				fmt.Fprintf(os.Stderr, "h2h failed: %v\n", err)
+				os.Exit(1)
+			}
+			return
+
+		case "trends":
+			fs := flag.NewFlagSet("trends", flag.ExitOnError)
+			dataRootFlag := fs.String("data-root", "", "Override Strikeye DataRoot directory")
+			steamIDFlag := fs.String("steamid", "", "SteamID64")
+			formatFlag := fs.String("format", "json", "Output format: json or csv")
+			_ = fs.Parse(flag.Args()[1:])
+
+			dataRoot := resolveDataRootOrExit(*dataRootFlag)
+			rest := []string{"-steamid", *steamIDFlag, "-format", *formatFlag}
+			if err := runTrends(context.Background(), dataRoot, rest, os.Stdout); err != nil {
+				fmt.Fprintf(os.Stderr, "trends failed: %v\n", err)
+				os.Exit(1)
+			}
+			return
+
+		case "corpus":
+			fs := flag.NewFlagSet("corpus", flag.ExitOnError)
+			dirFlag := fs.String("dir", "tests", "Directory holding fixture demos")
+			goldenFlag := fs.String("golden", filepath.Join("tests", "fixtures", "golden"), "Golden snapshot directory")
+			updateFlag := fs.Bool("update", false, "Rewrite golden snapshots from the current parse")
+			demoFlag := fs.String("demo", "", "Only process this fixture filename")
+			workFlag := fs.String("work-dir", "", "Reusable scratch data root")
+			geomFlag := fs.String("geometry-dir", "", "Directory of .tri map geometry for TTD metrics")
+			_ = fs.Parse(flag.Args()[1:])
+
+			args := []string{"-dir", *dirFlag, "-golden", *goldenFlag, "-demo", *demoFlag}
+			if *updateFlag {
+				args = append(args, "-update")
+			}
+			if *workFlag != "" {
+				args = append(args, "-work-dir", *workFlag)
+			}
+			if *geomFlag != "" {
+				args = append(args, "-geometry-dir", *geomFlag)
+			}
+			if err := runCorpus(context.Background(), args, os.Stdout); err != nil {
+				fmt.Fprintf(os.Stderr, "corpus failed: %v\n", err)
+				os.Exit(1)
+			}
+			return
+
+		case "mixaudio":
+			fs := flag.NewFlagSet("mixaudio", flag.ExitOnError)
+			videoFlag := fs.String("video", "", "Input video clip")
+			trackFlag := &stringListFlag{}
+			fs.Var(trackFlag, "track", "Audio track spec path[@offset[:volume]] (repeatable)")
+			outFlag := fs.String("out", "", "Output path (default <video>_mixed.mp4)")
+			volFlag := fs.Float64("volume", 1.0, "Volume applied to the clip's own audio")
+			audioOnlyFlag := fs.Bool("audio-only", false, "Also export the mixed audio as .m4a")
+			ffmpegFlag := fs.String("ffmpeg", "", "ffmpeg executable")
+			_ = fs.Parse(flag.Args()[1:])
+
+			if err := runMixAudio(context.Background(), mixaudioOptions{
+				videoPath:  *videoFlag,
+				trackSpecs: *trackFlag,
+				outPath:    *outFlag,
+				baseVolume: *volFlag,
+				audioOnly:  *audioOnlyFlag,
+				ffmpegExe:  *ffmpegFlag,
+			}, os.Stdout); err != nil {
+				fmt.Fprintf(os.Stderr, "mixaudio failed: %v\n", err)
+				os.Exit(1)
+			}
+			return
+
+		case "search":
+			fs := flag.NewFlagSet("search", flag.ExitOnError)
+			dataRootFlag := fs.String("data-root", "", "Override Strikeye DataRoot directory")
+			queryFlag := fs.String("query", "", "Search text (players / teams / map / notes)")
+			limitFlag := fs.Int("limit", 20, "Maximum hits")
+			reindexFlag := fs.Bool("reindex", false, "Force a full index rebuild")
+			_ = fs.Parse(flag.Args()[1:])
+
+			dataRoot := resolveDataRootOrExit(*dataRootFlag)
+			args := []string{"-query", *queryFlag, "-limit", strconv.Itoa(*limitFlag)}
+			if *reindexFlag {
+				args = append(args, "-reindex")
+			}
+			if err := runSearch(context.Background(), dataRoot, args, os.Stdout); err != nil {
+				fmt.Fprintf(os.Stderr, "search failed: %v\n", err)
+				os.Exit(1)
+			}
+			return
+
+		case "strokes":
+			fs := flag.NewFlagSet("strokes", flag.ExitOnError)
+			dataRootFlag := fs.String("data-root", "", "Override Strikeye DataRoot directory")
+			demoIDFlag := fs.Int64("demo-id", 0, "Demo id")
+			roundFlag := fs.Int("round", -1, "Only strokes of this round (0 = match-wide)")
+			clearFlag := fs.Bool("clear", false, "Delete matching strokes")
+			_ = fs.Parse(flag.Args()[1:])
+
+			dataRoot := resolveDataRootOrExit(*dataRootFlag)
+			rest := []string{"-demo-id", strconv.FormatInt(*demoIDFlag, 10), "-round", strconv.Itoa(*roundFlag)}
+			if *clearFlag {
+				rest = append(rest, "-clear")
+			}
+			if err := runStrokes(context.Background(), dataRoot, rest, os.Stdout); err != nil {
+				fmt.Fprintf(os.Stderr, "strokes failed: %v\n", err)
+				os.Exit(1)
+			}
+			return
+
+		case "avatars":
+			fs := flag.NewFlagSet("avatars", flag.ExitOnError)
+			dataRootFlag := fs.String("data-root", "", "Override Strikeye DataRoot directory")
+			steamIDFlag := fs.String("steamid", "", "Comma separated SteamID64 list")
+			demoIDFlag := fs.Int64("demo-id", 0, "Fetch avatars for every player of this demo")
+			outDirFlag := fs.String("out-dir", "", "Override the cache directory")
+			refreshFlag := fs.Bool("refresh", false, "Ignore cached avatars")
+			_ = fs.Parse(flag.Args()[1:])
+
+			dataRoot := resolveDataRootOrExit(*dataRootFlag)
+			rest := []string{"-steamid", *steamIDFlag, "-demo-id", strconv.FormatInt(*demoIDFlag, 10)}
+			if *outDirFlag != "" {
+				rest = append(rest, "-out-dir", *outDirFlag)
+			}
+			if *refreshFlag {
+				rest = append(rest, "-refresh")
+			}
+			if err := runAvatars(context.Background(), dataRoot, rest, os.Stdout); err != nil {
+				fmt.Fprintf(os.Stderr, "avatars failed: %v\n", err)
+				os.Exit(1)
+			}
+			return
+
+		case "buys":
+			fs := flag.NewFlagSet("buys", flag.ExitOnError)
+			dataRootFlag := fs.String("data-root", "", "Override Strikeye DataRoot directory")
+			demoIDFlag := fs.Int64("demo-id", 0, "Demo ID (default: first parsed demo)")
+			roundFlag := fs.Int("round", 0, "Only this round")
+			_ = fs.Parse(flag.Args()[1:])
+
+			dataRoot := resolveDataRootOrExit(*dataRootFlag)
+			if err := runBuys(context.Background(), dataRoot, *demoIDFlag, *roundFlag, os.Stdout); err != nil {
+				fmt.Fprintf(os.Stderr, "buys failed: %v\n", err)
+				os.Exit(1)
+			}
+			return
+
+		case "viewprefs":
+			fs := flag.NewFlagSet("viewprefs", flag.ExitOnError)
+			dataRootFlag := fs.String("data-root", "", "Override Strikeye DataRoot directory")
+			mapFlag := fs.String("map", "", "Map name to write (with --set)")
+			xFlag := fs.Float64("x", 0, "Lower-layer horizontal offset in radar pixels")
+			yFlag := fs.Float64("y", 0, "Lower-layer vertical offset in radar pixels")
+			opacityFlag := fs.Float64("opacity", 1, "Lower-layer opacity (0.1-1.0)")
+			setFlag := fs.Bool("set", false, "Persist the given values instead of listing")
+			_ = fs.Parse(flag.Args()[1:])
+
+			dataRoot := resolveDataRootOrExit(*dataRootFlag)
+			db, err := storage.OpenDefault(dataRoot)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "open storage: %v\n", err)
+				os.Exit(1)
+			}
+			defer db.Close()
+			if err := runViewPrefs(context.Background(), db, viewPrefsOptions{
+				mapName: *mapFlag,
+				offsetX: *xFlag,
+				offsetY: *yFlag,
+				opacity: *opacityFlag,
+				set:     *setFlag,
+			}, os.Stdout); err != nil {
+				fmt.Fprintf(os.Stderr, "viewprefs failed: %v\n", err)
+				os.Exit(1)
+			}
+			return
+
+		case "notes":
+			fs := flag.NewFlagSet("notes", flag.ExitOnError)
+			dataRootFlag := fs.String("data-root", "", "Override Strikeye DataRoot directory")
+			demoIDFlag := fs.Int64("demo-id", 0, "Demo ID (default: first parsed demo)")
+			roundFlag := fs.Int("round", 0, "Round number (0 = whole match)")
+			calloutFlag := fs.String("callout", "", "Callout id to pin")
+			noteFlag := fs.String("note", "", "Note text")
+			colorFlag := fs.String("color", "amber", "Marker color: amber|red|green|blue")
+			deleteFlag := fs.Int64("delete", 0, "Delete annotation by id")
+			clearFlag := fs.Bool("clear", false, "Delete every annotation of the demo")
+			_ = fs.Parse(flag.Args()[1:])
+
+			dataRoot := resolveDataRootOrExit(*dataRootFlag)
+			if err := runNotes(context.Background(), dataRoot, *demoIDFlag, *roundFlag, *calloutFlag, *noteFlag, *colorFlag, *deleteFlag, *clearFlag, os.Stdout); err != nil {
+				fmt.Fprintf(os.Stderr, "notes failed: %v\n", err)
+				os.Exit(1)
+			}
+			return
+
+		case "download":
+			fs := flag.NewFlagSet("download", flag.ExitOnError)
+			dataRootFlag := fs.String("data-root", "", "Override Strikeye DataRoot directory")
+			cookieFlag := fs.String("cookies", "", "Cookie header value or path to a cookie file")
+			tabFlag := fs.String("tab", "matchhistorypremier", "GCPD tab (comma separated for several)")
+			limitFlag := fs.Int("limit", 0, "Max demos per tab (0 = all)")
+			outFlag := fs.String("out", "", "Output dir (default: <DataRoot>/media/imports)")
+			_ = fs.Parse(flag.Args()[1:])
+
+			dataRoot := resolveDataRootOrExit(*dataRootFlag)
+			tabs := strings.Split(*tabFlag, ",")
+			if err := runDownload(context.Background(), dataRoot, *cookieFlag, tabs, *limitFlag, *outFlag, os.Stdout); err != nil {
+				fmt.Fprintf(os.Stderr, "download failed: %v\n", err)
+				os.Exit(1)
+			}
+			return
+
+		case "bans":
+			fs := flag.NewFlagSet("bans", flag.ExitOnError)
+			dataRootFlag := fs.String("data-root", "", "Override Strikeye DataRoot directory")
+			demoIDFlag := fs.Int64("demo-id", 0, "Demo ID whose players should be checked (default: first parsed demo)")
+			steamIDFlag := fs.String("steamid", "", "Comma separated SteamID64 list (overrides --demo-id)")
+			refreshFlag := fs.Bool("refresh", false, "Ignore cached snapshots and ask Steam again")
+			apiKeyFlag := fs.String("api-key", "", "Steam Web API key (default: $STRIKEYE_STEAM_API_KEY)")
+			_ = fs.Parse(flag.Args()[1:])
+
+			dataRoot := resolveDataRootOrExit(*dataRootFlag)
+			ids := strings.Split(*steamIDFlag, ",")
+			if err := runBans(context.Background(), dataRoot, *demoIDFlag, ids, *refreshFlag, steamAPIKey(*apiKeyFlag), os.Stdout); err != nil {
+				fmt.Fprintf(os.Stderr, "bans failed: %v\n", err)
+				os.Exit(1)
+			}
+			return
+
+		case "voice-decode":
+			fs := flag.NewFlagSet("voice-decode", flag.ExitOnError)
+			dataRootFlag := fs.String("data-root", "", "Override Strikeye DataRoot directory")
+			demoIDFlag := fs.Int64("demo-id", 0, "Demo ID to decode")
+			toolFlag := fs.String("tool", "", "Path to an external Steam voice decoder")
+			xuidFlag := fs.Uint64("xuid", 0, "Only export this speaker")
+			outFlag := fs.String("out", "", "Output dir (default: <DataRoot>/media/voice/demo_<id>)")
+			_ = fs.Parse(flag.Args()[1:])
+
+			dataRoot := resolveDataRootOrExit(*dataRootFlag)
+			demoID := *demoIDFlag
+			if demoID == 0 {
+				db, err := storage.OpenDefault(dataRoot)
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "voice-decode failed: %v\n", err)
+					os.Exit(1)
+				}
+				demo, err := pickDemo(context.Background(), db, 0)
+				db.Close()
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "voice-decode failed: %v\n", err)
+					os.Exit(1)
+				}
+				demoID = demo.ID
+			}
+			if err := runVoiceDecodeFiltered(context.Background(), dataRoot, demoID, *toolFlag, *outFlag, *xuidFlag, os.Stdout); err != nil {
+				fmt.Fprintf(os.Stderr, "voice-decode failed: %v\n", err)
+				os.Exit(1)
+			}
+			return
+
+		case "voice-activity":
+			fs := flag.NewFlagSet("voice-activity", flag.ExitOnError)
+			dataRootFlag := fs.String("data-root", "", "Override Strikeye DataRoot directory")
+			demoIDFlag := fs.Int64("demo-id", 0, "Demo ID (default: first parsed demo)")
+			roundFlag := fs.Int("round", 0, "Only report this round")
+			_ = fs.Parse(flag.Args()[1:])
+
+			dataRoot := resolveDataRootOrExit(*dataRootFlag)
+			if err := runVoiceActivity(context.Background(), dataRoot, *demoIDFlag, *roundFlag, os.Stdout); err != nil {
+				fmt.Fprintf(os.Stderr, "voice-activity failed: %v\n", err)
+				os.Exit(1)
+			}
+			return
+
+		case "voice":
+			fs := flag.NewFlagSet("voice", flag.ExitOnError)
+			dataRootFlag := fs.String("data-root", "", "Override Strikeye DataRoot directory")
+			demoIDFlag := fs.Int64("demo-id", 0, "Demo ID (default: first parsed demo)")
+			_ = fs.Parse(flag.Args()[1:])
+
+			dataRoot := resolveDataRootOrExit(*dataRootFlag)
+			if err := runVoice(context.Background(), dataRoot, *demoIDFlag, os.Stdout); err != nil {
+				fmt.Fprintf(os.Stderr, "voice failed: %v\n", err)
+				os.Exit(1)
+			}
+			return
+
+		case "team":
+			fs := flag.NewFlagSet("team", flag.ExitOnError)
+			dataRootFlag := fs.String("data-root", "", "Override Strikeye DataRoot directory")
+			nameFlag := fs.String("name", "", "Team name as recorded on demos (case-insensitive)")
+			_ = fs.Parse(flag.Args()[1:])
+
+			dataRoot := resolveDataRootOrExit(*dataRootFlag)
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			if err := runTeam(ctx, dataRoot, *nameFlag, os.Stdout); err != nil {
+				fmt.Fprintf(os.Stderr, "team failed: %v\n", err)
+				os.Exit(1)
+			}
+			return
+
 		case "render":
 			fs := flag.NewFlagSet("render", flag.ExitOnError)
 			dataRootFlag := fs.String("data-root", "", "Override Strikeye DataRoot directory")
@@ -107,7 +729,7 @@ func main() {
 		}
 	}
 
-	fmt.Fprintln(os.Stderr, "usage: strikeye-cli [--version | --env-check | doctor | parse --file <dem> | inspect (--demo-id <id> | --rpl <path>)]")
+	fmt.Fprintln(os.Stderr, "usage: strikeye-cli [--version | --env-check | doctor | parse --file <dem> | inspect (--demo-id <id> | --rpl <path>) | export (--demo-id <id> | --steamid <id64>) [--format csv|json|xlsx|html|both|all] | profile --steamid <id64> | series | team --name <team> | sharecode --code <code> | play --demo-id <id> | maps | maps-fetch --map <map>|--all | navs | navs-fetch --map <map>|--all | callouts-fetch | area --map <map> --x <x> --y <y> --z <z> | navpath --map <map> --from <place> --to <place> | sql --query <sql> [--format csv|json] [--limit <n>] | killctx [--demo-id <id>] [--store] | zones [--demo-id <id>] | mapcontrol [--demo-id <id>] [--step <sec>] [--effects=false] | nades [--demo-id <id>] [--min-throws <n>] | voice [--demo-id <id>] | bans [--demo-id <id> | --steamid <id64,...>] [--refresh] | download --cookies <file|header> [--tab <tab>] [--limit <n>] | voice-decode --demo-id <id> [--tool <path> | --xuid <id64>] | voice-activity --demo-id <id> [--round <n>] | notes [--demo-id <id>] [--round <n> --callout <id> --note <text>] | buys [--demo-id <id>] [--round <n>] | tendencies --team <name> [--top <n>] [--format json|csv] [--out <path>] | h2h --team-a <a> --team-b <b> [--format json|csv] | avatars (--steamid <id64,...> | --demo-id <id>) [--refresh] | search --query <text> [--limit <n>] [--reindex] | viewprefs [--set --map <map> --x --y --opacity] ... | mixaudio --video <clip> --track <path[@offset[:vol]]> [--audio-only] | strokes --demo-id <id> [--round <n>] [--clear] | trends --steamid <id64> [--format json|csv] | corpus [--update] [--geometry-dir <dir>] | gsi [--listen addr]")
 	os.Exit(2)
 }
 
@@ -261,6 +883,7 @@ type doctorSummary struct {
 	SchemaVersion int                `json:"schema_version"`
 	Toolchain     config.ProbeReport `json:"toolchain"`
 	IPCSelfCheck  string             `json:"ipc_self_check"`
+	Platform      platformReport     `json:"platform"`
 }
 
 func runDoctor(ctx context.Context, dataRoot string, out io.Writer) error {
@@ -291,6 +914,7 @@ func runDoctor(ctx context.Context, dataRoot string, out io.Writer) error {
 		SchemaVersion: schemaVer,
 		Toolchain:     probe,
 		IPCSelfCheck:  "ok",
+		Platform:      describePlatform(),
 	}
 	enc := json.NewEncoder(out)
 	enc.SetIndent("", "  ")
@@ -418,4 +1042,14 @@ func runRenderDryRun(ctx context.Context, dataRoot string, demoID int64, dryRun 
 		"hlae_args":            hlaeArgs,
 		"sample_boot_cfg":      sampleCFG,
 	})
+}
+
+// stringListFlag collects repeated string flag values.
+type stringListFlag []string
+
+func (s *stringListFlag) String() string { return strings.Join(*s, ",") }
+
+func (s *stringListFlag) Set(v string) error {
+	*s = append(*s, v)
+	return nil
 }

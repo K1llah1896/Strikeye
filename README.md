@@ -61,11 +61,29 @@ Strikeye 围绕比赛的完整生命周期，构建统一的 Demo 管理、观�
 
 ### 能力清单（截至 2026-11）
 
-资料库：18 类来源识别、压缩包自动解压、`.info` 旁挂元数据、GCPD 官方 demo 下载、share code 导入、全文检索（含中文子串）、系列赛分组、选手档案与标签、封禁快照、头像、GSI 直播条、SQL 控制台、地图数据（碰撞几何 / 导航网格 / callout）一键下载。
+资料库：18 类来源识别、压缩包自动解压、`.info` 旁挂元数据、GCPD 官方 demo 下载、share code 导入、全文检索（含中文子串）、系列赛分组、选手档案与标签、封禁快照、头像、GSI 直播条、SQL 控制台、内置地图数据（碰撞几何 / 导航网格 / callout，随包分发，零点击即用）。
 
 分析：Rating / ADR / KAST / K-D / 首杀 / 交易 / 残局、TTK 与 TTD（含开镜视锥与追踪遮挡）、逐 kill 击杀上下文（距离/视线/穿烟/背光/开镜夹角，可落库与导出）、经济与购买时序、区域控制与击杀区位、默认站位热力图、navmesh 地图控制曲线（含烟雾/火焰遮蔽）、道具 line-up 库与收益归因。
 
 回放与产出：32Hz 2D 回放（弹道/死亡标记/C4 爆炸范围/击杀信息条/上下层雷达/自由笔刷与区域标记/语音时间轴）、多格式导出（CSV/JSON/XLSX/HTML）、多轨音频混音、HLAE 录制与集锦合成。
+
+### 地图数据与外部工具随包提供
+
+碰撞几何、导航网格、callout 表，以及 FFmpeg/HLAE，都随安装包分发，全新解压即可离线使用区域控制、地图控制曲线、TTD、击杀视线、录制与合成，**不需要点任何下载按钮**：
+
+- 导航网格（`navs.zip`，7.7 MB）与 callout 表（780 KB）用 `go:embed` 编入可执行文件，启动时校验 sha256 后写入 `<DataRoot>/cache/`；
+- 碰撞几何合计约 200 MB，作为 `map_geometry.zip` 边车与 exe 同目录分发，按图按需解压（首次用到某图才落盘 6–20 MB）；
+- FFmpeg（`ffmpeg-windows-amd64.zip`，119 MB）与 HLAE（`hlae-windows-amd64.zip`，9 MB）同样作为边车随包，启动前解压到 `<DataRoot>/tools/`，探测时包内版本优先于系统 PATH；
+- 应用内热更新会把所有边车一并替换，升级后依旧无需下载。
+
+源码构建不含这些二进制（`.gitignore` 挡住），需要先跑一次：
+
+```bash
+go run ./cmd/strikeye-cli assets-pack        # 生成 internal/mapassets/assets/*、assets/map_geometry.zip 与工具边车
+go build ./...
+```
+
+没有这一步时程序照常编译运行，只是 `mapassets.Available()` 为 false，依赖地图数据的能力会提示缺失。原有 `maps-fetch` / `navs-fetch` / `callouts-fetch` 与设置页的联网安装保留为“升级到更新数据集”、源码构建的兜底手段，而不是前提。
 
 完整的差分调研与依据见 [`docs/research/2026-11-25-cs2-oss-gap-analysis.md`](docs/research/2026-11-25-cs2-oss-gap-analysis.md)，指标口径见 [`docs/metrics.md`](docs/metrics.md)。
 
@@ -131,13 +149,14 @@ GOOS=darwin GOARCH=arm64 go build ./...
 openspec validate --all --strict
 ```
 
-指标回归用黄金快照，需先下载地图几何（TTD 依赖 `.tri` 几何），这条任务在 CI 里是手动触发（`workflow_dispatch`），避免 PR 依赖外网：
+指标回归用黄金快照（TTD 依赖 `.tri` 几何）。几何随包提供时直接跑；没有边车时再显式下载：
 
 ```bash
 go build -o bin/strikeye-cli ./cmd/strikeye-cli
-./bin/strikeye-cli maps-fetch --data-root .ci-data --map de_ancient --map de_dust2
-./bin/strikeye-cli corpus --geometry-dir .ci-data/cache/map_geometry
-./bin/strikeye-cli corpus --update --geometry-dir dist/cache/map_geometry   # 口径变了才重生成
+./bin/strikeye-cli corpus                                  # 自动使用 exe 旁的 map_geometry.zip
+./bin/strikeye-cli corpus --geometry-dir .ci-data/cache/map_geometry        # 或指定已缓存目录
+./bin/strikeye-cli corpus --update                          # 口径变了才重生成
+STRIKEYE_CORPUS=1 go test ./internal/corpus/                # 金标快照回归
 ```
 
 ---

@@ -152,7 +152,7 @@
 
 **为什么重要**：这是"从统计到解释"的关键一跳。没有它，2D 回放无法回答"他有没有可能看到"，狙击/架枪/背身指标也无从谈起。
 
-**已落地路径（与建议的差异）**：几何不再从本地 VPK 生成，改为按需下载公开数据集（见 4.4.1），省掉 VPK 解析与地图资产分发。
+**已落地路径（与建议的差异）**：几何不再从本地 VPK 生成，改为使用公开数据集（见 4.4.1），并以 `map_geometry.zip` 边车随安装包分发、按图按需解压，省掉 VPK 解析与联网步骤。
 
 上述"后续可加"三项均已落地：
 1. 可见性修正：开镜 FOV（回放 v3 记录 `Zoom`，视锥 53°→20°→7.5°）、闪光状态（剩余闪光 >0.1s 视为致盲）、烟雾用半径 144 的球体近似（椭球差异见 §9）；
@@ -163,9 +163,9 @@
 
 **数据源**：`gitlab.com/akiver/cs2-map-geometry`（tag `v1`），16 张官方图，`manifest.json` 带 `size` + `sha256`。格式为 gzip + `CSDAGEO\0` 头 + 顶点/索引/BVH 节点三段，正是 cs-demo-analyzer 计算 LOS/TTD/TTK 用的同一份数据（de_dust2 6.2MB / 244,628 顶点 / 270k 节点；de_ancient 16.1MB）。
 
-**接入方式**：`strikeye-cli maps` 列出缓存；`strikeye-cli maps-fetch --map de_dust2 --map de_ancient` 或 `--all` 下载到 `<DataRoot>/cache/map_geometry`，逐个校验大小与 SHA-256，`.part` → rename。
+**接入方式**：几何以 `map_geometry.zip`（约 200 MB，含 `manifest.json` + 16 张 `.tri`）随安装包分发在 exe 同目录，首次用到某图时只解压该图并校验 `size`+`sha256`，写入 `<DataRoot>/cache/map_geometry`；`strikeye-cli maps` 列出缓存，`maps-fetch --map … | --all` 仍可用于升级到更新的数据集。`strikeye-cli assets-pack` 负责生成随包文件（发布流水线在编译前调用）。
 
-**许可注意**：该仓库没有 LICENSE 文件，因此 Strikeye 不把二进制打进仓库，只提供用户触发的按需下载并在输出中标注来源；后续若能自行从 VPK 生成，应替换该来源。
+**许可注意**：该仓库没有 LICENSE 文件，因此 Strikeye 仍不把二进制提交进仓库（`.gitignore` 排除，构建时按钉定校验和下载）；但会随安装包分发（`map_geometry.zip`）并在文档/界面标注来源，后续若能自行从 VPK 生成，应替换该来源。
 
 ### 4.4.2 导航网格与 callout 数据来源（本轮补齐）
 
@@ -175,7 +175,7 @@
 
 **为什么不能只靠 nav**：CS2 的 `.nav` 不再含地名（`strings de_dust2.nav` 只有 NavGenParams），地名来自地图实体的 `env_cs_place`，所以两份数据必须分别获取。
 
-**已落地**：`strikeye-cli navs/navs-fetch/callouts-fetch/area/navpath/zones` + Match Analysis「7. 区域控制」（默认站位分布、击杀区位）。
+**已落地**：导航网格与 callout 表已用 `go:embed` 编入可执行文件（安装包零点击即用），`strikeye-cli navs/navs-fetch/callouts-fetch/area/navpath/zones` + Match Analysis「7. 区域控制」（默认站位分布、击杀区位）。
 
 ### 4.5 空间分析：navmesh / 地图控制 / 默认站位 / 手雷库 —— **P1**
 
@@ -365,9 +365,12 @@
 | `montage-audio-tracks` | 合辑导出卡片「额外音轨」编辑区（3 行：路径/偏移/音量/静音），写入 `MontageSpec.AudioTracks` 由既有 `amix` 流程混入，把 POV 语音铺到集锦上 |
 | `library-steam-download` | 资料库「从 Steam 下载」面板：粘贴 Cookie（存 `cache/gcpd_cookie.txt`，0600）+ 匹配类型选择 + 后台下载到 `media/imports` + 自动扫描，把 CLI 的 `download` 闭环搬进 GUI |
 | `settings-map-data` | 设置页「地图数据」卡片：导航网格张数 / callout 大小 / 检查时间 + 后台下载（复用 `internal/mapdata`），把"去终端跑 navs-fetch"的断点补上 |
+| `bundled-map-assets` | 地图数据随包分发：navs.zip（7.7 MB）与 nav_places.csv（780 KB）`go:embed` 进二进制、启动即写入缓存；碰撞几何以 `map_geometry.zip` 边车按图按需解压；`assets-pack` 生成构建输入；热更新一并替换边车；设置页展示内置状态 |
 | `player-profile-editor` | 分析页选手抽屉内档案编辑（显示名/备注/标签，走 `profile.Save`，按 SteamID 换草稿），补齐"标签只有 CLI 能写"的入口缺失 |
 | `library-export-and-play` | 资料库卡片「导出数据」（CSV/JSON/XLSX/HTML → `media/exports`）与「用 CS2 打开」（`steam://rungameid/730//+playdemo`，`internal/launcher` 三平台映射） |
 | `team-tab` | 分析页第 8 个标签页「队伍视角」：队伍档案（分图战绩/阵容）+ 侦察报告（分侧/经济/下包点/开场区位）+ 交手记录，队伍切换与后台加载；`internal/parser` 抽出 `ResolveReplayCachePath`/`LoadReplayCache`/`ReplayRoundList` 供 CLI 与 UI 共用 |
+| `bundled-map-assets` | 地图数据全部随包：导航网格 + callout 表 `go:embed` 进 exe（首次运行按 sha256 校验落盘），200 MB 碰撞几何作为 `map_geometry.zip` 边车按图按需解压；启动/GUI 后台自动安装，设置页与 CLI 的下载按钮降级为“从内置包安装”；`strikeye-cli assets-pack` 成为唯一生成入口 |
+| `bundled-toolchain` | FFmpeg（119 MB）与 HLAE（9 MB）以 `*-windows-amd64.zip` 边车随包分发，启动前自动解压到 `<DataRoot>/tools/<tool>`；探测用 glob 发现 `tools/` 下的二进制（包内版本优先于 PATH）；打包改用钉定直链（HLAE `v2.193.2`、BtbN `latest`）避开 GitHub API 每小时 60 次的限流；设置页按钮改为离线「从内置包安装」 |
 | `ci-gate` | `.github/workflows/ci.yml`：gofmt / vet / test / 三平台交叉编译 / `openspec validate --all --strict`（CLI 钉 1.15.0），语料回归走 `workflow_dispatch`；仓库内 8 个文件统一 gofmt |
 
 ## 9. 仍未补齐及原因
@@ -378,4 +381,6 @@
 | 语音频道区分（队伍语音 / 全部语音） | `CMsgVoiceAudio` 只给 `section`/`sequence`，没有频道字段；时间轴只能表示"谁在说话"。要区分频道得从 `svc_VoiceInit`/语音路由推断，收益低、误判风险高。 |
 | 开镜 FOV 的引擎精确值 | 已用回放 v3 记录的 `Zoom`（0/1/2）把视锥收窄为 53°→20°→7.5°，TTD 与击杀光学都吃这套判定；残余差异在于 demo 不暴露投影 FOV 本身，20°/7.5° 是标定近似。 |
 | Steam 登录态相关（需凭据） | `download` 已实现 Cookie 解析与 GCPD 分页下载；实际拉取需要用户自己的 Steam Cookie，属凭据而非能力缺口。 |
+| 选手头像的离线预置 | 头像按 SteamID 抓取（`steamcommunity.com/profiles/<id>?xml=1`），目标集合随用户导入的 demo 变化、数量无上界，无法预先打包；已在导入后自动抓取并缓存 30 天。 |
+| 内置地图/工具数据无法进 git | 导航网格 8.5 MB、callout 780 KB、碰撞几何 200 MB、FFmpeg 119 MB、HLAE 9 MB 都是构建输入而非源码，仓库只提交 `assets-pack` 与钉定校验和；发布 zip 内全部具备，源码构建则按需生成。 |
 | Web 版 GSI 直播 HUD（P2 残项） | GSI 只读接入与资料库直播条已落地；浏览器/覆盖层渲染与“零侵入本地工具”定位冲突，仍不做。 |

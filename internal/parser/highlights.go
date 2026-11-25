@@ -12,10 +12,10 @@ import (
 )
 
 const (
-	rapidKillWindowSec  = 10.0
-	burstKillInterval   = 3.0
-	longRangeKillDist   = 1500.0 // aligned with legacy tag_constants.py _HIGHLIGHT_LONG_RANGE_DIST
-	lowHPThreshold      = 15
+	rapidKillWindowSec = 10.0
+	burstKillInterval  = 3.0
+	longRangeKillDist  = 1500.0 // aligned with legacy tag_constants.py _HIGHLIGHT_LONG_RANGE_DIST
+	lowHPThreshold     = 15
 )
 
 // DefuseEvent captures a bomb defusal for highlight detection.

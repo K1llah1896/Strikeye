@@ -13,8 +13,8 @@ import (
 )
 
 var (
-	ReplayMagicBytes          = [8]byte{'C', 'S', '2', 'R', 'P', 'L', '0', '1'}
-	ReplayFormatVersion uint16 = 1
+	ReplayMagicBytes           = [8]byte{'C', 'S', '2', 'R', 'P', 'L', '0', '1'}
+	ReplayFormatVersion uint16 = 3
 
 	ErrInvalidReplayMagic   = errors.New("invalid CS2RPL01 magic")
 	ErrUnsupportedReplayVer = errors.New("unsupported CS2RPL01 version")
@@ -45,21 +45,26 @@ type RoundIndexEntry struct {
 
 // ReplayPlayerPose holds one player's 32Hz sampled state.
 type ReplayPlayerPose struct {
-	Slot         uint8
-	Team         uint8 // 0=unknown, 1=T, 2=CT
-	Alive        bool
-	HasBomb      bool
-	IsDefusing   bool
-	Health       uint8
-	Armor        uint8
-	Money        uint16
-	EquipValue   uint16
-	FlashDur     float32
-	X            float32
-	Y            float32
-	Z            float32
-	Yaw          float32
-	Pitch        float32
+	Slot       uint8
+	Team       uint8 // 0=unknown, 1=T, 2=CT
+	Alive      bool
+	HasBomb    bool
+	IsDefusing bool
+	Health     uint8
+	Armor      uint8
+	Money      uint16
+	EquipValue uint16
+	FlashDur   float32
+	X          float32
+	Y          float32
+	Z          float32
+	// Yaw is the eye-angle yaw in degrees (0 = +X, counter-clockwise positive),
+	// which is what demoinfocs exposes as Player.ViewDirectionX().
+	Yaw   float32
+	Pitch float32
+	// Zoom is the scope level: 0 = hip fire, 1 = half zoom, 2 = full zoom.
+	// Only stored from replay format 3 on; older files read back as 0.
+	Zoom         uint8
 	ActiveWeapon string
 }
 
@@ -79,6 +84,42 @@ type ReplayRoundData struct {
 	Smokes      []SmokeEffect
 	Infernos    []InfernoEffect
 	InputEdges  []InputEdge
+	Shots       []ReplayShotEvent
+	Deaths      []ReplayDeathEvent
+	Bombs       []ReplayBombEvent
+}
+
+// ReplayBombEvent kinds persisted in the combat chunk.
+const (
+	ReplayBombPlant   uint8 = 1
+	ReplayBombDefuse  uint8 = 2
+	ReplayBombExplode uint8 = 3
+)
+
+// ReplayShotEvent is one firing trace sampled from WeaponFire.
+type ReplayShotEvent struct {
+	Tick       int64
+	PlayerSlot uint8
+	Weapon     string
+	Start      Point3D
+	End        Point3D
+}
+
+// ReplayDeathEvent records where a victim died and where the killer stood.
+type ReplayDeathEvent struct {
+	Tick       int64
+	KillerSlot uint8
+	VictimSlot uint8
+	Headshot   bool
+	Victim     Point3D
+	Killer     Point3D
+}
+
+// ReplayBombEvent records a plant, defuse, or detonation position.
+type ReplayBombEvent struct {
+	Tick int64
+	Kind uint8
+	Pos  Point3D
 }
 
 // InputCapCode converts a capability string into its binary enum code.
@@ -140,7 +181,7 @@ func WriteReplayFileAtomic(path string, tickRate float32, inputCap string, round
 
 	for _, r := range rounds {
 		buf.Reset()
-		if err := encodeRoundPayload(&buf, r); err != nil {
+		if err := encodeRoundPayload(&buf, r, hdr.Version); err != nil {
 			return fmt.Errorf("encode round %d: %w", r.RoundNumber, err)
 		}
 		payload := buf.Bytes()
@@ -235,7 +276,7 @@ func ReadReplayRound(path string, roundNum uint32) (ReplayHeader, ReplayRoundDat
 			if _, err := io.ReadFull(f, buf); err != nil {
 				return ReplayHeader{}, ReplayRoundData{}, err
 			}
-			rd, err := decodeRoundPayloadBytes(buf)
+			rd, err := decodeRoundPayloadBytes(buf, hdr.Version)
 			return hdr, rd, err
 		}
 	}
@@ -275,7 +316,7 @@ func readHeaderAndIndex(f *os.File) (ReplayHeader, []RoundIndexEntry, error) {
 	if err := binary.Read(f, binary.LittleEndian, &hdr.Version); err != nil {
 		return hdr, nil, err
 	}
-	if hdr.Version != ReplayFormatVersion {
+	if hdr.Version > ReplayFormatVersion {
 		return hdr, nil, fmt.Errorf("%w: %d", ErrUnsupportedReplayVer, hdr.Version)
 	}
 	if err := binary.Read(f, binary.LittleEndian, &hdr.InputCap); err != nil {
@@ -316,7 +357,7 @@ func readHeaderAndIndex(f *os.File) (ReplayHeader, []RoundIndexEntry, error) {
 	return hdr, entries, nil
 }
 
-func encodeRoundPayload(w io.Writer, r ReplayRoundData) error {
+func encodeRoundPayload(w io.Writer, r ReplayRoundData, version uint16) error {
 	_ = binary.Write(w, binary.LittleEndian, r.RoundNumber)
 	_ = binary.Write(w, binary.LittleEndian, r.StartTick)
 	_ = binary.Write(w, binary.LittleEndian, r.EndTick)
@@ -350,6 +391,9 @@ func encodeRoundPayload(w io.Writer, r ReplayRoundData) error {
 			_ = binary.Write(w, binary.LittleEndian, p.Z)
 			_ = binary.Write(w, binary.LittleEndian, p.Yaw)
 			_ = binary.Write(w, binary.LittleEndian, p.Pitch)
+			if version >= 3 {
+				_ = binary.Write(w, binary.LittleEndian, p.Zoom)
+			}
 			writeShortString(w, p.ActiveWeapon)
 		}
 	}
@@ -401,6 +445,50 @@ func encodeRoundPayload(w io.Writer, r ReplayRoundData) error {
 		_ = binary.Write(w, binary.LittleEndian, e.Tick)
 		_ = binary.Write(w, binary.LittleEndian, e.PlayerSlot)
 		_ = binary.Write(w, binary.LittleEndian, e.Buttons)
+	}
+
+	// Chunk D (v2): Combat events.
+	if ReplayFormatVersion < 2 {
+		return nil
+	}
+	_ = binary.Write(w, binary.LittleEndian, uint32(len(r.Shots)))
+	for _, sh := range r.Shots {
+		_ = binary.Write(w, binary.LittleEndian, sh.Tick)
+		_ = binary.Write(w, binary.LittleEndian, sh.PlayerSlot)
+		_ = binary.Write(w, binary.LittleEndian, sh.Start.X)
+		_ = binary.Write(w, binary.LittleEndian, sh.Start.Y)
+		_ = binary.Write(w, binary.LittleEndian, sh.Start.Z)
+		_ = binary.Write(w, binary.LittleEndian, sh.End.X)
+		_ = binary.Write(w, binary.LittleEndian, sh.End.Y)
+		_ = binary.Write(w, binary.LittleEndian, sh.End.Z)
+		writeShortString(w, sh.Weapon)
+	}
+
+	_ = binary.Write(w, binary.LittleEndian, uint32(len(r.Deaths)))
+	for _, d := range r.Deaths {
+		var flags uint8
+		if d.Headshot {
+			flags = 1
+		}
+		_ = binary.Write(w, binary.LittleEndian, d.Tick)
+		_ = binary.Write(w, binary.LittleEndian, d.KillerSlot)
+		_ = binary.Write(w, binary.LittleEndian, d.VictimSlot)
+		_ = binary.Write(w, binary.LittleEndian, flags)
+		_ = binary.Write(w, binary.LittleEndian, d.Victim.X)
+		_ = binary.Write(w, binary.LittleEndian, d.Victim.Y)
+		_ = binary.Write(w, binary.LittleEndian, d.Victim.Z)
+		_ = binary.Write(w, binary.LittleEndian, d.Killer.X)
+		_ = binary.Write(w, binary.LittleEndian, d.Killer.Y)
+		_ = binary.Write(w, binary.LittleEndian, d.Killer.Z)
+	}
+
+	_ = binary.Write(w, binary.LittleEndian, uint32(len(r.Bombs)))
+	for _, b := range r.Bombs {
+		_ = binary.Write(w, binary.LittleEndian, b.Tick)
+		_ = binary.Write(w, binary.LittleEndian, b.Kind)
+		_ = binary.Write(w, binary.LittleEndian, b.Pos.X)
+		_ = binary.Write(w, binary.LittleEndian, b.Pos.Y)
+		_ = binary.Write(w, binary.LittleEndian, b.Pos.Z)
 	}
 	return nil
 }
@@ -489,7 +577,7 @@ func (s *sliceReader) shortString(intern map[string]string) (string, error) {
 	return string(raw), nil
 }
 
-func decodeRoundPayloadBytes(buf []byte) (ReplayRoundData, error) {
+func decodeRoundPayloadBytes(buf []byte, version uint16) (ReplayRoundData, error) {
 	var out ReplayRoundData
 	sr := sliceReader{b: buf}
 	intern := make(map[string]string, 48)
@@ -551,6 +639,13 @@ func decodeRoundPayloadBytes(buf []byte) (ReplayRoundData, error) {
 				Pitch:      math.Float32frombits(binary.LittleEndian.Uint32(b[29:33])),
 			}
 			sr.o += 33
+			if version >= 3 {
+				zoom, err := sr.u8()
+				if err != nil {
+					return out, err
+				}
+				p.Zoom = zoom
+			}
 			p.ActiveWeapon, err = sr.shortString(intern)
 			if err != nil {
 				return out, err
@@ -698,6 +793,120 @@ func decodeRoundPayloadBytes(buf []byte) (ReplayRoundData, error) {
 			Tick:       int64(binary.LittleEndian.Uint64(b[0:8])),
 			PlayerSlot: b[8],
 			Buttons:    binary.LittleEndian.Uint16(b[9:11]),
+		}
+	}
+
+	// Chunk D (v2 combat events) is absent in version 1 payloads.
+	if sr.rem() == 0 {
+		return out, nil
+	}
+	shotCount, err := sr.u32()
+	if err != nil {
+		return out, err
+	}
+	if uint64(shotCount)*34 > uint64(sr.rem()) {
+		return out, io.ErrUnexpectedEOF
+	}
+	out.Shots = make([]ReplayShotEvent, shotCount)
+	for i := uint32(0); i < shotCount; i++ {
+		sh := &out.Shots[i]
+		if sh.Tick, err = sr.i64(); err != nil {
+			return out, err
+		}
+		if sh.PlayerSlot, err = sr.u8(); err != nil {
+			return out, err
+		}
+		if sh.Start.X, err = sr.f32(); err != nil {
+			return out, err
+		}
+		if sh.Start.Y, err = sr.f32(); err != nil {
+			return out, err
+		}
+		if sh.Start.Z, err = sr.f32(); err != nil {
+			return out, err
+		}
+		if sh.End.X, err = sr.f32(); err != nil {
+			return out, err
+		}
+		if sh.End.Y, err = sr.f32(); err != nil {
+			return out, err
+		}
+		if sh.End.Z, err = sr.f32(); err != nil {
+			return out, err
+		}
+		if sh.Weapon, err = sr.shortString(intern); err != nil {
+			return out, err
+		}
+	}
+
+	deathCount, err := sr.u32()
+	if err != nil {
+		return out, err
+	}
+	if uint64(deathCount)*35 > uint64(sr.rem()) {
+		return out, io.ErrUnexpectedEOF
+	}
+	out.Deaths = make([]ReplayDeathEvent, deathCount)
+	for i := uint32(0); i < deathCount; i++ {
+		d := &out.Deaths[i]
+		if d.Tick, err = sr.i64(); err != nil {
+			return out, err
+		}
+		if d.KillerSlot, err = sr.u8(); err != nil {
+			return out, err
+		}
+		if d.VictimSlot, err = sr.u8(); err != nil {
+			return out, err
+		}
+		flags, err := sr.u8()
+		if err != nil {
+			return out, err
+		}
+		d.Headshot = flags&1 != 0
+		if d.Victim.X, err = sr.f32(); err != nil {
+			return out, err
+		}
+		if d.Victim.Y, err = sr.f32(); err != nil {
+			return out, err
+		}
+		if d.Victim.Z, err = sr.f32(); err != nil {
+			return out, err
+		}
+		if d.Killer.X, err = sr.f32(); err != nil {
+			return out, err
+		}
+		if d.Killer.Y, err = sr.f32(); err != nil {
+			return out, err
+		}
+		if d.Killer.Z, err = sr.f32(); err != nil {
+			return out, err
+		}
+	}
+
+	bombCount, err := sr.u32()
+	if err != nil {
+		return out, err
+	}
+	if uint64(bombCount)*21 > uint64(sr.rem()) {
+		return out, io.ErrUnexpectedEOF
+	}
+	out.Bombs = make([]ReplayBombEvent, bombCount)
+	for i := uint32(0); i < bombCount; i++ {
+		b := &out.Bombs[i]
+		if b.Tick, err = sr.i64(); err != nil {
+			return out, err
+		}
+		if b.Kind, err = sr.u8(); err != nil {
+			return out, err
+		}
+		if b.Pos.X, err = sr.f32(); err != nil {
+			return out, err
+		}
+		if b.Pos.Y, err = sr.f32(); err != nil {
+			return out, err
+		}
+		if b.Pos.Z, err = sr.f32(); err != nil {
+			return out, err
 		}
 	}
 	return out, nil

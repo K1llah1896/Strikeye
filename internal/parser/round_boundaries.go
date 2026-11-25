@@ -27,6 +27,7 @@ type RoundWindow struct {
 	TeamAEconomyType string
 	TeamBEconomyType string
 	PlayerEconomy    []PlayerRoundEconomy
+	Purchases        []PlayerPurchase
 	Headline         *string
 	Tags             []string
 }
@@ -38,9 +39,10 @@ type RoundTracker struct {
 	rounds        []*RoundWindow
 	active        *RoundWindow
 
-	teamAScore int
-	teamBScore int
-	lastSideA  string
+	teamAScore  int
+	teamBScore  int
+	lastSideA   string
+	freezeEnded bool
 }
 
 // NewRoundTracker creates a RoundTracker for the given demo tick rate.
@@ -49,6 +51,22 @@ func NewRoundTracker(tickRate float64) *RoundTracker {
 		tickRate = 64.0
 	}
 	return &RoundTracker{tickRate: tickRate}
+}
+
+// RecordPurchase attributes a bought item to the active round if it happened at
+// or before freeze time end (the buy window).
+func (rt *RoundTracker) RecordPurchase(tick int64, p PlayerPurchase) {
+	if rt.active == nil {
+		return
+	}
+	if tick < rt.active.StartTick {
+		return
+	}
+	if rt.freezeEnded && tick > rt.active.FreezeEndTick {
+		return
+	}
+	p.Tick = tick
+	rt.active.Purchases = append(rt.active.Purchases, p)
 }
 
 // ResetMatch clears any pre-match / warmup / knife rounds when live match starts.
@@ -72,6 +90,7 @@ func (rt *RoundTracker) StartRound(startTick int64, teamASide, teamBSide string)
 		}
 	}
 
+	rt.freezeEnded = false
 	if teamASide == "" {
 		teamASide = "CT"
 	}
@@ -115,7 +134,17 @@ func (rt *RoundTracker) MarkFreezeEnd(tick int64) {
 	}
 	if tick >= rt.active.StartTick {
 		rt.active.FreezeEndTick = tick
+		rt.freezeEnded = true
 	}
+	// Purchases only count during the buy window: anything recorded after freeze
+	// end is a mid-round pickup-and-drop, not a buy.
+	kept := rt.active.Purchases[:0]
+	for _, p := range rt.active.Purchases {
+		if p.Tick <= tick {
+			kept = append(kept, p)
+		}
+	}
+	rt.active.Purchases = kept
 }
 
 // EndRound records the winner and win reason for the currently active round.

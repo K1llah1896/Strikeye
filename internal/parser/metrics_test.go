@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"math"
 	"testing"
+
+	"strikeye/internal/storage"
 )
 
 func TestComputeMetricsCappedDamageTradeKASTClutchAndRating(t *testing.T) {
@@ -161,5 +163,71 @@ func TestComputeMetricsV2SideSplitFlashClutchSwingAndEcoAdj(t *testing.T) {
 	}
 	if sideCount != 2 {
 		t.Fatalf("expected 2 side-split rows for A1, got %d", sideCount)
+	}
+}
+
+func TestComputeMetricsDuelTiming(t *testing.T) {
+	players := []PlayerMeta{
+		{SteamID64: "1", PlayerName: "attacker", TeamKey: "team_a"},
+		{SteamID64: "2", PlayerName: "victim", TeamKey: "team_b"},
+		{SteamID64: "3", PlayerName: "other", TeamKey: "team_a"},
+	}
+	rounds := []*RoundWindow{{RoundNumber: 1, TeamASide: "CT", TeamBSide: "T"}}
+	damages := []DamageEvent{
+		{RoundNumber: 1, Tick: 100, AttackerSteamID: "3", AttackerTeamKey: "team_a", VictimSteamID: "2", VictimTeamKey: "team_b", Weapon: "ak47", RawHealthDamage: 20},
+		{RoundNumber: 1, Tick: 150, AttackerSteamID: "1", AttackerTeamKey: "team_a", VictimSteamID: "2", VictimTeamKey: "team_b", Weapon: "ak47", RawHealthDamage: 30},
+		// Second life: victim takes chip damage from 3 before 1 finishes.
+		{RoundNumber: 1, Tick: 400, AttackerSteamID: "3", AttackerTeamKey: "team_a", VictimSteamID: "2", VictimTeamKey: "team_b", Weapon: "hegrenade", RawHealthDamage: 10},
+	}
+	kills := []KillEvent{
+		{RoundNumber: 1, Tick: 214, AttackerSteamID: "1", AttackerName: "attacker", VictimSteamID: "2", Weapon: "ak47"},
+		{RoundNumber: 1, Tick: 478, AttackerSteamID: "3", AttackerName: "other", VictimSteamID: "2", Weapon: "ak47"},
+	}
+	res := ComputeMetrics(MetricsInput{TickRate: 64, TotalRounds: 1, Players: players, Rounds: rounds, Kills: kills, Damages: damages})
+	byID := map[string]storage.MatchPlayer{}
+	for _, p := range res.Players {
+		byID[p.SteamID64] = p
+	}
+	// 150 -> 214 = 64 ticks = 1000ms at 64 tick; the second life's chip damage at
+	// 400 -> 478 = 78 ticks = 1218.75ms credits the chipper.
+	if got := byID["1"].TTKAvgMS; got != 1000 {
+		t.Fatalf("attacker TTK = %v, want 1000", got)
+	}
+	if byID["1"].TTKSamples != 1 {
+		t.Fatalf("attacker samples = %d, want 1", byID["1"].TTKSamples)
+	}
+	if byID["3"].TTKSamples != 1 || byID["3"].TTKAvgMS != 1218.8 {
+		t.Fatalf("other TTK = %v/%d, want 1218.8/1", byID["3"].TTKAvgMS, byID["3"].TTKSamples)
+	}
+}
+
+func TestComputeMetricsVisibilityTTD(t *testing.T) {
+	players := []PlayerMeta{
+		{SteamID64: "1", PlayerName: "attacker", TeamKey: "team_a"},
+		{SteamID64: "2", PlayerName: "victim", TeamKey: "team_b"},
+	}
+	rounds := []*RoundWindow{
+		{RoundNumber: 1, TeamASide: "CT", TeamBSide: "T"},
+		{RoundNumber: 2, TeamASide: "CT", TeamBSide: "T"},
+	}
+	ttd := []TTDSample{
+		{RoundNumber: 1, AttackerSteamID: "1", DurationMS: 120},
+		{RoundNumber: 1, AttackerSteamID: "1", DurationMS: 480},
+		{RoundNumber: 2, AttackerSteamID: "1", DurationMS: 300},
+		{RoundNumber: 1, AttackerSteamID: "2", DurationMS: 0},
+	}
+	res := ComputeMetrics(MetricsInput{TickRate: 64, TotalRounds: 2, Players: players, Rounds: rounds, TTDSamples: ttd})
+	byID := map[string]storage.MatchPlayer{}
+	for _, p := range res.Players {
+		byID[p.SteamID64] = p
+	}
+	if got := byID["1"].TTDAvgMS; got != 300 {
+		t.Fatalf("TTD avg = %v, want 300", got)
+	}
+	if byID["1"].TTDSamples != 3 {
+		t.Fatalf("TTD samples = %d, want 3", byID["1"].TTDSamples)
+	}
+	if byID["2"].TTDSamples != 1 || byID["2"].TTDAvgMS != 0 {
+		t.Fatalf("victim TTD = %v/%d, want 0/1", byID["2"].TTDAvgMS, byID["2"].TTDSamples)
 	}
 }

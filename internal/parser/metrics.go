@@ -86,6 +86,7 @@ type MetricsInput struct {
 	Kills                []KillEvent
 	Damages              []DamageEvent
 	Flashes              []FlashEvent
+	TTDSamples           []TTDSample
 	BombPlantTickByRound map[int]int64
 	EquipValues          map[string][]int // steamID64 -> equip values at freeze end
 }
@@ -137,10 +138,14 @@ type statAcc struct {
 	enemiesFlashed  int
 	totalFlashSec   float64
 	roundSwingSum   float64
+	ttdMS           float64
+	ttdSamples      int
 	ecoAdjKills     float64
 	ecoAdjDeaths    float64
 	ecoAdjAssists   float64
 	ecoAdjDamage    float64
+	ttkTicks        int64
+	ttkSamples      int
 }
 
 func (a *statAcc) recordClutch(enemies int, won bool) {
@@ -292,6 +297,7 @@ func ComputeMetrics(in MetricsInput) MetricsResult {
 		tickRate = 64.0
 	}
 	tradeWindowTicks := int64(math.Round(5.0 * tickRate))
+	duelWindowTicks := int64(math.Round(3.0 * tickRate))
 
 	type pAcc struct {
 		meta  PlayerMeta
@@ -366,6 +372,10 @@ func ComputeMetrics(in MetricsInput) MetricsResult {
 	for _, f := range in.Flashes {
 		flashesByRound[f.RoundNumber] = append(flashesByRound[f.RoundNumber], f)
 	}
+	ttdByRound := make(map[int][]TTDSample)
+	for _, t := range in.TTDSamples {
+		ttdByRound[t.RoundNumber] = append(ttdByRound[t.RoundNumber], t)
+	}
 
 	var clutches []RoundClutchResult
 
@@ -375,6 +385,16 @@ func ComputeMetrics(in MetricsInput) MetricsResult {
 			addForRound(p, r, func(s *statAcc) {
 				s.roundsPlayed++
 			})
+		}
+
+		// 0. Time-to-damage samples per attacker.
+		for _, t := range ttdByRound[r.RoundNumber] {
+			if p := accMap[t.AttackerSteamID]; p != nil {
+				addForRound(p, r, func(s *statAcc) {
+					s.ttdMS += t.DurationMS
+					s.ttdSamples++
+				})
+			}
 		}
 
 		// 1. Capped damage (100 HP per victim per round).
@@ -431,6 +451,51 @@ func ComputeMetrics(in MetricsInput) MetricsResult {
 					s.enemiesFlashed++
 					s.totalFlashSec += dur
 				})
+			}
+		}
+
+		// 1c. Duel timing: time from a player's first damage on a victim to the
+		// killing blow, measured within one life (engagement resets on death).
+		type engagement struct {
+			attacker string
+			tick     int64
+		}
+		firstHit := make(map[string]engagement)
+		dmgs := dmgsByRound[r.RoundNumber]
+		killList := killsByRound[r.RoundNumber]
+		di, ki := 0, 0
+		for di < len(dmgs) || ki < len(killList) {
+			if ki < len(killList) && (di >= len(dmgs) || killList[ki].Tick <= dmgs[di].Tick) {
+				k := killList[ki]
+				ki++
+				if e, ok := firstHit[k.VictimSteamID]; ok {
+					delete(firstHit, k.VictimSteamID)
+					if e.attacker != "" && e.attacker == k.AttackerSteamID && k.Tick >= e.tick && k.Tick-e.tick <= duelWindowTicks {
+						if att := ensurePlayer(e.attacker, k.AttackerName, k.AttackerTeamKey); att != nil {
+							delta := k.Tick - e.tick
+							addForRound(att, r, func(s *statAcc) {
+								s.ttkTicks += delta
+								s.ttkSamples++
+							})
+						}
+					}
+				}
+				continue
+			}
+			d := dmgs[di]
+			di++
+			if d.AttackerSteamID == "" || d.VictimSteamID == "" || d.AttackerSteamID == d.VictimSteamID {
+				continue
+			}
+			if d.AttackerTeamKey != "" && d.VictimTeamKey != "" && d.AttackerTeamKey == d.VictimTeamKey {
+				continue
+			}
+			if d.RawHealthDamage <= 0 {
+				continue
+			}
+			prev, ok := firstHit[d.VictimSteamID]
+			if !ok || prev.attacker != d.AttackerSteamID || d.Tick-prev.tick > duelWindowTicks {
+				firstHit[d.VictimSteamID] = engagement{attacker: d.AttackerSteamID, tick: d.Tick}
 			}
 		}
 
@@ -728,6 +793,10 @@ func ComputeMetrics(in MetricsInput) MetricsResult {
 			EcoAdjRating:        dm.ecoAdjRating,
 			EcoAdjADR:           dm.ecoAdjADR,
 			ClutchBreakdownJSON: string(clutchJSONBytes),
+			TTKAvgMS:            avgTTKMS(p.all, tickRate),
+			TTKSamples:          p.all.ttkSamples,
+			TTDAvgMS:            avgTTDMS(p.all),
+			TTDSamples:          p.all.ttdSamples,
 		})
 
 		for _, sideName := range []string{"CT", "T"} {
@@ -780,6 +849,20 @@ func ComputeMetrics(in MetricsInput) MetricsResult {
 		Sides:    sidesOut,
 		Clutches: clutches,
 	}
+}
+
+func avgTTDMS(a statAcc) float64 {
+	if a.ttdSamples == 0 {
+		return 0
+	}
+	return roundTo(a.ttdMS/float64(a.ttdSamples), 1)
+}
+
+func avgTTKMS(a statAcc, tickRate float64) float64 {
+	if a.ttkSamples == 0 || tickRate <= 0 {
+		return 0
+	}
+	return roundTo(float64(a.ttkTicks)/tickRate*1000.0/float64(a.ttkSamples), 1)
 }
 
 func roundTo(v float64, decimals int) float64 {

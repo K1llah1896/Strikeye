@@ -8,6 +8,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -17,6 +18,7 @@ import (
 	"github.com/markus-wa/demoinfocs-golang/v5/pkg/demoinfocs/events"
 	"github.com/markus-wa/demoinfocs-golang/v5/pkg/demoinfocs/msg"
 
+	"strikeye/internal/mapgeom"
 	"strikeye/internal/storage"
 	"strikeye/internal/version"
 	"strikeye/internal/watcher"
@@ -123,6 +125,9 @@ func ParseAndPersist(ctx context.Context, db *storage.DB, opts ParseOptions) (Pa
 	if err := db.Analysis().ReplaceMatchRounds(ctx, demo.ID, res.rounds); err != nil {
 		return ParseSummary{}, fmt.Errorf("persist match_rounds: %w", err)
 	}
+	if err := db.Analysis().ReplaceMatchPurchases(ctx, demo.ID, res.purchases); err != nil {
+		return ParseSummary{}, fmt.Errorf("persist match_purchases: %w", err)
+	}
 	if err := db.Analysis().ReplaceMatchEvents(ctx, demo.ID, res.events); err != nil {
 		return ParseSummary{}, fmt.Errorf("persist match_events: %w", err)
 	}
@@ -210,6 +215,7 @@ type singlePassOutput struct {
 	players        []storage.MatchPlayer
 	playerSides    []storage.MatchPlayerSide
 	rounds         []storage.MatchRound
+	purchases      []storage.MatchPurchase
 	events         []storage.MatchEvent
 	highlights     []storage.HighlightClip
 	replayRounds   []ReplayRoundData
@@ -240,16 +246,25 @@ func executeSinglePass(ctx context.Context, demo storage.Demo, opts ParseOptions
 		playerSlots  = make(map[string]uint8)
 		equipValues  = make(map[string][]int)
 
-		kills          []KillEvent
-		damages        []DamageEvent
-		flashes        []FlashEvent
-		defuses        []DefuseEvent
-		bombPlantTicks = make(map[int]int64)
-		matchEvents    []storage.MatchEvent
-		framesByRound  = make(map[int][]ReplayFrame)
-		activeBombSite string
-		lastSampleTick int64 = -1
-		lastProgTick   int64 = -1
+		kills           []KillEvent
+		damages         []DamageEvent
+		flashes         []FlashEvent
+		defuses         []DefuseEvent
+		bombPlantTicks  = make(map[int]int64)
+		matchEvents     []storage.MatchEvent
+		framesByRound   = make(map[int][]ReplayFrame)
+		shotsByRound    = make(map[int][]ReplayShotEvent)
+		deathsByRound   = make(map[int][]ReplayDeathEvent)
+		bombsByRound    = make(map[int][]ReplayBombEvent)
+		plantPosByRound = make(map[int]Point3D)
+		activeBombSite  string
+		visSamples      []visSample
+		ttdSamples      []TTDSample
+		ttdSeen         = make(map[string]bool)
+		visTracer       *mapgeom.Tracer
+		visGeoLoaded    bool
+		lastSampleTick  int64 = -1
+		lastProgTick    int64 = -1
 	)
 
 	resetState := func() {
@@ -261,7 +276,13 @@ func executeSinglePass(ctx context.Context, demo storage.Demo, opts ParseOptions
 		defuses = nil
 		matchEvents = nil
 		framesByRound = make(map[int][]ReplayFrame)
+		shotsByRound = make(map[int][]ReplayShotEvent)
+		deathsByRound = make(map[int][]ReplayDeathEvent)
+		bombsByRound = make(map[int][]ReplayBombEvent)
+		plantPosByRound = make(map[int]Point3D)
 		activeBombSite = ""
+		visSamples = nil
+		ttdSeen = make(map[string]bool)
 	}
 
 	resolveTeamKey := func(pl *common.Player) string {
@@ -418,6 +439,30 @@ func executeSinglePass(ctx context.Context, demo storage.Demo, opts ParseOptions
 		recordParticipants(gs)
 	})
 
+	p.RegisterEventHandler(func(e events.ItemPickup) {
+		gs := p.GameState()
+		if gs.IsWarmupPeriod() || !gs.IsMatchStarted() {
+			return
+		}
+		if e.Player == nil || e.Weapon == nil || !e.Player.IsAlive() {
+			return
+		}
+		name := e.Weapon.String()
+		if IsDefaultLoadout(name) || KnifeVariant(name) {
+			return
+		}
+		cost, ok := WeaponPrice(name)
+		if !ok {
+			return
+		}
+		rt.RecordPurchase(int64(gs.IngameTick()), PlayerPurchase{
+			SteamID64:  steamIDStr(e.Player),
+			PlayerName: e.Player.Name,
+			Weapon:     name,
+			Cost:       cost,
+		})
+	})
+
 	p.RegisterEventHandler(func(e events.RoundFreezetimeEnd) {
 		gs := p.GameState()
 		if gs.IsWarmupPeriod() || !gs.IsMatchStarted() {
@@ -515,6 +560,12 @@ func executeSinglePass(ctx context.Context, demo storage.Demo, opts ParseOptions
 		if e.Player != nil {
 			s, n, tk := steamIDStr(e.Player), e.Player.Name, resolveTeamKey(e.Player)
 			actorSID, actorName, actorTK = &s, &n, &tk
+			pp := e.Player.Position()
+			pos := Point3D{X: float32(pp.X), Y: float32(pp.Y), Z: float32(pp.Z)}
+			plantPosByRound[rw.RoundNumber] = pos
+			bombsByRound[rw.RoundNumber] = append(bombsByRound[rw.RoundNumber], ReplayBombEvent{
+				Tick: tick, Kind: ReplayBombPlant, Pos: pos,
+			})
 		}
 		matchEvents = append(matchEvents, storage.MatchEvent{
 			RoundNumber:    rw.RoundNumber,
@@ -541,6 +592,11 @@ func executeSinglePass(ctx context.Context, demo storage.Demo, opts ParseOptions
 		if e.Player != nil {
 			s, n, tk := steamIDStr(e.Player), e.Player.Name, resolveTeamKey(e.Player)
 			actorSID, actorName, actorTK = &s, &n, &tk
+			pp := e.Player.Position()
+			bombsByRound[rw.RoundNumber] = append(bombsByRound[rw.RoundNumber], ReplayBombEvent{
+				Tick: tick, Kind: ReplayBombDefuse,
+				Pos: Point3D{X: float32(pp.X), Y: float32(pp.Y), Z: float32(pp.Z)},
+			})
 			for _, pl := range gs.Participants().Playing() {
 				if pl.IsAlive() && pl.Team != e.Player.Team {
 					enemiesAlive++
@@ -574,12 +630,47 @@ func executeSinglePass(ctx context.Context, demo storage.Demo, opts ParseOptions
 		}
 		tick := int64(p.GameState().IngameTick())
 		site := string(e.Site)
+		if pos, ok := plantPosByRound[rw.RoundNumber]; ok {
+			bombsByRound[rw.RoundNumber] = append(bombsByRound[rw.RoundNumber], ReplayBombEvent{
+				Tick: tick, Kind: ReplayBombExplode, Pos: pos,
+			})
+		}
 		matchEvents = append(matchEvents, storage.MatchEvent{
 			RoundNumber:  rw.RoundNumber,
 			Tick:         tick,
 			RoundTimeSec: roundTimeSec(tick, rw.FreezeEndTick, tickRate),
 			EventType:    "bomb_exploded",
 			Site:         &site,
+		})
+	})
+
+	p.RegisterEventHandler(func(e events.WeaponFire) {
+		rw := rt.Active()
+		if rw == nil || e.Shooter == nil || e.Weapon == nil {
+			return
+		}
+		sid := steamIDStr(e.Shooter)
+		slot, ok := playerSlots[sid]
+		if !ok {
+			return
+		}
+		pos := e.Shooter.Position()
+		yaw := float64(e.Shooter.ViewDirectionX()) * math.Pi / 180.0
+		pitch := float64(e.Shooter.ViewDirectionY()) * math.Pi / 180.0
+		dirX := math.Cos(yaw) * math.Cos(pitch)
+		dirY := math.Sin(yaw) * math.Cos(pitch)
+		dirZ := -math.Sin(pitch)
+		const traceLen = 1024.0
+		shotsByRound[rw.RoundNumber] = append(shotsByRound[rw.RoundNumber], ReplayShotEvent{
+			Tick:       int64(p.GameState().IngameTick()),
+			PlayerSlot: slot,
+			Weapon:     strings.ToLower(e.Weapon.String()),
+			Start:      Point3D{X: float32(pos.X), Y: float32(pos.Y), Z: float32(pos.Z + 64)},
+			End: Point3D{
+				X: float32(pos.X + dirX*traceLen),
+				Y: float32(pos.Y + dirY*traceLen),
+				Z: float32(pos.Z + 64 + dirZ*traceLen),
+			},
 		})
 	})
 
@@ -597,16 +688,38 @@ func executeSinglePass(ctx context.Context, demo storage.Demo, opts ParseOptions
 		if e.Weapon != nil {
 			wep = strings.ToLower(e.Weapon.String())
 		}
+		vicSID := steamIDStr(e.Player)
+		vicTK := resolveTeamKey(e.Player)
 		damages = append(damages, DamageEvent{
 			RoundNumber:     rw.RoundNumber,
 			Tick:            int64(p.GameState().IngameTick()),
 			AttackerSteamID: attSID,
 			AttackerTeamKey: attTK,
-			VictimSteamID:   steamIDStr(e.Player),
-			VictimTeamKey:   resolveTeamKey(e.Player),
+			VictimSteamID:   vicSID,
+			VictimTeamKey:   vicTK,
 			Weapon:          wep,
 			RawHealthDamage: e.HealthDamage,
 		})
+
+		if visTracer == nil || attSID == "" || vicSID == "" || attSID == vicSID || e.HealthDamage <= 0 {
+			return
+		}
+		if attTK != "" && vicTK != "" && attTK == vicTK {
+			return
+		}
+		tick := int64(p.GameState().IngameTick())
+		key := fmt.Sprintf("%d|%s|%s", rw.RoundNumber, attSID, vicSID)
+		if ttdSeen[key] {
+			return
+		}
+		if ms, ok := visibleRunMS(visTracer, visSamples, attSID, vicSID, tick, int64(math.Round(5*tickRate)), tickRate); ok {
+			ttdSeen[key] = true
+			ttdSamples = append(ttdSamples, TTDSample{
+				RoundNumber:     rw.RoundNumber,
+				AttackerSteamID: attSID,
+				DurationMS:      ms,
+			})
+		}
 	})
 
 	p.RegisterEventHandler(func(e events.PlayerFlashed) {
@@ -701,6 +814,24 @@ func executeSinglePass(ctx context.Context, demo storage.Demo, opts ParseOptions
 			TeamKill:        teamKill,
 		}
 		kills = append(kills, ke)
+
+		if vicSID != "" {
+			vp := e.Victim.Position()
+			kp := vp
+			killerSlot := uint8(0)
+			if e.Killer != nil {
+				kp = e.Killer.Position()
+				killerSlot = playerSlots[attSID]
+			}
+			deathsByRound[rw.RoundNumber] = append(deathsByRound[rw.RoundNumber], ReplayDeathEvent{
+				Tick:       tick,
+				KillerSlot: killerSlot,
+				VictimSlot: playerSlots[vicSID],
+				Headshot:   e.IsHeadshot,
+				Victim:     Point3D{X: float32(vp.X), Y: float32(vp.Y), Z: float32(vp.Z)},
+				Killer:     Point3D{X: float32(kp.X), Y: float32(kp.Y), Z: float32(kp.Z)},
+			})
+		}
 
 		var extraJSONPtr *string
 		{
@@ -811,6 +942,14 @@ func executeSinglePass(ctx context.Context, demo storage.Demo, opts ParseOptions
 		gs := p.GameState()
 		tick := int64(gs.IngameTick())
 
+		if !visGeoLoaded && mapName != "" && gs.IsMatchStarted() {
+			visGeoLoaded = true
+			geoPath := filepath.Join(opts.DataRoot, "cache", "map_geometry", strings.ToLower(mapName)+mapgeom.Extension)
+			if bvh, _, err := mapgeom.Load(geoPath); err == nil {
+				visTracer = mapgeom.NewTracer(bvh)
+			}
+		}
+
 		if opts.OnProgress != nil && (lastProgTick < 0 || tick-lastProgTick >= 4096) {
 			lastProgTick = tick
 			opts.OnProgress(ParseProgress{
@@ -846,6 +985,17 @@ func executeSinglePass(ctx context.Context, demo storage.Demo, opts ParseOptions
 		}
 		lastSampleTick = tick
 
+		if visGeoLoaded && visTracer != nil {
+			sample := sampleObservation(gs)
+			sample.Tick = tick
+			visSamples = append(visSamples, sample)
+			if cutoff := tick - int64(math.Round(5*tickRate)); cutoff > 0 {
+				for len(visSamples) > 0 && visSamples[0].Tick < cutoff {
+					visSamples = visSamples[1:]
+				}
+			}
+		}
+
 		poses := make([]ReplayPlayerPose, 0, 10)
 		for _, pl := range gs.Participants().Playing() {
 			sid := steamIDStr(pl)
@@ -861,8 +1011,12 @@ func executeSinglePass(ctx context.Context, demo storage.Demo, opts ParseOptions
 			}
 			pos := pl.Position()
 			wep := ""
+			zoom := uint8(0)
 			if aw := pl.ActiveWeapon(); aw != nil {
 				wep = strings.ToLower(aw.String())
+				if z := aw.ZoomLevel(); z > 0 {
+					zoom = uint8(z)
+				}
 			}
 			hasBomb := false
 			for _, w := range pl.Weapons() {
@@ -887,6 +1041,7 @@ func executeSinglePass(ctx context.Context, demo storage.Demo, opts ParseOptions
 				Z:            float32(pos.Z),
 				Yaw:          pl.ViewDirectionX(),
 				Pitch:        pl.ViewDirectionY(),
+				Zoom:         zoom,
 				ActiveWeapon: wep,
 			})
 		}
@@ -954,6 +1109,7 @@ func executeSinglePass(ctx context.Context, demo storage.Demo, opts ParseOptions
 		Kills:                kills,
 		Damages:              damages,
 		Flashes:              flashes,
+		TTDSamples:           ttdSamples,
 		BombPlantTickByRound: bombPlantTicks,
 		EquipValues:          equipValues,
 	})
@@ -973,6 +1129,7 @@ func executeSinglePass(ctx context.Context, demo storage.Demo, opts ParseOptions
 	})
 
 	storageRounds := make([]storage.MatchRound, 0, len(rounds))
+	var purchases []storage.MatchPurchase
 	replayRounds := make([]ReplayRoundData, 0, len(rounds))
 
 	for _, r := range rounds {
@@ -1003,6 +1160,25 @@ func executeSinglePass(ctx context.Context, demo storage.Demo, opts ParseOptions
 			PlayerEconomyJSON: string(peJSON),
 		})
 
+		if len(r.Purchases) > 0 {
+			sorted := append([]PlayerPurchase(nil), r.Purchases...)
+			sort.Slice(sorted, func(i, j int) bool { return sorted[i].Tick < sorted[j].Tick })
+			for i := range sorted {
+				if r.FreezeEndTick > 0 {
+					sorted[i].TimeSec = roundTo(float64(sorted[i].Tick-r.FreezeEndTick)/tickRate, 2)
+				}
+				purchases = append(purchases, storage.MatchPurchase{
+					RoundNumber: r.RoundNumber,
+					Tick:        sorted[i].Tick,
+					TimeSec:     sorted[i].TimeSec,
+					SteamID64:   sorted[i].SteamID64,
+					PlayerName:  sorted[i].PlayerName,
+					Weapon:      sorted[i].Weapon,
+					Cost:        sorted[i].Cost,
+				})
+			}
+		}
+
 		gTracks, smokes, infernos := gc.RoundEffects(r.RoundNumber)
 		replayRounds = append(replayRounds, ReplayRoundData{
 			RoundNumber: uint32(r.RoundNumber),
@@ -1013,6 +1189,9 @@ func executeSinglePass(ctx context.Context, demo storage.Demo, opts ParseOptions
 			Smokes:      smokes,
 			Infernos:    infernos,
 			InputEdges:  ic.RoundEdges(r.RoundNumber),
+			Shots:       shotsByRound[r.RoundNumber],
+			Deaths:      deathsByRound[r.RoundNumber],
+			Bombs:       bombsByRound[r.RoundNumber],
 		})
 	}
 
@@ -1040,6 +1219,7 @@ func executeSinglePass(ctx context.Context, demo storage.Demo, opts ParseOptions
 		events:         matchEvents,
 		highlights:     highlights,
 		replayRounds:   replayRounds,
+		purchases:      purchases,
 	}, nil
 }
 

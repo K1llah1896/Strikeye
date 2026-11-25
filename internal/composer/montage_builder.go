@@ -48,6 +48,7 @@ type MontageSpec struct {
 	ClipVolume    float64        `json:"clip_volume"`
 	BGMVolume     float64        `json:"bgm_volume"`
 	BGMFadeSec    float64        `json:"bgm_fade_sec"`
+	AudioTracks   []AudioTrack   `json:"audio_tracks,omitempty"`
 	Width         int            `json:"width"`
 	Height        int            `json:"height"`
 	FPS           int            `json:"fps"`
@@ -311,6 +312,20 @@ func BuildMontage(ctx context.Context, spec MontageSpec, deps MontageDeps) (Mont
 		}
 	}
 
+	// Extra tracks (comms, voice-over) layer on top of the BGM mix so their
+	// offsets stay relative to the final timeline.
+	if audible := audibleTracks(spec.AudioTracks); len(audible) > 0 {
+		mixedPath := filepath.Join(workDir, "mixed_tracks.mp4")
+		if err := MixAudioTracks(ctx, ffmpegExe, tmpOut, audible, mixedPath, expectedTotalDur, 1.0); err != nil {
+			_ = os.Remove(tmpOut)
+			return fail(fmt.Errorf("mix audio tracks: %w", err))
+		}
+		_ = os.Remove(tmpOut)
+		if err := copyFile(mixedPath, tmpOut); err != nil {
+			return fail(err)
+		}
+	}
+
 	minBytes := deps.MinFileBytes
 	if minBytes <= 0 {
 		minBytes = 64 * 1024
@@ -536,6 +551,18 @@ func concatSegments(ctx context.Context, ffmpegExe string, paths []string, outPa
 		return fmt.Errorf("%v: %s", err, strings.TrimSpace(string(out)))
 	}
 	return nil
+}
+
+// audibleTracks drops muted and silent tracks, and rejects entries without a path.
+func audibleTracks(tracks []AudioTrack) []AudioTrack {
+	out := make([]AudioTrack, 0, len(tracks))
+	for _, t := range tracks {
+		if t.Mute || t.EffectiveVolume() == 0 || strings.TrimSpace(t.Path) == "" {
+			continue
+		}
+		out = append(out, t)
+	}
+	return out
 }
 
 func mixBGM(ctx context.Context, ffmpegExe, videoPath, bgmPath, outPath string, totalDur, clipVol, bgmVol, fadeSec float64) error {

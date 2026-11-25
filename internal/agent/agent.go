@@ -92,7 +92,8 @@ func Run(ctx context.Context, dataRoot, pipeOverride string) error {
 		Probe:  svc.probe,
 	})
 	w := watcher.New(db, watcher.Options{
-		Targets: targets,
+		Targets:   targets,
+		ImportDir: filepath.Join(dataRoot, "media", "imports"),
 		OnDiscovered: func(d watcher.DiscoveredDemo) {
 			svc.HandleDiscovered(d)
 		},

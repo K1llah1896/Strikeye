@@ -43,13 +43,13 @@ func TestNormalizeClampingAndFullScale(t *testing.T) {
 
 func TestDeriveZeroAndNaNSafety(t *testing.T) {
 	p := storage.MatchPlayer{
-		KPR:            math.NaN(),
-		SurvivalRate:   -5,
-		ADR:            0,
-		KASTPercent:    0,
-		TwoKillRounds:  2,
+		KPR:             math.NaN(),
+		SurvivalRate:    -5,
+		ADR:             0,
+		KASTPercent:     0,
+		TwoKillRounds:   2,
 		ThreeKillRounds: 1,
-		StrikeyeRating: 0,
+		StrikeyeRating:  0,
 	}
 	raw := DeriveFromMatchPlayer(p)
 	if raw.KPR != 0 || raw.Surviving != 0 || raw.MultiKill != 3 {

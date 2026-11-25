@@ -165,8 +165,8 @@ echo '{"format":{"duration":"4.0"},"streams":[{"codec_type":"video","codec_name"
 	cfgMgr := NewCFGBackupManager(layout.BackupCS2Configs, steamDir, "")
 
 	sched := NewScheduler(SchedulerOptions{
-		DataRoot:   tmp,
-		Config:     cfg,
+		DataRoot: tmp,
+		Config:   cfg,
 		Probe: config.ProbeReport{
 			FFprobe: config.ToolStatus{Available: true, Path: ffprobeScript},
 			Steam:   config.ToolStatus{Available: true, Path: steamDir},

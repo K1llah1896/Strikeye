@@ -77,18 +77,18 @@ type SchedulerStatus struct {
 
 // SchedulerOptions configures the Phase 4 render scheduler.
 type SchedulerOptions struct {
-	DataRoot    string
-	Config      config.Config
-	Probe       config.ProbeReport
-	DB          *storage.DB
-	UILock      ipc.Lock
-	RenderLock  ipc.Lock
-	Guard       ProcessGuard
-	Runner      SessionRunner
-	CFGBackup   *CFGBackupManager
-	UICooldown  time.Duration
-	PollPeriod  time.Duration
-	Publish     EventPublisher
+	DataRoot   string
+	Config     config.Config
+	Probe      config.ProbeReport
+	DB         *storage.DB
+	UILock     ipc.Lock
+	RenderLock ipc.Lock
+	Guard      ProcessGuard
+	Runner     SessionRunner
+	CFGBackup  *CFGBackupManager
+	UICooldown time.Duration
+	PollPeriod time.Duration
+	Publish    EventPublisher
 }
 
 // Scheduler orchestrates policy-based render planning, UI/CS2 mutual exclusion,

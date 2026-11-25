@@ -38,8 +38,11 @@ type Options struct {
 	StableDuration time.Duration
 	MinSamples     int
 	MinFileSize    int64
-	OnDiscovered   func(DiscoveredDemo)
-	OnWarning      func(path string, err error)
+	// ImportDir receives demos extracted from archives. It defaults to
+	// <user cache>/strikeye/imports and is excluded from directory walks.
+	ImportDir    string
+	OnDiscovered func(DiscoveredDemo)
+	OnWarning    func(path string, err error)
 }
 
 // DiscoveredDemo reports a stabilized, deduplicated demo registration event.
@@ -81,6 +84,10 @@ func New(db *storage.DB, opts Options) *Watcher {
 	if opts.MinFileSize <= 0 {
 		opts.MinFileSize = DefaultMinFileSize
 	}
+	if strings.TrimSpace(opts.ImportDir) == "" {
+		opts.ImportDir = defaultImportDir()
+	}
+	opts.ImportDir = filepath.Clean(opts.ImportDir)
 	return &Watcher{
 		db:     db,
 		opts:   opts,
@@ -160,9 +167,12 @@ func (w *Watcher) scanOnce(ctx context.Context, immediate bool) (ScanReport, err
 				return nil
 			}
 			if d.IsDir() {
+				if path != target.Dir && isUnderDir(path, w.opts.ImportDir) {
+					return filepath.SkipDir
+				}
 				return nil
 			}
-			if !strings.EqualFold(filepath.Ext(d.Name()), ".dem") {
+			if !strings.EqualFold(filepath.Ext(d.Name()), ".dem") && !IsDemoArchive(d.Name()) {
 				return nil
 			}
 			rep.Candidates++
@@ -232,48 +242,170 @@ func (w *Watcher) processCandidate(ctx context.Context, path string, target Watc
 		}
 	}
 
-	if err := ValidateDemoFile(path, tr.size, w.opts.MinFileSize); err != nil {
+	if IsDemoArchive(path) {
+		return w.processArchive(ctx, path, target, tr, now)
+	}
+	return w.ingestDemoFile(ctx, path, target.Platform, tr.size, target.Dir, tr)
+}
+
+// processArchive extracts every .dem entry from a stabilized archive and
+// registers each extracted demo through the normal validation/dedupe pipeline.
+func (w *Watcher) processArchive(ctx context.Context, archivePath string, target WatchTarget, tr *fileTrack, now time.Time) (bool, string) {
+	platform := target.Platform
+	if platform == "" || platform == PlatformUnknown {
+		platform = ClassifyPlatform(archivePath)
+	}
+
+	extracted, err := ExtractDemoArchives(ctx, archivePath, w.opts.ImportDir)
+	if err != nil {
 		tr.rejected = true
-		if w.opts.OnWarning != nil {
-			w.opts.OnWarning(path, err)
+		w.warn(archivePath, err)
+		return false, fmt.Sprintf("%s: %v", filepath.Base(archivePath), err)
+	}
+
+	createdAny := false
+	var warns []string
+	for _, demoPath := range extracted {
+		info, statErr := os.Stat(demoPath)
+		if statErr != nil || info.IsDir() {
+			continue
 		}
+		created, warn := w.ingestDemoFile(ctx, demoPath, platform, info.Size(), w.opts.ImportDir, nil)
+		createdAny = createdAny || created
+		if warn != "" {
+			warns = append(warns, warn)
+		}
+	}
+	tr.ingested = true
+	if len(warns) > 0 {
+		return createdAny, strings.Join(warns, "; ")
+	}
+	return createdAny, ""
+}
+
+// ingestDemoFile validates, hashes, and registers one demo file, applying any
+// sidecar .info metadata without overwriting parsed data or user annotations.
+func (w *Watcher) ingestDemoFile(ctx context.Context, path, platform string, size int64, watchRoot string, tr *fileTrack) (bool, string) {
+	if err := ValidateDemoFile(path, size, w.opts.MinFileSize); err != nil {
+		if tr != nil {
+			tr.rejected = true
+		}
+		w.warn(path, err)
 		return false, fmt.Sprintf("%s: %v", filepath.Base(path), err)
 	}
 
 	hash, err := StreamSHA256(path)
 	if err != nil {
-		if w.opts.OnWarning != nil {
-			w.opts.OnWarning(path, err)
+		if tr != nil {
+			tr.rejected = true
 		}
+		w.warn(path, err)
 		return false, fmt.Sprintf("%s: %v", filepath.Base(path), err)
 	}
 
-	platform := target.Platform
-	if platform == "" || platform == PlatformUnknown {
-		platform = ClassifyPlatform(path)
+	meta, hasSidecar, sidecarErr := ReadSidecar(path)
+	if sidecarErr != nil {
+		w.warn(path, sidecarErr)
 	}
-	watchRoot := target.Dir
+	if platform == "" || platform == PlatformUnknown {
+		if meta.SourcePlatform != "" {
+			platform = meta.SourcePlatform
+		} else {
+			platform = ClassifyPlatform(path)
+		}
+	}
+	if platform == "" {
+		platform = PlatformUnknown
+	}
 
-	demo, created, err := w.db.Demos().UpsertByContentHash(ctx, storage.Demo{
+	root := watchRoot
+	demo := storage.Demo{
 		FilePath:       path,
 		Filename:       filepath.Base(path),
-		FileSize:       tr.size,
+		FileSize:       size,
 		ContentSHA256:  hash,
 		SourcePlatform: platform,
-		WatchRoot:      &watchRoot,
-	})
-	if err != nil {
-		if w.opts.OnWarning != nil {
-			w.opts.OnWarning(path, err)
+		WatchRoot:      &root,
+	}
+	if hasSidecar {
+		if meta.MatchDate != "" {
+			demo.MatchDate = strPtr(meta.MatchDate)
 		}
+		if meta.TeamAName != "" {
+			demo.TeamAName = meta.TeamAName
+		}
+		if meta.TeamBName != "" {
+			demo.TeamBName = meta.TeamBName
+		}
+		if meta.HasScore {
+			demo.TeamAScore = meta.TeamAScore
+			demo.TeamBScore = meta.TeamBScore
+		}
+		if meta.MatchID != "" {
+			demo.Remark = strPtr(meta.MatchID)
+		}
+	}
+
+	registered, created, err := w.db.Demos().UpsertByContentHash(ctx, demo)
+	if err != nil {
+		if tr != nil {
+			tr.rejected = true
+		}
+		w.warn(path, err)
 		return false, fmt.Sprintf("%s: %v", filepath.Base(path), err)
 	}
 
-	tr.ingested = true
+	if hasSidecar && !meta.IsZero() {
+		if _, applyErr := w.db.Demos().ApplyIngestMetadata(ctx, registered.ID, storage.IngestMetadata{
+			SourcePlatform: meta.SourcePlatform,
+			MatchDate:      meta.MatchDate,
+			TeamAName:      meta.TeamAName,
+			TeamBName:      meta.TeamBName,
+			TeamAScore:     meta.TeamAScore,
+			TeamBScore:     meta.TeamBScore,
+			HasScore:       meta.HasScore,
+			MatchID:        meta.MatchID,
+		}); applyErr != nil {
+			w.warn(path, applyErr)
+		} else if updated, getErr := w.db.Demos().GetByID(ctx, registered.ID); getErr == nil {
+			registered = updated
+		}
+	}
+
+	if tr != nil {
+		tr.ingested = true
+	}
 	if w.opts.OnDiscovered != nil {
-		w.opts.OnDiscovered(DiscoveredDemo{Demo: demo, Created: created})
+		w.opts.OnDiscovered(DiscoveredDemo{Demo: registered, Created: created})
 	}
 	return created, ""
+}
+
+func (w *Watcher) warn(path string, err error) {
+	if w.opts.OnWarning != nil {
+		w.opts.OnWarning(path, err)
+	}
+}
+
+func strPtr(s string) *string { return &s }
+
+// defaultImportDir returns a stable per-user directory for extracted demos.
+func defaultImportDir() string {
+	if cache, err := os.UserCacheDir(); err == nil && cache != "" {
+		return filepath.Join(cache, "strikeye", "imports")
+	}
+	return filepath.Join(os.TempDir(), "strikeye-imports")
+}
+
+func isUnderDir(path, dir string) bool {
+	if dir == "" {
+		return false
+	}
+	rel, err := filepath.Rel(dir, path)
+	if err != nil {
+		return false
+	}
+	return rel != "." && !strings.HasPrefix(rel, "..")
 }
 
 // ValidateDemoFile verifies minimum file size, non-exclusive readability, and PBDEMS2 header magic.

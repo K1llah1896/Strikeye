@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -204,5 +205,112 @@ func TestWatcherStabilizationValidationAndDeduplication(t *testing.T) {
 	}
 	if discovered[1].Demo.ParseStatus != "parsed" {
 		t.Fatalf("expected parse_status 'parsed' preserved, got %s", discovered[1].Demo.ParseStatus)
+	}
+}
+
+func TestWatcherIngestsArchiveAndAppliesSidecarMetadata(t *testing.T) {
+	ctx := context.Background()
+	tmp := t.TempDir()
+	dataRoot := filepath.Join(tmp, "data")
+	watchDir := filepath.Join(tmp, "faceit_demos")
+	miscDir := filepath.Join(tmp, "misc_demos")
+	for _, dir := range []string{watchDir, miscDir} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	db, err := storage.OpenDefault(dataRoot)
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer db.Close()
+
+	var discovered []DiscoveredDemo
+	w := New(db, Options{
+		Targets: []WatchTarget{
+			{Dir: watchDir, Platform: PlatformUnknown},
+			{Dir: miscDir, Platform: PlatformUnknown},
+		},
+		ImportDir:      filepath.Join(dataRoot, "media", "imports"),
+		SampleInterval: 10 * time.Millisecond,
+		StableDuration: 25 * time.Millisecond,
+		MinSamples:     2,
+		MinFileSize:    1024,
+		OnDiscovered: func(d DiscoveredDemo) {
+			discovered = append(discovered, d)
+		},
+	})
+
+	archivePath := filepath.Join(watchDir, "faceit_major.zip")
+	writeZip(t, archivePath, map[string][]byte{"rounds/match.dem": demoPayload(2048)})
+
+	if err := w.PollOnce(ctx); err != nil {
+		t.Fatalf("poll 1: %v", err)
+	}
+	time.Sleep(30 * time.Millisecond)
+	if err := w.PollOnce(ctx); err != nil {
+		t.Fatalf("poll 2: %v", err)
+	}
+	if len(discovered) != 1 {
+		t.Fatalf("expected 1 extracted demo, got %d", len(discovered))
+	}
+	got := discovered[0].Demo
+	if got.SourcePlatform != PlatformFACEIT {
+		t.Fatalf("expected faceit platform, got %q", got.SourcePlatform)
+	}
+	if want := filepath.Join(dataRoot, "media", "imports"); !strings.HasPrefix(got.FilePath, want) {
+		t.Fatalf("expected extracted demo under %q, got %q", want, got.FilePath)
+	}
+
+	// Sidecar metadata on a plain demo fills missing fields.
+	sidecarDemo := filepath.Join(miscDir, "scrim.dem")
+	if err := os.WriteFile(sidecarDemo, demoPayload(3000), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(sidecarDemo+".info", []byte(`{
+		"source": "matchzy",
+		"team1": "Spirit",
+		"team2": "FaZe",
+		"score1": 2,
+		"score2": 1,
+		"date": "2026-10-01 12:00:00",
+		"matchId": "abc-123"
+	}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.PollOnce(ctx); err != nil {
+		t.Fatalf("poll 3: %v", err)
+	}
+	time.Sleep(30 * time.Millisecond)
+	if err := w.PollOnce(ctx); err != nil {
+		t.Fatalf("poll 4: %v", err)
+	}
+	if len(discovered) != 2 {
+		t.Fatalf("expected 2 discoveries, got %d", len(discovered))
+	}
+	side := discovered[1].Demo
+	if side.SourcePlatform != PlatformMatchZy {
+		t.Fatalf("expected matchzy platform from sidecar, got %q", side.SourcePlatform)
+	}
+	if side.TeamAName != "Spirit" || side.TeamBName != "FaZe" || side.TeamAScore != 2 || side.TeamBScore != 1 {
+		t.Fatalf("sidecar teams/score not applied: %+v", side)
+	}
+	if side.MatchDate == nil || *side.MatchDate != "2026-10-01T12:00:00Z" {
+		t.Fatalf("sidecar date not applied: %v", side.MatchDate)
+	}
+	if side.Remark == nil || *side.Remark != "abc-123" {
+		t.Fatalf("sidecar match id not applied: %v", side.Remark)
+	}
+
+	// Re-polling must not duplicate rows or re-extract.
+	if err := w.PollOnce(ctx); err != nil {
+		t.Fatalf("poll 5: %v", err)
+	}
+	rows, err := db.Demos().List(ctx)
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if len(rows) != 2 {
+		t.Fatalf("expected 2 demo rows after re-poll, got %d", len(rows))
 	}
 }

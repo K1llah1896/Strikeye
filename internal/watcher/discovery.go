@@ -8,13 +8,6 @@ import (
 	"strikeye/internal/config"
 )
 
-const (
-	PlatformValve        = "valve"
-	PlatformPerfectWorld = "perfect_world"
-	Platform5E           = "5e"
-	PlatformUnknown      = "unknown"
-)
-
 // WatchTarget represents a resolved directory to monitor for CS2 .dem files.
 type WatchTarget struct {
 	Dir        string
@@ -84,21 +77,6 @@ func DiscoverWatchTargets(opts DiscoverOptions) []WatchTarget {
 	}
 
 	return targets
-}
-
-// ClassifyPlatform infers the demo source platform from a directory or file path.
-func ClassifyPlatform(path string) string {
-	lower := strings.ToLower(filepath.ToSlash(path))
-	switch {
-	case strings.Contains(lower, "perfectworld") || strings.Contains(lower, "perfect_world") || strings.Contains(lower, "/pw") || strings.Contains(lower, "pwp"):
-		return PlatformPerfectWorld
-	case strings.Contains(lower, "5eplay") || strings.Contains(lower, "/5e") || strings.Contains(lower, "5e_"):
-		return Platform5E
-	case strings.Contains(lower, "/csgo/replays") || strings.Contains(lower, "counter-strike global offensive"):
-		return PlatformValve
-	default:
-		return PlatformUnknown
-	}
 }
 
 func cs2ReplaysDirFromExe(cs2Exe string) string {

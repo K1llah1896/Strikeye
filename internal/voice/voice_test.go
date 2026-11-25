@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"errors"
+	"os"
 	"testing"
 )
 
@@ -81,10 +82,16 @@ func TestWriteFramePayloadLimit(t *testing.T) {
 }
 
 func TestExtractDemoWithoutVoice(t *testing.T) {
-	// The bundled fixtures were recorded without voice: extraction must succeed
-	// and report zero speakers rather than failing.
+	// The fixtures are 350+ MB Valve match demos and are git-ignored, so CI runs
+	// without them: skip rather than fail when the corpus is absent locally.
+	const demo = "../../tests/furia-vs-falcons-m2-dust2.dem"
+	if _, err := os.Stat(demo); err != nil {
+		t.Skipf("demo corpus not present: %v", err)
+	}
+	// That fixture was recorded without voice: extraction must succeed and
+	// report zero speakers rather than failing.
 	var buf bytes.Buffer
-	sum, err := Extract(t.Context(), "../../tests/furia-vs-falcons-m2-dust2.dem", &buf)
+	sum, err := Extract(t.Context(), demo, &buf)
 	if err != nil {
 		t.Fatalf("extract: %v", err)
 	}

@@ -301,13 +301,22 @@ func (v *View) Render(c *ui.Context) {
 				if strings.Contains(statusMsg, "失败") {
 					statusCol = theme.StatusRed
 				}
-				theme.RowCenter(c).FillWidth().Gap(8).Children(func() {
-					theme.PillBadge(c, statusMsg, statusCol)
-					ui.Spacer(c)
-					if theme.ActionButton(c, "关闭").Clicked() {
-						v.setStatus("")
-					}
-				})
+				theme.RowCenter(c).FillWidth().Gap(8).
+					Transition(ui.ElementTransition{
+						Duration:     200 * time.Millisecond,
+						Ease:         ui.EaseOut,
+						ExitDuration: 140 * time.Millisecond,
+						Position:     true,
+						Enter:        &ui.Motion{Collapse: true, Opacity: 0},
+						Exit:         &ui.Motion{Collapse: true, Opacity: 0},
+					}).
+					Children(func() {
+						theme.PillBadge(c, statusMsg, statusCol)
+						ui.Spacer(c)
+						if theme.ActionButton(c, "关闭").Clicked() {
+							v.setStatus("")
+						}
+					})
 			}
 
 			// 1. Environment probe & path overrides
@@ -348,7 +357,18 @@ func (v *View) Render(c *ui.Context) {
 				toolRow(c, ffmpegLabel, v.probe.FFmpeg, &v.cfg.Paths.FFmpegExe)
 				toolRow(c, ffprobeLabel, v.probe.FFprobe, &v.cfg.Paths.FFprobeExe)
 				if toolBusy {
-					theme.ProgressBar(c, toolProg, toolStage)
+					ui.Box(c).FillWidth().
+						Transition(ui.ElementTransition{
+							Duration:     220 * time.Millisecond,
+							Ease:         ui.EaseOut,
+							ExitDuration: 140 * time.Millisecond,
+							Position:     true,
+							Enter:        &ui.Motion{Collapse: true, Opacity: 0},
+							Exit:         &ui.Motion{Collapse: true, Opacity: 0},
+						}).
+						Children(func() {
+							theme.ProgressBar(c, toolProg, toolStage)
+						})
 				} else if toolErr != "" {
 					theme.PillBadge(c, "工具安装失败: "+toolErr, theme.StatusRed)
 				}
@@ -471,9 +491,16 @@ func (v *View) Render(c *ui.Context) {
 								btn := ui.ButtonBase(c).
 									Width(22).Height(22).Radius(11).
 									Background(ui.Hex(sw.Hex)).
-									Border(1, theme.BorderSubtle)
+									Border(1, theme.BorderSubtle).
+									Cursor(ui.CursorPointer).
+									Transition(ui.ElementTransition{Colors: true, Duration: 140 * time.Millisecond, Ease: ui.EaseOut})
 								if strings.EqualFold(v.cfg.Theme.AccentColor, sw.Hex) {
 									btn = btn.Border(2, theme.TextPrimary)
+								}
+								if btn.Hovered() {
+									btn = btn.AnimatePose(ui.Pose{Scale: 1.18}, ui.Snappy)
+								} else {
+									btn = btn.AnimatePose(ui.Pose{}, ui.Snappy)
 								}
 								if btn.Clicked() {
 									v.cfg.Theme.AccentColor = sw.Hex
@@ -719,7 +746,9 @@ func toolRow(c *ui.Context, name string, st config.ToolStatus, pathPtr *string) 
 }
 
 func (v *View) renderTaskRow(c *ui.Context, t storage.RenderTask) {
-	theme.RowCenter(c).FillWidth().Background(theme.BgInput).Border(1, theme.BorderSubtle).Radius(10).Padding(8).Gap(10).Children(func() {
+	row := theme.RowCenter(c).FillWidth().Background(theme.BgInput).Border(1, theme.BorderSubtle).Radius(10).Padding(8).Gap(10).
+		Transition(ui.ElementTransition{Colors: true, Duration: 140 * time.Millisecond, Ease: ui.EaseOut})
+	row.Children(func() {
 		theme.ScoreText(c, fmt.Sprintf("#%d", t.ID)).FontSize(12).TextColor(theme.AccentAmber)
 		theme.Capsule(c, t.Status, theme.MediaStatusColor(t.Status))
 		ui.Text(c, t.TargetPlayerName).FontSize(12).Bold().TextColor(theme.TextPrimary)
@@ -748,6 +777,11 @@ func (v *View) renderTaskRow(c *ui.Context, t storage.RenderTask) {
 			}
 		}
 	})
+	if row.Hovered() {
+		row = row.Background(theme.BgElevated).AnimatePose(ui.Pose{X: 2}, ui.Snappy)
+	} else {
+		row = row.AnimatePose(ui.Pose{}, ui.Snappy)
+	}
 }
 
 func (v *View) notifyTasksChanged() {

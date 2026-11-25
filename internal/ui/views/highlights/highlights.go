@@ -7,6 +7,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/egoist/mygo/ui"
 	"strikeye/internal/composer"
@@ -340,11 +341,22 @@ func (v *View) Render(c *ui.Context) {
 			}
 		})
 
-		if v.activeTab == "library" {
-			v.renderLibrary(c)
-		} else {
-			v.renderWorkbench(c)
-		}
+		ui.Column(c.Key("highlights-tab-" + v.activeTab)).FillWidth().Grow(1).MinHeight(0).
+			Transition(ui.ElementTransition{
+				Duration:     180 * time.Millisecond,
+				Ease:         ui.EaseOut,
+				ExitDuration: 120 * time.Millisecond,
+				Position:     true,
+				Enter:        &ui.Motion{Y: 8, Opacity: 1},
+				Exit:         &ui.Motion{Y: -6, Opacity: 0},
+			}).
+			Children(func() {
+				if v.activeTab == "library" {
+					v.renderLibrary(c)
+				} else {
+					v.renderWorkbench(c)
+				}
+			})
 	})
 }
 
@@ -373,7 +385,18 @@ func (v *View) renderLibrary(c *ui.Context) {
 						return
 					}
 					for _, clip := range filtered {
-						v.renderClipCard(c, clip)
+						ui.Column(c.Key(clip.ID)).FillWidth().
+							Transition(ui.ElementTransition{
+								Duration:     200 * time.Millisecond,
+								Ease:         ui.EaseOut,
+								ExitDuration: 140 * time.Millisecond,
+								Position:     true,
+								Enter:        &ui.Motion{Y: 10, Opacity: 0},
+								Exit:         &ui.Motion{Y: -6, Opacity: 0},
+							}).
+							Children(func() {
+								v.renderClipCard(c, clip)
+							})
 					}
 				})
 			})
@@ -390,7 +413,7 @@ func (v *View) renderClipCard(c *ui.Context, clip storage.HighlightClip) {
 	if clip.ID == v.selectedClipID {
 		accent = theme.AccentAmber
 	}
-	theme.BentoCard(c, accent, 14, func() {
+	card := theme.BentoCard(c, accent, 14, func() {
 		theme.RowCenter(c).FillWidth().Gap(8).Children(func() {
 			theme.ScoreText(c, fmt.Sprintf("R%d", clip.RoundNumber)).FontSize(16).TextColor(theme.AccentAmber)
 			ui.Text(c, clip.PlayerName).FontSize(14).Bold().TextColor(theme.TextPrimary)
@@ -470,6 +493,7 @@ func (v *View) renderClipCard(c *ui.Context, clip storage.HighlightClip) {
 			}
 		})
 	})
+	theme.HoverLift(card, 3)
 }
 
 func (v *View) renderClipPreview(c *ui.Context) {

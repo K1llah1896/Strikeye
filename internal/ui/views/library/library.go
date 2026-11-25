@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/egoist/mygo/ui"
 	"strikeye/internal/config"
@@ -238,7 +239,16 @@ func (v *View) Render(c *ui.Context) {
 				ui.Spacer(c)
 			})
 			if v.showManualImport {
-				theme.RowCenter(c).FillWidth().Gap(8).Children(func() {
+				importRow := theme.RowCenter(c).FillWidth().Gap(8).
+					Transition(ui.ElementTransition{
+						Duration:     200 * time.Millisecond,
+						Ease:         ui.EaseOut,
+						ExitDuration: 140 * time.Millisecond,
+						Position:     true,
+						Enter:        &ui.Motion{Collapse: true, Opacity: 0},
+						Exit:         &ui.Motion{Collapse: true, Opacity: 0},
+					})
+				importRow.Children(func() {
 					ui.TextInput(c, &v.manualPath).FillWidth().Placeholder("输入本地 .dem 文件绝对路径以手动导入并解析")
 					if theme.IconAccentButton(c, theme.IconPlus, "导入并解析").Clicked() && strings.TrimSpace(v.manualPath) != "" {
 						if v.agent != nil {
@@ -271,7 +281,20 @@ func (v *View) Render(c *ui.Context) {
 					return
 				}
 				for _, e := range filtered {
-					v.renderMatchCard(c, e)
+					// Keyed wrappers let newly filtered cards fade in and moving
+					// cards glide to their new slots without rebuilding the view.
+					ui.Column(c.Key(e.Demo.ID)).FillWidth().
+						Transition(ui.ElementTransition{
+							Duration:     200 * time.Millisecond,
+							Ease:         ui.EaseOut,
+							ExitDuration: 140 * time.Millisecond,
+							Position:     true,
+							Enter:        &ui.Motion{Y: 10, Opacity: 0},
+							Exit:         &ui.Motion{Y: -6, Opacity: 0},
+						}).
+						Children(func() {
+							v.renderMatchCard(c, e)
+						})
 				}
 			})
 		})
@@ -297,7 +320,7 @@ func (v *View) renderMatchCard(c *ui.Context, e MatchEntry) {
 		teamB = "TEAM T"
 	}
 
-	theme.BentoCard(c, ui.Color{}, 16, func() {
+	card := theme.BentoCard(c, ui.Color{}, 16, func() {
 		// Header metadata row (map badge removed; map identity lives in the scoreline hero banner)
 		theme.RowCenter(c).FillWidth().Gap(8).Children(func() {
 			ui.Text(c, title).FontSize(14).Bold().TextColor(theme.TextPrimary)
@@ -388,6 +411,7 @@ func (v *View) renderMatchCard(c *ui.Context, e MatchEntry) {
 			}
 		})
 	})
+	theme.HoverLift(card, 3)
 }
 
 func (v *View) scanAndRefresh(ctx context.Context) {

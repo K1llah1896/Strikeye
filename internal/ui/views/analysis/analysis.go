@@ -1045,20 +1045,31 @@ func (v *View) Render(c *ui.Context) {
 					})
 					return
 				}
-				switch activeTab {
-				case TabOverview:
-					v.renderOverview(c)
-				case TabEconomy:
-					v.renderEconomy(c)
-				case TabPerformance:
-					v.renderPerformance(c)
-				case TabRadar:
-					v.renderRadarWorkbench(c)
-				case TabReplay2D:
-					v.renderReplay2D(c)
-				case TabHeatmaps:
-					v.renderHeatmaps(c)
-				}
+				ui.Column(c.Key("analysis-tab-" + string(activeTab))).FillWidth().Gap(12).
+					Transition(ui.ElementTransition{
+						Duration:     180 * time.Millisecond,
+						Ease:         ui.EaseOut,
+						ExitDuration: 120 * time.Millisecond,
+						Position:     true,
+						Enter:        &ui.Motion{Y: 8, Opacity: 1},
+						Exit:         &ui.Motion{Y: -6, Opacity: 0},
+					}).
+					Children(func() {
+						switch activeTab {
+						case TabOverview:
+							v.renderOverview(c)
+						case TabEconomy:
+							v.renderEconomy(c)
+						case TabPerformance:
+							v.renderPerformance(c)
+						case TabRadar:
+							v.renderRadarWorkbench(c)
+						case TabReplay2D:
+							v.renderReplay2D(c)
+						case TabHeatmaps:
+							v.renderHeatmaps(c)
+						}
+					})
 			})
 		})
 	})
@@ -1207,7 +1218,9 @@ func (v *View) renderScoreboardGroup(c *ui.Context, title string, accent ui.Colo
 			swingCol = theme.StatusRed
 		}
 
-		rowBtn := ui.ButtonBase(c).FillWidth().Background(bg).Radius(10).PaddingX(6).PaddingY(6).Children(func() {
+		rowBtn := ui.ButtonBase(c).FillWidth().Background(bg).Radius(10).PaddingX(6).PaddingY(6).
+			Transition(ui.ElementTransition{Colors: true, Duration: 140 * time.Millisecond, Ease: ui.EaseOut})
+		rowBtn.Children(func() {
 			theme.RowCenter(c).FillWidth().Gap(4).Children(func() {
 				theme.RowCenter(c).Width(150).Gap(6).Children(func() {
 					theme.StatusDot(c, accent, 6)
@@ -1233,6 +1246,11 @@ func (v *View) renderScoreboardGroup(c *ui.Context, title string, accent ui.Colo
 				})
 			})
 		})
+		if rowBtn.Hovered() {
+			rowBtn = rowBtn.Background(ui.RGBA(255, 255, 255, 0.06)).AnimatePose(ui.Pose{X: 2}, ui.Snappy)
+		} else {
+			rowBtn = rowBtn.AnimatePose(ui.Pose{}, ui.Snappy)
+		}
 		if rowBtn.Clicked() {
 			if isExpanded {
 				v.expandedPlayerSID = ""
@@ -1258,7 +1276,16 @@ func (v *View) renderPlayerDetailDrawer(c *ui.Context, p storage.MatchPlayer) {
 		clutchText = strings.Join(parts, "  |  ")
 	}
 
-	ui.Column(c).FillWidth().Background(theme.BgBase).Border(1, theme.BorderSubtle).Radius(6).Padding(10).Gap(8).Children(func() {
+	drawer := ui.Column(c).FillWidth().Background(theme.BgBase).Border(1, theme.BorderSubtle).Radius(6).Padding(10).Gap(8).
+		Transition(ui.ElementTransition{
+			Duration:     220 * time.Millisecond,
+			Ease:         ui.EaseOut,
+			ExitDuration: 140 * time.Millisecond,
+			Position:     true,
+			Enter:        &ui.Motion{Collapse: true, Opacity: 0},
+			Exit:         &ui.Motion{Collapse: true, Opacity: 0},
+		})
+	drawer.Children(func() {
 		theme.RowCenter(c).FillWidth().Gap(16).Children(func() {
 			theme.StatText(c, fmt.Sprintf("多杀分布: 2K=%d  3K=%d  4K=%d  5K=%d", p.TwoKillRounds, p.ThreeKillRounds, p.FourKillRounds, p.FiveKillRounds)).FontSize(12).TextColor(theme.TextPrimary)
 			theme.StatText(c, fmt.Sprintf("残局明细: %s", clutchText)).FontSize(12).TextColor(theme.AccentCyan)
@@ -1579,7 +1606,16 @@ func (v *View) renderRoundDetailDrawer(c *ui.Context, r storage.MatchRound) {
 		})
 	}
 
-	ui.Column(c).FillWidth().Background(theme.BgBase).Border(1, theme.BorderSubtle).Radius(6).Padding(10).Gap(8).Children(func() {
+	drawer := ui.Column(c).FillWidth().Background(theme.BgBase).Border(1, theme.BorderSubtle).Radius(6).Padding(10).Gap(8).
+		Transition(ui.ElementTransition{
+			Duration:     220 * time.Millisecond,
+			Ease:         ui.EaseOut,
+			ExitDuration: 140 * time.Millisecond,
+			Position:     true,
+			Enter:        &ui.Motion{Collapse: true, Opacity: 0},
+			Exit:         &ui.Motion{Collapse: true, Opacity: 0},
+		})
+	drawer.Children(func() {
 		theme.RowCenter(c).FillWidth().Gap(10).Children(func() {
 			theme.SectionTitle(c, fmt.Sprintf("R%02d 回合详情", r.RoundNumber))
 			if r.BombSite != nil && *r.BombSite != "" {

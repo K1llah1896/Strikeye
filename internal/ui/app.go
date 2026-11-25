@@ -526,9 +526,17 @@ func (a *App) Render(c *mygoui.Context) {
 				mygoui.Text(c, "SEE THE ROUND. OWN THE MOMENT.").Font("Rajdhani").FontSize(12).LetterSpacing(1.4).TextColor(theme.TextMuted)
 				mygoui.Spacer(c)
 				if parseActive {
-					mygoui.Box(c).Width(210).Children(func() {
-						theme.ProgressBar(c, parseProg, parseStage)
-					})
+					mygoui.Box(c).Width(210).
+						Transition(mygoui.ElementTransition{
+							Duration:     220 * time.Millisecond,
+							Ease:         mygoui.EaseOut,
+							ExitDuration: 140 * time.Millisecond,
+							Enter:        &mygoui.Motion{Y: -8, Opacity: 0},
+							Exit:         &mygoui.Motion{Y: -8, Opacity: 0},
+						}).
+						Children(func() {
+							theme.ProgressBar(c, parseProg, parseStage)
+						})
 				}
 				if queued > 0 {
 					if theme.IconAccentButton(c, theme.IconBolt, "立即启动渲染").Clicked() {
@@ -611,7 +619,11 @@ func (a *App) Render(c *mygoui.Context) {
 						})
 					if queueBtn.Hovered() {
 						queueBtn = queueBtn.Background(theme.BgElevated).Border(1, theme.AccentAmber)
+						queueBtn = queueBtn.AnimatePose(mygoui.Pose{Y: -1}, mygoui.Snappy)
+					} else {
+						queueBtn = queueBtn.AnimatePose(mygoui.Pose{}, mygoui.Snappy)
 					}
+					queueBtn = queueBtn.Transition(mygoui.ElementTransition{Colors: true, Duration: 160 * time.Millisecond, Ease: mygoui.EaseOut})
 					if queueBtn.Clicked() {
 						a.NavigateTo(ViewSettings, 0)
 					}
@@ -629,18 +641,32 @@ func (a *App) Render(c *mygoui.Context) {
 						})
 						return
 					}
-					switch active {
-					case ViewLibrary:
-						a.libraryView.Render(c)
-					case ViewSpectator:
-						a.spectatorView.Render(c)
-					case ViewAnalysis:
-						a.analysisView.Render(c)
-					case ViewHighlights:
-						a.highlightsView.Render(c)
-					case ViewSettings:
-						a.settingsView.Render(c)
-					}
+					// Each workspace enters with a short fade and slide; the copy of
+					// the view leaving fades out without taking layout or input.
+					mygoui.Column(c.Key("workspace-" + string(active))).
+						FillWidth().FillHeight().
+						Transition(mygoui.ElementTransition{
+							Duration:     190 * time.Millisecond,
+							Ease:         mygoui.EaseOut,
+							ExitDuration: 120 * time.Millisecond,
+							Position:     true,
+							Enter:        &mygoui.Motion{Y: 10, Opacity: 1},
+							Exit:         &mygoui.Motion{Y: -6, Opacity: 0},
+						}).
+						Children(func() {
+							switch active {
+							case ViewLibrary:
+								a.libraryView.Render(c)
+							case ViewSpectator:
+								a.spectatorView.Render(c)
+							case ViewAnalysis:
+								a.analysisView.Render(c)
+							case ViewHighlights:
+								a.highlightsView.Render(c)
+							case ViewSettings:
+								a.settingsView.Render(c)
+							}
+						})
 				})
 			})
 		})

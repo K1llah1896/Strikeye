@@ -8,6 +8,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/egoist/mygo/ui"
 	"strikeye/internal/parser"
@@ -437,7 +438,13 @@ func (v *View) Render(c *ui.Context) {
 									if active {
 										el.Bold()
 									}
-								})
+								}).
+								Transition(ui.ElementTransition{Colors: true, Duration: 150 * time.Millisecond, Ease: ui.EaseOut})
+							if pill.Hovered() {
+								pill = pill.AnimatePose(ui.Pose{Y: -1}, ui.Snappy)
+							} else {
+								pill = pill.AnimatePose(ui.Pose{}, ui.Snappy)
+							}
 							if pill.Clicked() {
 								v.mu.Lock()
 								v.selectedRound = r.RoundNumber
@@ -563,6 +570,7 @@ func (v *View) renderPOVItem(c *ui.Context, st POVMediaState) {
 		PaddingY(8).
 		Gap(8).
 		AlignItems(ui.Center).
+		Transition(ui.ElementTransition{Colors: true, Duration: 150 * time.Millisecond, Ease: ui.EaseOut}).
 		Children(func() {
 			theme.StatusDot(c, statusCol, 8)
 			ui.Text(c, st.Label).FontSize(12).Bold().TextColor(theme.TextPrimary)
@@ -572,6 +580,11 @@ func (v *View) renderPOVItem(c *ui.Context, st POVMediaState) {
 			}
 			ui.Text(c, stateText).FontSize(10).Bold().TextColor(statusCol)
 		})
+	if btn.Hovered() {
+		btn = btn.AnimatePose(ui.Pose{X: 3}, ui.Snappy)
+	} else {
+		btn = btn.AnimatePose(ui.Pose{}, ui.Snappy)
+	}
 	if btn.Clicked() {
 		relSec := 0.0
 		if v.loadedVideoPath != "" {

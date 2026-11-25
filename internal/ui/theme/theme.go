@@ -616,14 +616,18 @@ func SegmentedControl(c *ui.Context, items []SegmentItem, activeKey string, onSe
 						ui.Text(c, item.Label).FontSize(12).Bold().TextColor(fg)
 					}).
 					Cursor(ui.CursorPointer).
-					Transition(ui.ElementTransition{Duration: 130 * time.Millisecond, Ease: ui.EaseOut})
+					Transition(ui.ElementTransition{Colors: true, Animation: &ui.Snappy})
+				pose := ui.Pose{}
 				if btn.Pressed() {
+					pose = ui.Pose{Scale: 0.97}
 					btn = btn.Background(BgSurface).Border(1, withAlpha(AccentAmber, 0.45))
 				} else if btn.Hovered() {
+					pose = ui.Pose{Y: -1, Scale: 1.02}
 					btn = btn.Background(BgElevated).Border(1, withAlpha(AccentAmber, 0.30))
 				} else {
 					btn = btn.Background(bg).Border(1, borderCol)
 				}
+				btn = btn.AnimatePose(pose, ui.Snappy)
 				if btn.Clicked() && onSelect != nil {
 					onSelect(item.Key)
 				}
@@ -684,27 +688,40 @@ func EmptyStateCard(c *ui.Context, icon *ui.SVG, title, subtitle string) ui.Elem
 }
 
 func withButtonMotion(el ui.Element, baseBg, hoverBg, pressBg ui.Color, hasBorder bool, baseBorder, hoverBorder ui.Color) ui.Element {
+	// Colors cross-fade in paint; the press/hover scale runs as a pose, which
+	// also animates without rebuilding the view, so busy screens stay at 60fps.
 	el = el.Cursor(ui.CursorPointer).
-		Transition(ui.ElementTransition{Duration: 130 * time.Millisecond, Ease: ui.EaseOut})
-	if el.Pressed() {
-		el = el.Background(pressBg).Scale(0.96, 0.96)
+		Transition(ui.ElementTransition{Colors: true, Animation: &ui.Snappy})
+	pose := ui.Pose{}
+	switch {
+	case el.Pressed():
+		pose = ui.Pose{Scale: 0.96}
+		el = el.Background(pressBg)
 		if hasBorder {
 			el = el.Border(1, hoverBorder)
 		}
-		return el
+	case el.Hovered():
+		pose = ui.Pose{Y: -1, Scale: 1.02}
+		el = el.Background(hoverBg)
+		if hasBorder {
+			el = el.Border(1, hoverBorder)
+		}
+	default:
+		el = el.Background(baseBg)
+		if hasBorder {
+			el = el.Border(1, baseBorder)
+		}
 	}
+	return el.AnimatePose(pose, ui.Snappy)
+}
+
+// HoverLift raises an interactive surface a few DIPs while the pointer is over
+// it. The lift is a pose, so it is painted without rebuilding the view.
+func HoverLift(el ui.Element, lift float32) ui.Element {
 	if el.Hovered() {
-		el = el.Background(hoverBg).Scale(1.02, 1.02)
-		if hasBorder {
-			el = el.Border(1, hoverBorder)
-		}
-		return el
+		return el.AnimatePose(ui.Pose{Y: -lift, Scale: 1.004}, ui.Snappy)
 	}
-	el = el.Background(baseBg).Scale(1.0, 1.0)
-	if hasBorder {
-		el = el.Border(1, baseBorder)
-	}
-	return el
+	return el.AnimatePose(ui.Pose{}, ui.Snappy)
 }
 
 // ActionButton renders a themed secondary glass action button with hover/press motion.
@@ -819,21 +836,28 @@ func ProgressBar(c *ui.Context, progress float64, label string) ui.Element {
 				}
 			})
 		}
-		ui.Row(c).FillWidth().Height(9).Background(BgInput).Border(1, BorderSubtle).Radius(5).Clip().Children(func() {
-			if indeterminate {
-				c.Invalidate()
-				phase := float32((time.Now().UnixMilli()%1200))/1200.0 * 0.72
-				ui.Box(c).Grow(phase)
-				ui.Box(c).FillHeight().Grow(0.28).Background(AccentAmber).Radius(4)
-				ui.Box(c).Grow(0.72 - phase)
-			} else if progress > 0 {
-				p := float32(progress)
-				ui.Box(c).FillHeight().Grow(p).Background(AccentAmber).Radius(4)
-				if p < 1 {
-					ui.Box(c).Grow(1 - p)
-				}
-			}
-		})
+		track := ui.Row(c).FillWidth().Height(9).Background(BgInput).Border(1, BorderSubtle).Radius(5).Clip()
+		if indeterminate {
+			// Painted per frame without rebuilding the view: the sweep keeps
+			// running at 60fps even while the rest of the app is busy.
+			track.Draw(func(p *ui.Painter, r ui.Rect) {
+				p.AnimationFrameRate(60)
+				const cycle = 1200 * time.Millisecond
+				t := float64(p.Now().UnixMilli()%cycle.Milliseconds()) / float64(cycle.Milliseconds())
+				eased := t * t * (3 - 2*t) // smoothstep
+				w := (r.W - 2) * 0.30
+				x := r.X + 1 + (r.W-2-w)*float32(eased)
+				p.Fill(ui.Rect{X: x, Y: r.Y + 1, W: w, H: r.H - 2}, AccentAmber, 4)
+			})
+		} else if progress > 0 {
+			track.Children(func() {
+				ui.Box(c).FillHeight().
+					WidthPercent(float32(progress) * 100).
+					Background(AccentAmber).
+					Radius(4).
+					Transition(ui.ElementTransition{Width: true, Duration: 320 * time.Millisecond, Ease: ui.EaseOut})
+			})
+		}
 	})
 }
 
@@ -864,8 +888,10 @@ func TabButton(c *ui.Context, label string, active bool) ui.Element {
 		PaddingY(6).
 		Children(func() {
 			ui.Column(c).AlignItems(ui.Center).Gap(4).Children(func() {
-				ui.Text(c, label).FontSize(12).Bold().TextColor(fg)
-				ui.Box(c).FillWidth().Height(2).Radius(1).Background(bar)
+				ui.Text(c, label).FontSize(12).Bold().TextColor(fg).
+					Transition(ui.ElementTransition{Colors: true, Duration: 180 * time.Millisecond, Ease: ui.EaseOut})
+				ui.Box(c).FillWidth().Height(2).Radius(1).Background(bar).
+					Transition(ui.ElementTransition{Colors: true, Animation: &ui.Snappy})
 			})
 		})
 	return withButtonMotion(el, bg, BgElevated, BgSurface, false, ui.Transparent, ui.Transparent)
@@ -901,19 +927,24 @@ func NavButtonWithIcon(c *ui.Context, icon *ui.SVG, title, subtitle string, acti
 		AlignItems(ui.Center).
 		Children(func() {
 			if icon != nil {
-				ui.Box(c).Width(32).Height(32).Radius(10).Background(iconBg).Center().Children(func() {
-					RenderIcon(c, icon, 16, iconCol)
-				})
+				ui.Box(c).Width(32).Height(32).Radius(10).Background(iconBg).Center().
+					Transition(ui.ElementTransition{Colors: true, Duration: 180 * time.Millisecond, Ease: ui.EaseOut}).
+					Children(func() {
+						RenderIcon(c, icon, 16, iconCol)
+					})
 			} else {
 				bar := ui.Transparent
 				if active {
 					bar = AccentAmber
 				}
-				ui.Box(c).Width(3).Height(26).Radius(2).Background(bar)
+				ui.Box(c).Width(3).Height(26).Radius(2).Background(bar).
+					Transition(ui.ElementTransition{Colors: true, Duration: 180 * time.Millisecond, Ease: ui.EaseOut})
 			}
 			ui.Column(c).FillWidth().Gap(1).Children(func() {
-				ui.Text(c, title).FontSize(13).Bold().TextColor(titleCol)
-				ui.Text(c, subtitle).Font("Rajdhani").FontSize(10).LetterSpacing(0.9).TextColor(subCol)
+				ui.Text(c, title).FontSize(13).Bold().TextColor(titleCol).
+					Transition(ui.ElementTransition{Colors: true, Duration: 180 * time.Millisecond, Ease: ui.EaseOut})
+				ui.Text(c, subtitle).Font("Rajdhani").FontSize(10).LetterSpacing(0.9).TextColor(subCol).
+					Transition(ui.ElementTransition{Colors: true, Duration: 180 * time.Millisecond, Ease: ui.EaseOut})
 			})
 		})
 	return withButtonMotion(el, bg, BgElevated, BgSurface, true, border, withAlpha(AccentAmber, 0.30))

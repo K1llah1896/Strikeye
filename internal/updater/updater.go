@@ -340,6 +340,15 @@ func applyZipPackage(zipPath, targetDir string) error {
 		"strikeye-agent":     true,
 		"strikeye-cli":       true,
 	}
+	// Data sidecars shipped next to the executables: the bundled collision
+	// geometry archive and the FFmpeg/HLAE archives. They are not binaries, so
+	// they are staged with 0644 and an older release without them simply leaves
+	// the existing copies in place.
+	dataFiles := map[string]bool{
+		"map_geometry.zip":         true,
+		"ffmpeg-windows-amd64.zip": true,
+		"hlae-windows-amd64.zip":   true,
+	}
 
 	replaced := 0
 	for _, f := range zr.File {
@@ -347,7 +356,7 @@ func applyZipPackage(zipPath, targetDir string) error {
 			continue
 		}
 		base := filepath.Base(f.Name)
-		if !allowed[base] {
+		if !allowed[base] && !dataFiles[base] {
 			continue
 		}
 		rc, err := f.Open()
@@ -367,7 +376,12 @@ func applyZipPackage(zipPath, targetDir string) error {
 			_ = os.Remove(stagePath)
 			return copyErr
 		}
-		err = replaceBinaryFromFile(stagePath, filepath.Join(targetDir, base))
+		dst := filepath.Join(targetDir, base)
+		if dataFiles[base] {
+			err = copyFile(stagePath, dst, 0o644)
+		} else {
+			err = replaceBinaryFromFile(stagePath, dst)
+		}
 		_ = os.Remove(stagePath)
 		if err != nil {
 			return err

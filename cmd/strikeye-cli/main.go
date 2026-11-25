@@ -15,10 +15,12 @@ import (
 	"strikeye/internal/config"
 	"strikeye/internal/export"
 	"strikeye/internal/ipc"
+	"strikeye/internal/mapassets"
 	"strikeye/internal/mapgeom"
 	"strikeye/internal/parser"
 	"strikeye/internal/recorder"
 	"strikeye/internal/storage"
+	"strikeye/internal/toolbundle"
 	"strikeye/internal/version"
 )
 
@@ -171,6 +173,34 @@ func main() {
 			dataRoot := resolveDataRootOrExit(*dataRootFlag)
 			if err := runMapsFetch(dataRoot, *baseURLFlag, append(maps, fs.Args()...), *allFlag, os.Stdout); err != nil {
 				fmt.Fprintf(os.Stderr, "maps fetch failed: %v\n", err)
+				os.Exit(1)
+			}
+			return
+
+		case "assets-pack":
+			fs := flag.NewFlagSet("assets-pack", flag.ExitOnError)
+			assetDirFlag := fs.String("asset-dir", "", "Directory for the embedded nav/callout blobs (default internal/mapassets/assets)")
+			geometryOutFlag := fs.String("geometry-out", "", "Directory for the map_geometry.zip sidecar (default assets)")
+			toolsOutFlag := fs.String("tools-out", "", "Directory for the bundled FFmpeg/HLAE archives (default assets)")
+			skipNavFlag := fs.Bool("skip-nav", false, "Skip the embedded nav mesh and callout blobs")
+			skipGeomFlag := fs.Bool("skip-geom", false, "Skip the collision geometry bundle")
+			skipToolsFlag := fs.Bool("skip-tools", false, "Skip the bundled FFmpeg/HLAE archives")
+			baseURLFlag := fs.String("geometry-base-url", "", "Override geometry dataset base URL")
+			toolsAPIFlag := fs.String("tools-api-url", "", "Override the tool release API used for the bundled archives")
+			_ = fs.Parse(flag.Args()[1:])
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
+			defer cancel()
+			if err := runAssetsPack(ctx, assetsPackOptions{
+				AssetDir:    *assetDirFlag,
+				GeometryOut: *geometryOutFlag,
+				ToolsOut:    *toolsOutFlag,
+				SkipNav:     *skipNavFlag,
+				SkipGeom:    *skipGeomFlag,
+				SkipTools:   *skipToolsFlag,
+				BaseURL:     *baseURLFlag,
+				ToolsAPI:    *toolsAPIFlag,
+			}, os.Stdout); err != nil {
+				fmt.Fprintf(os.Stderr, "assets-pack failed: %v\n", err)
 				os.Exit(1)
 			}
 			return
@@ -729,12 +759,13 @@ func main() {
 		}
 	}
 
-	fmt.Fprintln(os.Stderr, "usage: strikeye-cli [--version | --env-check | doctor | parse --file <dem> | inspect (--demo-id <id> | --rpl <path>) | export (--demo-id <id> | --steamid <id64>) [--format csv|json|xlsx|html|both|all] | profile --steamid <id64> | series | team --name <team> | sharecode --code <code> | play --demo-id <id> | maps | maps-fetch --map <map>|--all | navs | navs-fetch --map <map>|--all | callouts-fetch | area --map <map> --x <x> --y <y> --z <z> | navpath --map <map> --from <place> --to <place> | sql --query <sql> [--format csv|json] [--limit <n>] | killctx [--demo-id <id>] [--store] | zones [--demo-id <id>] | mapcontrol [--demo-id <id>] [--step <sec>] [--effects=false] | nades [--demo-id <id>] [--min-throws <n>] | voice [--demo-id <id>] | bans [--demo-id <id> | --steamid <id64,...>] [--refresh] | download --cookies <file|header> [--tab <tab>] [--limit <n>] | voice-decode --demo-id <id> [--tool <path> | --xuid <id64>] | voice-activity --demo-id <id> [--round <n>] | notes [--demo-id <id>] [--round <n> --callout <id> --note <text>] | buys [--demo-id <id>] [--round <n>] | tendencies --team <name> [--top <n>] [--format json|csv] [--out <path>] | h2h --team-a <a> --team-b <b> [--format json|csv] | avatars (--steamid <id64,...> | --demo-id <id>) [--refresh] | search --query <text> [--limit <n>] [--reindex] | viewprefs [--set --map <map> --x --y --opacity] ... | mixaudio --video <clip> --track <path[@offset[:vol]]> [--audio-only] | strokes --demo-id <id> [--round <n>] [--clear] | trends --steamid <id64> [--format json|csv] | corpus [--update] [--geometry-dir <dir>] | gsi [--listen addr]")
+	fmt.Fprintln(os.Stderr, "usage: strikeye-cli [--version | --env-check | doctor | parse --file <dem> | inspect (--demo-id <id> | --rpl <path>) | export (--demo-id <id> | --steamid <id64>) [--format csv|json|xlsx|html|both|all] | profile --steamid <id64> | series | team --name <team> | sharecode --code <code> | play --demo-id <id> | maps | maps-fetch --map <map>|--all | navs | navs-fetch --map <map>|--all | assets-pack [--asset-dir <dir>] [--geometry-out <dir>] [--tools-out <dir>] [--skip-nav] [--skip-geom] [--skip-tools] | callouts-fetch | area --map <map> --x <x> --y <y> --z <z> | navpath --map <map> --from <place> --to <place> | sql --query <sql> [--format csv|json] [--limit <n>] | killctx [--demo-id <id>] [--store] | zones [--demo-id <id>] | mapcontrol [--demo-id <id>] [--step <sec>] [--effects=false] | nades [--demo-id <id>] [--min-throws <n>] | voice [--demo-id <id>] | bans [--demo-id <id> | --steamid <id64,...>] [--refresh] | download --cookies <file|header> [--tab <tab>] [--limit <n>] | voice-decode --demo-id <id> [--tool <path> | --xuid <id64>] | voice-activity --demo-id <id> [--round <n>] | notes [--demo-id <id>] [--round <n> --callout <id> --note <text>] | buys [--demo-id <id>] [--round <n>] | tendencies --team <name> [--top <n>] [--format json|csv] [--out <path>] | h2h --team-a <a> --team-b <b> [--format json|csv] | avatars (--steamid <id64,...> | --demo-id <id>) [--refresh] | search --query <text> [--limit <n>] [--reindex] | viewprefs [--set --map <map> --x --y --opacity] ... | mixaudio --video <clip> --track <path[@offset[:vol]]> [--audio-only] | strokes --demo-id <id> [--round <n>] [--clear] | trends --steamid <id64> [--format json|csv] | corpus [--update] [--geometry-dir <dir>] | gsi [--listen addr]")
 	os.Exit(2)
 }
 
 func resolveDataRootOrExit(override string) string {
 	if override != "" {
+		installBundledMapAssets(override)
 		return override
 	}
 	dataRoot, err := config.DefaultDataRoot()
@@ -742,7 +773,44 @@ func resolveDataRootOrExit(override string) string {
 		fmt.Fprintf(os.Stderr, "resolve data-root failed: %v\n", err)
 		os.Exit(1)
 	}
+	installBundledMapAssets(dataRoot)
 	return dataRoot
+}
+
+// installBundledMapAssets unpacks the map datasets shipped inside the binary so
+// navmesh, callout and collision-geometry features work on a fresh checkout
+// without any download step. Failures are reported but never fatal: a missing
+// bundle only degrades the geometry-dependent metrics.
+func boolToInt(v bool) int {
+	if v {
+		return 1
+	}
+	return 0
+}
+
+func installBundledMapAssets(dataRoot string) {
+	rep, err := mapassets.Install(dataRoot, mapassets.ExeDir())
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "warning: install bundled map assets: %v\n", err)
+		return
+	}
+	if rep.NavsWritten > 0 || rep.CalloutsWritten {
+		fmt.Fprintf(os.Stderr, "installed bundled map assets: %d nav meshes, callouts=%d\n", rep.NavsWritten, boolToInt(rep.CalloutsWritten))
+	}
+	provisionBundledTools(dataRoot)
+}
+
+// provisionBundledTools stages the FFmpeg/HLAE archives that ship beside the
+// executables, so rendering and montage export work without visiting settings.
+func provisionBundledTools(dataRoot string) {
+	rep, err := toolbundle.Provision(dataRoot, mapassets.ExeDir())
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "warning: provision bundled tools: %v\n", err)
+		return
+	}
+	if len(rep.Installed) > 0 {
+		fmt.Fprintf(os.Stderr, "installed bundled tools: %s\n", strings.Join(rep.Installed, ", "))
+	}
 }
 
 type parseCLISummary struct {
@@ -891,7 +959,7 @@ func runDoctor(ctx context.Context, dataRoot string, out io.Writer) error {
 	if err != nil {
 		return fmt.Errorf("config load: %w", err)
 	}
-	probe := config.ProbeToolchain(config.ProbeOptions{Configured: cfg.Paths})
+	probe := config.ProbeToolchain(config.ProbeOptions{Configured: cfg.Paths, DataRoot: dataRoot})
 
 	db, err := storage.OpenDefault(dataRoot)
 	if err != nil {
@@ -982,7 +1050,7 @@ func runRenderDryRun(ctx context.Context, dataRoot string, demoID int64, dryRun 
 	if err != nil {
 		return fmt.Errorf("config load: %w", err)
 	}
-	probe := config.ProbeToolchain(config.ProbeOptions{Configured: cfg.Paths})
+	probe := config.ProbeToolchain(config.ProbeOptions{Configured: cfg.Paths, DataRoot: dataRoot})
 	cs2Root := ""
 	if probe.CS2.Path != "" {
 		cs2Root = filepath.Dir(filepath.Dir(filepath.Dir(probe.CS2.Path)))

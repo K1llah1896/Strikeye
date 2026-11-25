@@ -116,6 +116,61 @@ func TestCheckUpdateAndDownloadZipHotSwap(t *testing.T) {
 	}
 }
 
+// TestApplyZipPackageInstallsGeometrySidecar proves an in-app update also
+// refreshes the bundled collision geometry archive that ships beside the
+// executables (it is data, not a binary, so it must not be marked executable).
+func TestApplyZipPackageInstallsGeometrySidecar(t *testing.T) {
+	var zipBuf bytes.Buffer
+	zw := zip.NewWriter(&zipBuf)
+	targetBin := "strikeye"
+	if runtime.GOOS == "windows" {
+		targetBin = "strikeye.exe"
+	}
+	fw, err := zw.Create("dist/" + targetBin)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fw.Write([]byte("new-binary")); err != nil {
+		t.Fatal(err)
+	}
+	gw, err := zw.Create("dist/map_geometry.zip")
+	if err != nil {
+		t.Fatal(err)
+	}
+	geometry := []byte("PK\x03\x04-fake-geometry-archive")
+	if _, err := gw.Write(geometry); err != nil {
+		t.Fatal(err)
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	zipPath := filepath.Join(t.TempDir(), "pkg.zip")
+	if err := os.WriteFile(zipPath, zipBuf.Bytes(), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	if err := applyZipPackage(zipPath, dir); err != nil {
+		t.Fatalf("applyZipPackage: %v", err)
+	}
+	got, err := os.ReadFile(filepath.Join(dir, "map_geometry.zip"))
+	if err != nil {
+		t.Fatalf("read geometry sidecar: %v", err)
+	}
+	if !bytes.Equal(got, geometry) {
+		t.Fatalf("geometry sidecar not installed: %q", got)
+	}
+	if runtime.GOOS != "windows" {
+		info, err := os.Stat(filepath.Join(dir, "map_geometry.zip"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if info.Mode().Perm()&0o111 != 0 {
+			t.Fatalf("data sidecar should not be executable: %v", info.Mode())
+		}
+	}
+}
+
 func TestCheckUpdateGitHubReleasesAPI(t *testing.T) {
 	var srv *httptest.Server
 	srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

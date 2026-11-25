@@ -59,6 +59,16 @@ Strikeye 围绕比赛的完整生命周期，构建统一的 Demo 管理、观�
 
 自动发现比赛中的高光时刻，支持筛选、收藏、回放与剪辑，将一场比赛中最值得记住的瞬间整理成属于自己的精彩集锦。
 
+### 能力清单（截至 2026-11）
+
+资料库：18 类来源识别、压缩包自动解压、`.info` 旁挂元数据、GCPD 官方 demo 下载、share code 导入、全文检索（含中文子串）、系列赛分组、选手档案与标签、封禁快照、头像、GSI 直播条、SQL 控制台、地图数据（碰撞几何 / 导航网格 / callout）一键下载。
+
+分析：Rating / ADR / KAST / K-D / 首杀 / 交易 / 残局、TTK 与 TTD（含开镜视锥与追踪遮挡）、逐 kill 击杀上下文（距离/视线/穿烟/背光/开镜夹角，可落库与导出）、经济与购买时序、区域控制与击杀区位、默认站位热力图、navmesh 地图控制曲线（含烟雾/火焰遮蔽）、道具 line-up 库与收益归因。
+
+回放与产出：32Hz 2D 回放（弹道/死亡标记/C4 爆炸范围/击杀信息条/上下层雷达/自由笔刷与区域标记/语音时间轴）、多格式导出（CSV/JSON/XLSX/HTML）、多轨音频混音、HLAE 录制与集锦合成。
+
+完整的差分调研与依据见 [`docs/research/2026-11-25-cs2-oss-gap-analysis.md`](docs/research/2026-11-25-cs2-oss-gap-analysis.md)，指标口径见 [`docs/metrics.md`](docs/metrics.md)。
+
 ---
 
 ## Our Philosophy
@@ -109,6 +119,26 @@ git push origin v0.1.0
 工作流会执行 `go vet` / `go test`，交叉编译三个可执行文件，打包 `strikeye-windows-amd64.zip`（内含 `strikeye.exe` / `strikeye-agent.exe` / `strikeye-cli.exe`）与 `SHA256SUMS.txt`，并创建对应的 GitHub Release。tag 中的版本号会通过 `-X strikeye/internal/version.AppVersion` 注入，用于应用内更新比较。
 
 带 `-` 的 tag（如 `v0.2.0-rc1`）会发布为 prerelease，不会顶掉 `/releases/latest`；应用内更新（`internal/updater`）读取的正是该地址，因此正式更新请使用 `vX.Y.Z` 形式的 tag。
+
+## 开发校验
+
+每次 push / PR 都会跑 `.github/workflows/ci.yml`：格式（`gofmt -l`）、`go vet`、`go test ./...`、三平台交叉编译（linux/amd64、darwin/arm64、windows/amd64）与 `openspec validate --all --strict`（CLI 钉在 1.15.0）。本地等价命令：
+
+```bash
+gofmt -l ./cmd ./internal        # 必须为空
+go vet ./... && go test ./... -count=1
+GOOS=darwin GOARCH=arm64 go build ./...
+openspec validate --all --strict
+```
+
+指标回归用黄金快照，需先下载地图几何（TTD 依赖 `.tri` 几何），这条任务在 CI 里是手动触发（`workflow_dispatch`），避免 PR 依赖外网：
+
+```bash
+go build -o bin/strikeye-cli ./cmd/strikeye-cli
+./bin/strikeye-cli maps-fetch --data-root .ci-data --map de_ancient --map de_dust2
+./bin/strikeye-cli corpus --geometry-dir .ci-data/cache/map_geometry
+./bin/strikeye-cli corpus --update --geometry-dir dist/cache/map_geometry   # 口径变了才重生成
+```
 
 ---
 

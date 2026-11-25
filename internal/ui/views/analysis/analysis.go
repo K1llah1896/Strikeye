@@ -15,6 +15,7 @@ import (
 
 	"github.com/egoist/mygo/ui"
 	"strikeye/assets/maps"
+	"strikeye/internal/avatars"
 	"strikeye/internal/callouts"
 	"strikeye/internal/config"
 	"strikeye/internal/killctx"
@@ -53,6 +54,8 @@ type View struct {
 	demo               *storage.Demo
 	players            []storage.MatchPlayer
 	avatars            map[string]*ui.Bitmap
+	avatarAutoFetch    bool
+	avatarClient       *avatars.Client
 	trends             map[string][]profile.TrendPoint
 	trendLoading       map[string]bool
 	playerSides        []storage.MatchPlayerSide
@@ -240,27 +243,28 @@ func (v *View) setOpProgress(loading bool, progress float64, stage string) {
 // NewView constructs a Match Analysis view.
 func NewView(db *storage.DB, dataRoot, ffmpegPath string) *View {
 	return &View{
-		db:            db,
-		dataRoot:      dataRoot,
-		ffmpegPath:    ffmpegPath,
-		activeTab:     TabOverview,
-		sortKey:       "rating",
-		sortDesc:      true,
-		sideFilter:    "ALL",
-		radarPreview:  components.NewRadarHexPreview(),
-		radarCanvas:   components.NewRadar2DCanvas(560),
-		heatmapCanvas: components.NewRadar2DCanvas(560),
-		replaySpeed:   1.0,
-		hmPlayer:      "全部选手",
-		hmTeam:        "全部阵营",
-		hmMode:        "position",
-		hmRoundType:   "全部回合",
-		showShots:     true,
-		showDeaths:    true,
-		showBomb:      true,
-		showRoute:     true,
-		showKillFeed:  true,
-		lowerOpacity:  1,
+		db:              db,
+		dataRoot:        dataRoot,
+		ffmpegPath:      ffmpegPath,
+		avatarAutoFetch: true,
+		activeTab:       TabOverview,
+		sortKey:         "rating",
+		sortDesc:        true,
+		sideFilter:      "ALL",
+		radarPreview:    components.NewRadarHexPreview(),
+		radarCanvas:     components.NewRadar2DCanvas(560),
+		heatmapCanvas:   components.NewRadar2DCanvas(560),
+		replaySpeed:     1.0,
+		hmPlayer:        "全部选手",
+		hmTeam:          "全部阵营",
+		hmMode:          "position",
+		hmRoundType:     "全部回合",
+		showShots:       true,
+		showDeaths:      true,
+		showBomb:        true,
+		showRoute:       true,
+		showKillFeed:    true,
+		lowerOpacity:    1,
 	}
 }
 
@@ -545,6 +549,10 @@ func (v *View) SelectDemo(ctx context.Context, demoID int64) error {
 	}
 	activeTab := v.activeTab
 	v.mu.Unlock()
+
+	// Avatars come from Steam: fetch the ones missing from the cache in the
+	// background so opening a demo is the only user action required.
+	v.ensureAvatarsAsync()
 
 	// Per-map lower-level alignment is loaded outside the lock because the
 	// repository hits SQLite.

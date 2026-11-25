@@ -108,6 +108,38 @@ func refreshBans(ctx context.Context, db *storage.DB, apiKey string, refresh boo
 	return sum, nil
 }
 
+// ensureBansAsync refreshes stale ban snapshots dropped away from the UI: when a
+// Steam API key is available, the library keeps the badges current without the
+// user clicking the shield button. Without a key it does nothing at all.
+func (v *View) ensureBansAsync() {
+	if v.db == nil {
+		return
+	}
+	key := loadSteamAPIKey(v.dataRoot)
+	if key == "" {
+		return
+	}
+	v.mu.Lock()
+	if v.bansBusy {
+		v.mu.Unlock()
+		return
+	}
+	v.bansBusy = true
+	v.mu.Unlock()
+
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+		defer cancel()
+		// refresh=false keeps the service's 24h TTL: only stale or unknown
+		// players cost a request.
+		_, _ = refreshBans(ctx, v.db, key, false)
+		v.mu.Lock()
+		v.bansBusy = false
+		v.mu.Unlock()
+		_ = v.Refresh(context.Background())
+	}()
+}
+
 // runBanRefreshNow is the goroutine body behind the toolbar button.
 func (v *View) runBanRefreshNow() {
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)

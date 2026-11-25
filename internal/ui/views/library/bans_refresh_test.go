@@ -95,3 +95,20 @@ func TestRefreshBansUsesCachedRows(t *testing.T) {
 		t.Fatalf("key file should not exist: %v", err)
 	}
 }
+
+// TestEnsureBansAsyncWithoutKeyIsNoop keeps first-run behaviour silent: no key,
+// no network, no goroutine.
+func TestEnsureBansAsyncWithoutKeyIsNoop(t *testing.T) {
+	db, err := storage.OpenDefault(t.TempDir())
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer db.Close()
+	v := NewView(db, nil, t.TempDir(), nil)
+	v.ensureBansAsync()
+	v.mu.RLock()
+	defer v.mu.RUnlock()
+	if v.bansBusy {
+		t.Fatal("ban refresh must not start without an API key")
+	}
+}

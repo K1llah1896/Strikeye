@@ -46,6 +46,67 @@ func (v *View) avatarFor(steamID string) (*ui.Bitmap, bool) {
 	return img, ok
 }
 
+// ensureAvatarsAsync fetches portraits for the current roster that are not in
+// the cache yet. Opening a demo is all a user ever does: no button, no dialog.
+func (v *View) ensureAvatarsAsync() {
+	v.mu.RLock()
+	players := append([]storage.MatchPlayer(nil), v.players...)
+	dataRoot := v.dataRoot
+	busy := v.avatarBusy
+	have := len(v.avatars)
+	v.mu.RUnlock()
+	if !v.avatarAutoFetch || busy || len(players) == 0 || have == len(players) {
+		return
+	}
+	dir := avatars.CacheDir(dataRoot)
+	missing := false
+	for _, p := range players {
+		if !avatars.ValidSteamID64(p.SteamID64) {
+			continue
+		}
+		if _, ok := avatars.Path(dir, p.SteamID64); !ok {
+			missing = true
+			break
+		}
+	}
+	if !missing {
+		return
+	}
+	v.mu.Lock()
+	v.avatarBusy = true
+	v.mu.Unlock()
+
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		defer cancel()
+		client := v.avatarClient
+		if client == nil {
+			client = avatars.NewClient()
+		}
+		fetched := 0
+		for _, p := range players {
+			if !avatars.ValidSteamID64(p.SteamID64) {
+				continue
+			}
+			if _, ok := avatars.Path(dir, p.SteamID64); ok {
+				continue
+			}
+			if _, err := client.Fetch(ctx, p.SteamID64, dir, avatars.DefaultMaxAge); err == nil {
+				fetched++
+			}
+		}
+		bitmaps := loadAvatars(dataRoot, players)
+		v.mu.Lock()
+		v.avatars = bitmaps
+		v.avatarBusy = false
+		if fetched > 0 {
+			v.avatarMsg = fmt.Sprintf("头像：已自动补齐 %d 个", fetched)
+		}
+		v.mu.Unlock()
+		v.invalidate()
+	}()
+}
+
 // refreshAvatars re-fetches every roster avatar past the 30-day TTL in the
 // background, then reloads the bitmaps. Without this the only way to update an
 // avatar is deleting the cache directory by hand.

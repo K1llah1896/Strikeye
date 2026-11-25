@@ -90,6 +90,7 @@ type View struct {
 	sharecodeDraft    string
 	apiKeyDraft       string
 	showAPIKeyPrompt  bool
+	bansBusy          bool
 	editingID         int64
 	remarkDraft       string
 	statusMsg         string
@@ -191,6 +192,7 @@ func (v *View) Refresh(ctx context.Context) error {
 	v.mu.Lock()
 	v.entries = entries
 	v.mu.Unlock()
+	v.ensureBansAsync()
 	return nil
 }
 

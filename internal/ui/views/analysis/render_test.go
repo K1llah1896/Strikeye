@@ -76,6 +76,9 @@ func intPtr(v int) *int { return &v }
 func TestRenderAllAnalysisTabs(t *testing.T) {
 	db, root, demoID := seedRenderAnalysis(t)
 	v := NewView(db, root, "")
+	// Rendering must not depend on Steam: the avatar fetch is exercised in
+	// analysis_avatars_test.go with an injected client instead.
+	v.avatarAutoFetch = false
 	if err := v.SelectDemo(context.Background(), demoID); err != nil {
 		t.Fatalf("select demo: %v", err)
 	}
@@ -92,6 +95,9 @@ func TestRenderAllAnalysisTabs(t *testing.T) {
 func TestRenderExpandedPlayerDrawer(t *testing.T) {
 	db, root, demoID := seedRenderAnalysis(t)
 	v := NewView(db, root, "")
+	// Rendering must not depend on Steam: the avatar fetch is exercised in
+	// analysis_avatars_test.go with an injected client instead.
+	v.avatarAutoFetch = false
 	if err := v.SelectDemo(context.Background(), demoID); err != nil {
 		t.Fatalf("select demo: %v", err)
 	}

@@ -89,6 +89,29 @@ Strikeye 围绕比赛的完整生命周期，构建统一的 Demo 管理、观�
 
 ---
 
+## Build & Release
+
+本地构建（可交叉编译出 Windows 可执行文件）：
+
+```bash
+GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -trimpath \
+  -ldflags "-X strikeye/internal/version.AppVersion=0.2.0 -H windowsgui" \
+  -o dist/strikeye.exe ./cmd/strikeye
+```
+
+自动发布：push 版本 tag 即触发 `.github/workflows/release.yml`。
+
+```bash
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+工作流会执行 `go vet` / `go test`，交叉编译三个可执行文件，打包 `strikeye-windows-amd64.zip`（内含 `strikeye.exe` / `strikeye-agent.exe` / `strikeye-cli.exe`）与 `SHA256SUMS.txt`，并创建对应的 GitHub Release。tag 中的版本号会通过 `-X strikeye/internal/version.AppVersion` 注入，用于应用内更新比较。
+
+带 `-` 的 tag（如 `v0.2.0-rc1`）会发布为 prerelease，不会顶掉 `/releases/latest`；应用内更新（`internal/updater`）读取的正是该地址，因此正式更新请使用 `vX.Y.Z` 形式的 tag。
+
+---
+
 <sub>STRIKEYE — CS2 MATCH REPLAY & ANALYSIS PLATFORM</sub>
 
 <sub>Built for players who see beyond the score.</sub>

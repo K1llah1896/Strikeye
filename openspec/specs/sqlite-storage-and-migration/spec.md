@@ -48,3 +48,79 @@ The legacy migrator SHALL detect existing `CS2-insight-agent` SQLite data (`cs2-
 #### Scenario: Missing legacy MP4 file during import
 - **WHEN** a legacy `recorded_clips` row points to an MP4 file that no longer exists on disk
 - **THEN** the missing file is skipped without failing migration of valid records
+
+### Requirement: Library full-text index
+
+系统 SHALL 维护 FTS5 全文索引：
+
+- 迁移 v10 SHALL 建立 `match_search(demo_id UNINDEXED, players, teams, map_name, note)` 使用 `unicode61` 分词。
+- 重建 SHALL 从 `demos`（队伍、地图、备注）、`match_players`（选手名）与 `map_annotations`（callout 与备注）汇总文本。
+- `EnsureSearchIndex` SHALL 在索引行数与 demo 数不一致时重建，并报告是否重建。
+- `Query(ctx, text, limit)` SHALL 对每个 token 做前缀匹配、按 `bm25` 升序返回、遵守 limit（默认 50、上限 500）。
+- 查询构造 SHALL 只保留字母数字 token 并丢弃 FTS5 保留字，因此用户输入的操作符与引号 SHALL NOT 造成 SQL 语法错误。
+- 空查询 SHALL 返回零结果而不访问数据库。
+
+#### Scenario: Player prefix match
+- **WHEN** the index contains player `KSCERATO` and the query is `ksce`
+- **THEN** that demo is returned
+
+#### Scenario: Operators cannot break the query
+- **WHEN** the query is `NiKo" OR NEAR(`
+- **THEN** the query succeeds and behaves like a two-token AND prefix search
+
+#### Scenario: Stale index is repaired
+- **WHEN** a demo is added after the last rebuild
+- **THEN** `EnsureSearchIndex` reports a rebuild and the new demo becomes searchable
+
+### Requirement: Large library pagination
+
+系统 SHALL 支持大资料库分页读取：
+
+- `ListPage(ctx, limit, offset)` SHALL 使用与 `List` 相同的排序，limit 上限 1000、默认 100，负 offset 归零。
+- `CountDemos` SHALL 返回 demo 总数。
+- 测试 SHALL 覆盖 2000 条 demo 下的分页、索引重建与查询耗时上限（分页 <200ms、FTS 查询 <100ms）。
+
+#### Scenario: Page offset beyond the first page
+- **WHEN** requesting `ListPage(50, 950)` on a 2000-row library
+- **THEN** 50 rows are returned within the time budget
+
+### Requirement: Per-map view preference storage
+
+数据库 SHALL 持久化每张地图的 2D 下层对齐参数：
+
+- 迁移 SHALL 新增 `map_view_prefs` 表，主键为地图名，字段包含 `lower_offset_x`、`lower_offset_y`、`lower_opacity`、`updated_at`。
+- 读取缺失行时 SHALL 返回偏移 0、透明度 1 的默认值而不报错。
+- 写入 SHALL 把偏移钳制在 ±512、透明度钳制在 0.1–1.0，并要求地图名非空。
+- 列表 SHALL 按地图名排序。
+
+#### Scenario: Defaults for an unseen map
+- **WHEN** preferences are read for a map that was never configured
+- **THEN** offsets are zero and opacity is 1
+
+#### Scenario: Out-of-range values are clamped
+- **WHEN** a caller stores offset 9999 and opacity 7
+- **THEN** the stored row reads back as offset 512 and opacity 1
+
+### Requirement: CJK substring search fallback
+
+资料库全文检索 SHALL 支持中文子串查询：
+
+- 查询含非 ASCII 字符时，除 FTS5 前缀匹配外 SHALL 额外执行大小写不敏感的子串匹配（`players`/`teams`/`map_name`/`note`）。
+- 两路结果 SHALL 按 `demo_id` 去重合并，FTS 命中优先保留其 bm25 排序。
+- 纯 ASCII 查询 SHALL 只走 FTS5，不改变既有排序。
+- 空查询 SHALL 返回空结果且不执行 SQL。
+
+#### Scenario: Search a Chinese note
+
+- **WHEN** 备注为 `LongA 默认双架`，用户搜索「双架」
+- **THEN** 该比赛出现在结果中，`note` 字段包含完整备注
+
+#### Scenario: Absent Chinese term
+
+- **WHEN** 用户搜索一个中文词库里不存在
+- **THEN** 返回 0 条，不报错
+
+#### Scenario: Latin query unchanged
+
+- **WHEN** 用户搜索 `furia`
+- **THEN** 走 FTS5 前缀匹配，结果按 bm25 排序

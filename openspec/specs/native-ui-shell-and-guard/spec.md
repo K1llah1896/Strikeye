@@ -24,8 +24,17 @@ When no render mutex is active, `strikeye.exe` SHALL acquire `Local\StrikeyeUISi
 - **WHEN** the user clicks "Start Render Now" in the UI and confirms the modal prompt
 - **THEN** `strikeye.exe` sends `render.start_now` to `strikeye-agent` and terminates cleanly so the agent can acquire the render mutex
 
-### Requirement: Main navigation shell and live agent status bar
-The main window SHALL use the active Strikeye theme palette (defaulting to the dark esports preset `#0F141C` background, `#171E29` cards, `#F59E0B` / `#38BDF8` accents) bound to the UI context so native controls (inputs, selects, checkboxes, sliders, scrollbars) inherit themed surfaces, with `Rajdhani` applied to numeric metrics and `Noto Sans SC` applied to CJK text, a two-tier left navigation rail for all five views, a top status bar displaying live agent state, active parse progress, and queued task counts via IPC event subscription, and a centered modal overlay for render-now confirmation.
+### Requirement: Main navigation shell and themed controls
+The main window SHALL bind the active Strikeye theme palette to the UI context so every native control inherits themed surfaces, apply `Rajdhani` to numeric metrics and `Noto Sans SC` to CJK text, and provide a two-tier left navigation rail covering all five views.
+
+#### Scenario: Default palette applies to native controls
+- **THEN** with the default dark esports preset (`#0F141C` background, `#171E29` cards, `#F59E0B` / `#38BDF8` accents) inputs, selects, checkboxes, sliders, and scrollbars render with themed surfaces
+
+#### Scenario: Navigation rail reaches every view
+- **THEN** the two-tier rail exposes Match Library, Match Analysis, 2D Replay, Highlights, and Settings & Tasks
+
+### Requirement: Live agent status bar and render-now modal
+The top status bar SHALL display live agent state, active parse progress, and queued task counts via IPC event subscription, and render-now confirmation SHALL use a centered modal overlay.
 
 #### Scenario: Live task status update
 - **WHEN** `strikeye-agent` publishes a demo parse or render task state change event
@@ -87,3 +96,22 @@ The UI shell SHALL provide a reusable progress bar primitive supporting determin
 #### Scenario: Navigating to a heavy view displays a loading progress bar
 - **WHEN** the user clicks to open `Match Analysis` for a parsed demo
 - **THEN** the workspace switches immediately and displays a loading progress bar with stage text until SQLite queries and initial canvas setup complete
+
+### Requirement: Headless render smoke tests
+
+视图 SHALL 具备无头渲染回归测试：
+
+- `internal/ui/renderutil` SHALL 提供 `Probe` 与 `AssertRendered`，用 `ui.Render` 在 1280×800 渲染并按 4px 采样统计不同颜色数。
+- 资料库、设置、分析、精彩回放、观战五个视图 SHALL 各至少有一个渲染测试，渲染结果颜色数低于阈值时 SHALL 失败。
+- 分析视图 SHALL 逐一渲染全部标签页（总览/经济/表现/雷达/2D 回放/热力图/区域控制/队伍视角）。
+- 测试数据 SHALL 由临时 SQLite 播种，不依赖真实 demo 文件。
+
+#### Scenario: Blank frame detected
+
+- **WHEN** 某视图因 nil 指针或空数据只画出背景
+- **THEN** 渲染测试因颜色数不足失败，而不是通过
+
+#### Scenario: Panel branches covered
+
+- **WHEN** 下载面板、API Key 面板或 SQL 结果表格处于展开状态
+- **THEN** 渲染测试覆盖这些分支并保持通过

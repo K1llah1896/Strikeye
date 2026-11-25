@@ -300,7 +300,7 @@ func (v *View) renderTeam(c *ui.Context) {
 					})
 				}
 			} else if profile.CalloutsMissing() {
-				theme.MutedText(c, "缺少 callout 数据：运行 `strikeye-cli callouts-fetch` 后开场区位才有名字")
+				theme.MutedText(c, "缺少 callout 数据：内置数据集缺失（源码构建可运行 `strikeye-cli assets-pack` 后重构建，或 `callouts-fetch` 联网补齐）")
 			}
 		})
 	}

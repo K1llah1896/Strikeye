@@ -14,6 +14,7 @@ import (
 	"sort"
 	"strings"
 
+	"strikeye/internal/mapassets"
 	"strikeye/internal/parser"
 	"strikeye/internal/storage"
 )
@@ -61,16 +62,22 @@ type PlayerEntry struct {
 	OpeningKills int     `json:"opening_kills"`
 }
 
-// Build parses one demo into a throwaway data root and returns its snapshot.
-// The temp root keeps corpus runs from touching the user's library.
-func Build(ctx context.Context, demoPath string, workDir string) (Snapshot, error) {
-	return BuildWithGeometry(ctx, demoPath, workDir, "")
+// BuildOptions configures one corpus snapshot.
+type BuildOptions struct {
+	// WorkDir is the scratch DataRoot; empty means a temp dir that is removed.
+	WorkDir string
+	// GeometryDir copies `.tri` files from an existing cache into the scratch
+	// root, so visibility-derived metrics (TTD) are covered by the snapshot.
+	GeometryDir string
+	// GeometryBundle points at a map_geometry.zip sidecar; the single map a demo
+	// needs is extracted on demand. Falls back to an auto-detected bundle.
+	GeometryBundle string
 }
 
-// BuildWithGeometry is Build plus an optional directory of `.tri` map geometry
-// copied into the scratch cache, so visibility-derived metrics (TTD) are
-// covered by the golden snapshot instead of silently reading zero.
-func BuildWithGeometry(ctx context.Context, demoPath string, workDir string, geometryDir string) (Snapshot, error) {
+// Build parses one demo into a throwaway data root and returns its snapshot.
+// The temp root keeps corpus runs from touching the user's library.
+func Build(ctx context.Context, demoPath string, opts BuildOptions) (Snapshot, error) {
+	workDir, geometryDir, geometryBundle := opts.WorkDir, opts.GeometryDir, opts.GeometryBundle
 	abs, err := filepath.Abs(demoPath)
 	if err != nil {
 		return Snapshot{}, err
@@ -95,6 +102,10 @@ func BuildWithGeometry(ctx context.Context, demoPath string, workDir string, geo
 		if err := copyGeometry(geometryDir, filepath.Join(workDir, "cache", "map_geometry")); err != nil {
 			return Snapshot{}, err
 		}
+	} else if geometryBundle == "" {
+		if bundle, ok := mapassets.FindGeometryBundle(workDir, mapassets.ExeDir()); ok {
+			geometryBundle = bundle
+		}
 	}
 	db, err := storage.OpenDefault(workDir)
 	if err != nil {
@@ -103,9 +114,10 @@ func BuildWithGeometry(ctx context.Context, demoPath string, workDir string, geo
 	defer db.Close()
 
 	parse, err := parser.ParseAndPersist(ctx, db, parser.ParseOptions{
-		DataRoot: workDir,
-		FilePath: abs,
-		Force:    true,
+		DataRoot:       workDir,
+		FilePath:       abs,
+		Force:          true,
+		GeometryBundle: geometryBundle,
 	})
 	if err != nil {
 		return Snapshot{}, fmt.Errorf("parse %s: %w", filepath.Base(abs), err)

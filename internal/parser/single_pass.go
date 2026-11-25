@@ -40,7 +40,11 @@ type ParseOptions struct {
 	PreBufferSec  float64
 	PostBufferSec float64
 	Force         bool
-	OnProgress    func(ParseProgress)
+	// GeometryBundle optionally points at a map_geometry.zip sidecar; when set,
+	// visibility geometry is pulled from it on demand instead of only from the
+	// DataRoot cache.
+	GeometryBundle string
+	OnProgress     func(ParseProgress)
 }
 
 // ParseSummary summarizes the persisted output of a single-pass parse.
@@ -944,8 +948,7 @@ func executeSinglePass(ctx context.Context, demo storage.Demo, opts ParseOptions
 
 		if !visGeoLoaded && mapName != "" && gs.IsMatchStarted() {
 			visGeoLoaded = true
-			geoPath := filepath.Join(opts.DataRoot, "cache", "map_geometry", strings.ToLower(mapName)+mapgeom.Extension)
-			if bvh, _, err := mapgeom.Load(geoPath); err == nil {
+			if bvh, ok := mapgeom.LoadForMapWithBundle(opts.DataRoot, opts.GeometryBundle, mapName); ok {
 				visTracer = mapgeom.NewTracer(bvh)
 			}
 		}

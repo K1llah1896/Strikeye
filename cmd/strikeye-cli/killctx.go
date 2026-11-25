@@ -5,8 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"path/filepath"
-	"strings"
 
 	"strikeye/internal/killctx"
 	"strikeye/internal/mapgeom"
@@ -48,7 +46,7 @@ func runKillContext(ctx context.Context, dataRoot string, demoID int64, store bo
 
 	var bvh *mapgeom.BVH
 	if mapName != "" {
-		if loaded, _, err := mapgeom.Load(filepath.Join(dataRoot, "cache", "map_geometry", strings.ToLower(mapName)+mapgeom.Extension)); err == nil {
+		if loaded, ok := mapgeom.LoadForMap(dataRoot, mapName); ok {
 			bvh = loaded
 		}
 	}

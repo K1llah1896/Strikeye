@@ -23,7 +23,8 @@ import (
 	"strikeye/internal/zones"
 )
 
-// calloutsTablePath is where `strikeye-cli callouts-fetch` stores the dataset.
+// calloutsTablePath is where the bundled callout table (or
+// `strikeye-cli callouts-fetch`) lands.
 func calloutsTablePath(dataRoot string) string {
 	return filepath.Join(dataRoot, "cache", "map_data", "callouts.csv")
 }
@@ -59,11 +60,13 @@ func (v *View) ensureZonesReadyAsync() {
 	v.invalidate()
 
 	go func() {
+		// The datasets ship inside the package and are staged at startup by the
+		// app shell; missing files here mean a source build without blobs.
 		zoneErr := ""
 		var set *callouts.Set
 		table, err := callouts.LoadCSV(calloutsTablePath(dataRoot))
 		if err != nil {
-			zoneErr = "尚未下载 callout 数据集：运行 `strikeye-cli callouts-fetch` 后重试。"
+			zoneErr = "内置 callout 数据集缺失（源码构建）：运行 `strikeye-cli assets-pack` 后重新构建，或 `strikeye-cli callouts-fetch` 联网补齐。"
 		} else if s, err := table.For(mapName); err != nil {
 			zoneErr = fmt.Sprintf("callout 数据集暂不含地图 %s（已覆盖 %s）。", mapName, strings.Join(table.Maps(), ", "))
 		} else {
@@ -125,7 +128,7 @@ func (v *View) ensureZonesReadyAsync() {
 		{
 			var bvh *mapgeom.BVH
 			if mapName != "" {
-				if loaded, _, err := mapgeom.Load(filepath.Join(dataRoot, "cache", "map_geometry", strings.ToLower(mapName)+mapgeom.Extension)); err == nil {
+				if loaded, ok := mapgeom.LoadForMap(dataRoot, mapName); ok {
 					bvh = loaded
 				}
 			}
@@ -140,7 +143,7 @@ func (v *View) ensureZonesReadyAsync() {
 		controlErr := ""
 		if set != nil {
 			if mesh, err := navmesh.Load(filepath.Join(dataRoot, "cache", "map_nav", mapName+".nav")); err != nil {
-				controlErr = fmt.Sprintf("未缓存导航网格：运行 `strikeye-cli navs-fetch --map %s` 后可显示地图控制曲线。", mapName)
+				controlErr = fmt.Sprintf("内置包不含 %s 的导航网格：可运行 `strikeye-cli navs-fetch --map %s` 联网补齐。", mapName, mapName)
 			} else {
 				control = mapcontrol.Build(replays, rounds, mesh, set, tickRate, mapcontrol.DefaultConfig())
 			}

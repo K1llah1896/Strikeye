@@ -20,7 +20,7 @@ The system SHALL read the remote geometry manifest and expose its map list.
 The system SHALL download missing geometry into `<DataRoot>/cache/map_geometry` and verify size and SHA-256 before use.
 
 #### Scenario: Fresh download
-- **WHEN** a requested map is absent from the cache
+- **WHEN** a requested map is absent from the cache and no sidecar archive exists
 - **THEN** the file is downloaded to a `.part` temporary and renamed only after size and checksum match
 
 #### Scenario: Cached file reuse
@@ -34,6 +34,29 @@ The system SHALL download missing geometry into `<DataRoot>/cache/map_geometry` 
 #### Scenario: Unknown map
 - **WHEN** a requested map is not in the manifest
 - **THEN** the command fails naming that map
+
+### Requirement: Sidecar geometry source
+系统 SHALL 优先从 `map_geometry.zip` 边车取图，边车位置为可执行文件目录、当前目录、DataRoot 或其 `cache`/`assets` 子目录；解压后 SHALL 按边车 `manifest.json` 的 `size`+`sha256` 校验。
+
+#### Scenario: Sidecar fills a cold cache
+- **WHEN** 缓存为空且 exe 旁存在 `map_geometry.zip`
+- **THEN** 只解压请求的那张图，校验通过后写入缓存，后续调用直接复用
+
+#### Scenario: Cached file wins over sidecar
+- **WHEN** 目标 `.tri` 已存在且非空
+- **THEN** 直接加载缓存文件，不读取边车
+
+#### Scenario: Explicit sidecar overrides detection
+- **WHEN** 调用方显式传入边车路径（例如 `corpus --geometry-bundle`）
+- **THEN** 只从该边车取图，不再搜索默认位置
+
+#### Scenario: Corrupt sidecar entry leaves nothing behind
+- **WHEN** 边车中某张图的校验和与 manifest 不符
+- **THEN** 该次调用报告几何不可用，缓存目录不留下 `.part` 或半成品文件
+
+#### Scenario: Missing bundle degrades gracefully
+- **WHEN** 既无缓存也无边车
+- **THEN** 调用方得到“几何不可用”并让依赖几何的指标归零，而不是报错
 
 ### Requirement: Geometry file parsing
 The system SHALL parse `.tri` v1 files into vertices, indices, and a BVH.

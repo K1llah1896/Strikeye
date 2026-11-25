@@ -5,6 +5,8 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"strikeye/internal/mapassets"
 )
 
 func TestDiffDetectsMetricAndCountChanges(t *testing.T) {
@@ -69,7 +71,16 @@ func TestFixtureCorpus(t *testing.T) {
 		t.Fatalf("abs: %v", err)
 	}
 	goldenDir := filepath.Join(root, "tests", "fixtures", "golden")
+	// Prefer an explicit geometry cache, then fall back to the bundled sidecar
+	// archive so the golden metrics stay reproducible from a fresh checkout.
 	geometryDir := filepath.Join(root, "dist", "cache", "map_geometry")
+	if entries, err := os.ReadDir(geometryDir); err != nil || len(entries) == 0 {
+		geometryDir = ""
+	}
+	bundlePath := filepath.Join(root, "assets", mapassets.GeometryBundleName)
+	if _, err := os.Stat(bundlePath); err != nil {
+		bundlePath = ""
+	}
 	entries, err := os.ReadDir(goldenDir)
 	if err != nil {
 		t.Fatalf("golden dir: %v", err)
@@ -89,7 +100,7 @@ func TestFixtureCorpus(t *testing.T) {
 			if _, err := os.Stat(demoPath); err != nil {
 				t.Skipf("fixture %s not present", want.Source)
 			}
-			got, err := BuildWithGeometry(ctx, demoPath, "", geometryDir)
+			got, err := Build(ctx, demoPath, BuildOptions{GeometryDir: geometryDir, GeometryBundle: bundlePath})
 			if err != nil {
 				t.Fatalf("build: %v", err)
 			}

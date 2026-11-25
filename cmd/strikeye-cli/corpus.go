@@ -26,6 +26,7 @@ func runCorpus(ctx context.Context, args []string, out io.Writer) error {
 	only := fs.String("demo", "", "Only process this fixture filename")
 	workDir := fs.String("work-dir", "", "Reusable scratch data root (default: temp)")
 	geomDir := fs.String("geometry-dir", "", "Directory of .tri map geometry copied into the scratch cache (enables TTD metrics)")
+	geomBundle := fs.String("geometry-bundle", "", "map_geometry.zip sidecar to extract TTD geometry from (default: auto-detected)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -61,7 +62,11 @@ func runCorpus(ctx context.Context, args []string, out io.Writer) error {
 	failures := 0
 	for _, demoPath := range demos {
 		start := time.Now()
-		snap, err := corpus.BuildWithGeometry(ctx, demoPath, *workDir, *geomDir)
+		snap, err := corpus.Build(ctx, demoPath, corpus.BuildOptions{
+			WorkDir:        *workDir,
+			GeometryDir:    *geomDir,
+			GeometryBundle: *geomBundle,
+		})
 		if err != nil {
 			return err
 		}

@@ -35,3 +35,11 @@ Thumbs.db
 *.swp
 *.swo
 *~
+
+# Bundled map asset blobs (fetched by `strikeye-cli assets-pack`, see
+# internal/mapassets/assets/README.md). Images are build inputs, not sources.
+internal/mapassets/assets/*.zip
+internal/mapassets/assets/*.csv
+assets/map_geometry.zip
+assets/ffmpeg-windows-amd64.zip
+assets/hlae-windows-amd64.zip

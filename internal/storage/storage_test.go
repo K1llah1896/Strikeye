@@ -86,7 +86,7 @@ func TestOpenWALForeignKeysAndPreMigrationSnapshot(t *testing.T) {
 		t.Fatalf("expected schema version %d, got %d (err=%v)", nextVer, ver, err)
 	}
 
-	snaps, err := filepath.Glob(filepath.Join(snapDir, "strikeye_v2_*.db"))
+	snaps, err := filepath.Glob(filepath.Join(snapDir, "strikeye_v*.db"))
 	if err != nil || len(snaps) != 1 {
 		t.Fatalf("expected 1 pre-migration snapshot in %q, got %v (err=%v)", snapDir, snaps, err)
 	}
@@ -475,24 +475,45 @@ func TestV2MigrationAndMatchPlayerSides(t *testing.T) {
 		t.Fatalf("close v1: %v", err)
 	}
 
-	// Upgrade to v2 using DefaultMigrations.
+	// Upgrade to the latest schema using DefaultMigrations.
 	db2, err := Open(dbPath, snapDir)
 	if err != nil {
-		t.Fatalf("Open v2 failed: %v", err)
+		t.Fatalf("Open latest failed: %v", err)
 	}
 	defer db2.Close()
 
 	ver, err := db2.CurrentSchemaVersion(ctx)
-	if err != nil || ver != 2 {
-		t.Fatalf("expected schema v2, got %d (err=%v)", ver, err)
+	if err != nil || ver != 12 {
+		t.Fatalf("expected schema v12, got %d (err=%v)", ver, err)
 	}
 	if !tableExists(ctx, db2.SQL(), "match_player_sides") {
 		t.Fatalf("expected match_player_sides table to exist")
 	}
+	if !tableExists(ctx, db2.SQL(), "player_profiles") {
+		t.Fatalf("expected player_profiles table to exist")
+	}
+	if !tableExists(ctx, db2.SQL(), "map_annotations") {
+		t.Fatalf("expected map_annotations table to exist")
+	}
+	if !tableExists(ctx, db2.SQL(), "match_purchases") {
+		t.Fatalf("expected match_purchases table to exist")
+	}
+	if !tableExists(ctx, db2.SQL(), "map_view_prefs") {
+		t.Fatalf("expected map_view_prefs table to exist")
+	}
+	if !tableExists(ctx, db2.SQL(), "kill_context") {
+		t.Fatalf("expected kill_context table to exist")
+	}
+	if !tableExists(ctx, db2.SQL(), "map_strokes") {
+		t.Fatalf("expected map_strokes table to exist")
+	}
+	if !tableExists(ctx, db2.SQL(), "match_search") {
+		t.Fatalf("expected match_search table to exist")
+	}
 
 	// Legacy v1 demo reads cleanly with empty side slice.
 	players, err := db2.Analysis().ListMatchPlayers(ctx, demo.ID)
-	if err != nil || len(players) != 1 || players[0].ClutchBreakdownJSON != "{}" {
+	if err != nil || len(players) != 1 || players[0].ClutchBreakdownJSON != "{}" || players[0].TTKSamples != 0 {
 		t.Fatalf("ListMatchPlayers legacy failed: len=%d err=%v players=%+v", len(players), err, players)
 	}
 	sides, err := db2.Analysis().ListMatchPlayerSides(ctx, demo.ID)
@@ -545,5 +566,179 @@ func TestBuildSQLiteDSNForUNCPath(t *testing.T) {
 	wantPrefix := "file:////wsl.localhost/archlinux/home/killah/Strikeye/dist/strikeye.db?"
 	if !strings.HasPrefix(got, wantPrefix) {
 		t.Fatalf("expected UNC DSN prefix %q, got %q", wantPrefix, got)
+	}
+}
+
+func TestApplyIngestMetadataFillsDefaultsWithoutOverwriting(t *testing.T) {
+	ctx := context.Background()
+	db, err := OpenDefault(t.TempDir())
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer db.Close()
+	demo, _, err := db.Demos().UpsertByContentHash(ctx, Demo{
+		FilePath:       "/tmp/meta.dem",
+		Filename:       "meta.dem",
+		FileSize:       2048,
+		ContentSHA256:  "hash-meta-1",
+		SourcePlatform: "unknown",
+	})
+	if err != nil {
+		t.Fatalf("insert demo: %v", err)
+	}
+
+	changed, err := db.Demos().ApplyIngestMetadata(ctx, demo.ID, IngestMetadata{
+		SourcePlatform: "faceit",
+		MatchDate:      "2026-10-01T12:00:00Z",
+		TeamAName:      "Spirit",
+		TeamBName:      "FaZe",
+		TeamAScore:     2,
+		TeamBScore:     1,
+		HasScore:       true,
+		MatchID:        "match-42",
+	})
+	if err != nil || !changed {
+		t.Fatalf("apply metadata: changed=%v err=%v", changed, err)
+	}
+	got, err := db.Demos().GetByID(ctx, demo.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.SourcePlatform != "faceit" || got.TeamAName != "Spirit" || got.TeamBName != "FaZe" ||
+		got.TeamAScore != 2 || got.TeamBScore != 1 || got.MatchDate == nil || *got.MatchDate != "2026-10-01T12:00:00Z" ||
+		got.Remark == nil || *got.Remark != "match-42" {
+		t.Fatalf("unexpected metadata: %+v", got)
+	}
+
+	// Applying different values must not overwrite the populated fields.
+	changed, err = db.Demos().ApplyIngestMetadata(ctx, demo.ID, IngestMetadata{
+		SourcePlatform: "esl",
+		TeamAName:      "Other",
+		MatchDate:      "2027-01-01T00:00:00Z",
+		MatchID:        "second",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if changed {
+		t.Fatalf("expected no change on populated fields")
+	}
+
+	// Ready demos keep parser-derived teams even when still at defaults.
+	ready, _, err := db.Demos().UpsertByContentHash(ctx, Demo{
+		FilePath:       "/tmp/ready.dem",
+		Filename:       "ready.dem",
+		FileSize:       2048,
+		ContentSHA256:  "hash-meta-2",
+		SourcePlatform: "valve",
+		ParseStatus:    "parsed",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Demos().ApplyIngestMetadata(ctx, ready.ID, IngestMetadata{
+		TeamAName: "Ignored", TeamBName: "Ignored", HasScore: true, TeamAScore: 9, TeamBScore: 9,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	gotReady, err := db.Demos().GetByID(ctx, ready.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotReady.TeamAName != "Team A" || gotReady.TeamBScore != 0 {
+		t.Fatalf("ready demo metadata was overwritten: %+v", gotReady)
+	}
+}
+
+func TestPlayerProfilesCRUDAndTags(t *testing.T) {
+	db, err := OpenDefault(t.TempDir())
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer db.Close()
+	ctx := context.Background()
+
+	if _, found, err := db.PlayerProfiles().Get(ctx, "76561198000000009"); err != nil || found {
+		t.Fatalf("expected missing profile, found=%v err=%v", found, err)
+	}
+
+	prof, err := db.PlayerProfiles().Upsert(ctx, PlayerProfile{
+		SteamID64:   " 76561198000000009 ",
+		DisplayName: " donk ",
+		Note:        " aggressive entry",
+		Tags:        []string{"Entry", " entry ", "", "Star"},
+	})
+	if err != nil {
+		t.Fatalf("upsert: %v", err)
+	}
+	if prof.SteamID64 != "76561198000000009" || prof.DisplayName != "donk" {
+		t.Errorf("normalized profile = %+v", prof)
+	}
+	if len(prof.Tags) != 2 || prof.Tags[0] != "Entry" || prof.Tags[1] != "Star" {
+		t.Errorf("tags = %v", prof.Tags)
+	}
+
+	updated, err := db.PlayerProfiles().Upsert(ctx, PlayerProfile{
+		SteamID64:   "76561198000000009",
+		DisplayName: "donk",
+		Tags:        ParseTagList("awper，clutch;awper"),
+	})
+	if err != nil {
+		t.Fatalf("second upsert: %v", err)
+	}
+	if len(updated.Tags) != 2 || updated.Tags[0] != "awper" || updated.Tags[1] != "clutch" {
+		t.Errorf("parsed tags = %v", updated.Tags)
+	}
+	if updated.UpdatedAt == "" {
+		t.Error("updated_at not stamped")
+	}
+
+	got, found, err := db.PlayerProfiles().Get(ctx, "76561198000000009")
+	if err != nil || !found || got.DisplayName != "donk" || len(got.Tags) != 2 {
+		t.Errorf("get = %+v found=%v err=%v", got, found, err)
+	}
+	all, err := db.PlayerProfiles().List(ctx)
+	if err != nil || len(all) != 1 {
+		t.Errorf("list = %+v err=%v", all, err)
+	}
+	tags, err := db.PlayerProfiles().TagsForSteamIDs(ctx, []string{"76561198000000009", "missing"})
+	if err != nil || len(tags["76561198000000009"]) != 2 {
+		t.Errorf("tags map = %v err=%v", tags, err)
+	}
+	if empty, err := db.PlayerProfiles().TagsForSteamIDs(ctx, nil); err != nil || len(empty) != 0 {
+		t.Errorf("empty lookup = %v err=%v", empty, err)
+	}
+	if err := db.PlayerProfiles().Delete(ctx, "76561198000000009"); err != nil {
+		t.Errorf("delete: %v", err)
+	}
+	if _, found, _ := db.PlayerProfiles().Get(ctx, "76561198000000009"); found {
+		t.Error("profile still present after delete")
+	}
+}
+
+func TestMatchPlayerTTDRoundTrip(t *testing.T) {
+	ctx := context.Background()
+	db, err := OpenDefault(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, _, err := db.Demos().UpsertByContentHash(ctx, Demo{ContentSHA256: "ttd", FilePath: "ttd.dem", Filename: "ttd.dem", FileSize: 1}); err != nil {
+		t.Fatal(err)
+	}
+	demo, err := db.Demos().GetByContentHash(ctx, "ttd")
+	if err != nil {
+		t.Fatal(err)
+	}
+	players := []MatchPlayer{{SteamID64: "1", PlayerName: "a", TeamKey: "team_a", Kills: 10, TTDAvgMS: 412.5, TTDSamples: 7}}
+	if err := db.Analysis().ReplaceMatchPlayers(ctx, demo.ID, players); err != nil {
+		t.Fatal(err)
+	}
+	got, err := db.Analysis().ListMatchPlayers(ctx, demo.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].TTDAvgMS != 412.5 || got[0].TTDSamples != 7 {
+		t.Fatalf("TTD round trip = %+v", got)
 	}
 }

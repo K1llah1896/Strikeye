@@ -7,42 +7,42 @@ import (
 
 // MatchPlayer represents a row in match_players.
 type MatchPlayer struct {
-	ID                 int64
-	DemoID             int64
-	SteamID64          string
-	PlayerName         string
-	DisplayName        string
-	TeamKey            string
-	SpecSlot           *int
-	Kills              int
-	Deaths             int
-	Assists            int
-	KDRatio            float64
-	KPR                float64
-	DPR                float64
-	APR                float64
-	TotalDamage        int
-	ADR                float64
-	UtilityDamage      int
-	UtilityADR         float64
-	KASTPercent        float64
-	Headshots          int
-	HSPercent          float64
-	FirstKills         int
-	FirstDeaths        int
-	OpeningDuelWinRate float64
-	TradeKills         int
-	TradeDeaths        int
-	SurvivalRate       float64
-	OneKillRounds      int
-	TwoKillRounds      int
-	ThreeKillRounds    int
-	FourKillRounds     int
-	FiveKillRounds     int
-	MultiKillRounds    int
-	ClutchAttempts     int
-	ClutchWins         int
-	AWPKills           int
+	ID                  int64
+	DemoID              int64
+	SteamID64           string
+	PlayerName          string
+	DisplayName         string
+	TeamKey             string
+	SpecSlot            *int
+	Kills               int
+	Deaths              int
+	Assists             int
+	KDRatio             float64
+	KPR                 float64
+	DPR                 float64
+	APR                 float64
+	TotalDamage         int
+	ADR                 float64
+	UtilityDamage       int
+	UtilityADR          float64
+	KASTPercent         float64
+	Headshots           int
+	HSPercent           float64
+	FirstKills          int
+	FirstDeaths         int
+	OpeningDuelWinRate  float64
+	TradeKills          int
+	TradeDeaths         int
+	SurvivalRate        float64
+	OneKillRounds       int
+	TwoKillRounds       int
+	ThreeKillRounds     int
+	FourKillRounds      int
+	FiveKillRounds      int
+	MultiKillRounds     int
+	ClutchAttempts      int
+	ClutchWins          int
+	AWPKills            int
 	AvgEquipmentValue   int
 	ImpactScore         float64
 	StrikeyeRating      float64
@@ -53,6 +53,10 @@ type MatchPlayer struct {
 	EcoAdjRating        float64
 	EcoAdjADR           float64
 	ClutchBreakdownJSON string
+	TTKAvgMS            float64
+	TTKSamples          int
+	TTDAvgMS            float64
+	TTDSamples          int
 }
 
 // MatchPlayerSide represents a row in match_player_sides for CT or T side-split stats.
@@ -218,8 +222,9 @@ func (r *AnalysisRepository) ReplaceMatchPlayers(ctx context.Context, demoID int
 			trade_kills, trade_deaths, survival_rate,
 			one_kill_rounds, two_kill_rounds, three_kill_rounds, four_kill_rounds, five_kill_rounds, multi_kill_rounds,
 			clutch_attempts, clutch_wins, awp_kills, avg_equipment_value, impact_score, strikeye_rating,
-			flash_assists, enemies_flashed, total_flash_sec, round_swing, eco_adj_rating, eco_adj_adr, clutch_breakdown_json
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			flash_assists, enemies_flashed, total_flash_sec, round_swing, eco_adj_rating, eco_adj_adr, clutch_breakdown_json,
+			ttk_avg_ms, ttk_samples, ttd_avg_ms, ttd_samples
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`)
 	if err != nil {
 		_ = tx.Rollback()
@@ -241,6 +246,7 @@ func (r *AnalysisRepository) ReplaceMatchPlayers(ctx context.Context, demoID int
 			p.OneKillRounds, p.TwoKillRounds, p.ThreeKillRounds, p.FourKillRounds, p.FiveKillRounds, p.MultiKillRounds,
 			p.ClutchAttempts, p.ClutchWins, p.AWPKills, p.AvgEquipmentValue, p.ImpactScore, p.StrikeyeRating,
 			p.FlashAssists, p.EnemiesFlashed, p.TotalFlashSec, p.RoundSwing, p.EcoAdjRating, p.EcoAdjADR, clutchJSON,
+			p.TTKAvgMS, p.TTKSamples, p.TTDAvgMS, p.TTDSamples,
 		); err != nil {
 			_ = tx.Rollback()
 			return fmt.Errorf("insert match_player %s: %w", p.SteamID64, err)
@@ -259,7 +265,8 @@ func (r *AnalysisRepository) ListMatchPlayers(ctx context.Context, demoID int64)
 			trade_kills, trade_deaths, survival_rate,
 			one_kill_rounds, two_kill_rounds, three_kill_rounds, four_kill_rounds, five_kill_rounds, multi_kill_rounds,
 			clutch_attempts, clutch_wins, awp_kills, avg_equipment_value, impact_score, strikeye_rating,
-			flash_assists, enemies_flashed, total_flash_sec, round_swing, eco_adj_rating, eco_adj_adr, clutch_breakdown_json
+			flash_assists, enemies_flashed, total_flash_sec, round_swing, eco_adj_rating, eco_adj_adr, clutch_breakdown_json,
+			ttk_avg_ms, ttk_samples, ttd_avg_ms, ttd_samples
 		FROM match_players WHERE demo_id = ? ORDER BY strikeye_rating DESC, kills DESC`, demoID)
 	if err != nil {
 		return nil, err
@@ -278,6 +285,7 @@ func (r *AnalysisRepository) ListMatchPlayers(ctx context.Context, demoID int64)
 			&p.OneKillRounds, &p.TwoKillRounds, &p.ThreeKillRounds, &p.FourKillRounds, &p.FiveKillRounds, &p.MultiKillRounds,
 			&p.ClutchAttempts, &p.ClutchWins, &p.AWPKills, &p.AvgEquipmentValue, &p.ImpactScore, &p.StrikeyeRating,
 			&p.FlashAssists, &p.EnemiesFlashed, &p.TotalFlashSec, &p.RoundSwing, &p.EcoAdjRating, &p.EcoAdjADR, &p.ClutchBreakdownJSON,
+			&p.TTKAvgMS, &p.TTKSamples, &p.TTDAvgMS, &p.TTDSamples,
 		); err != nil {
 			return nil, err
 		}

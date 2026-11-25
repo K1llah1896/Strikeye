@@ -106,6 +106,26 @@ func OpenDefault(dataRoot string) (*DB, error) {
 	)
 }
 
+// ReadOnly returns a second connection that only allows reads: query_only blocks
+// every write at the engine level, so the SQL console cannot mutate data even if
+// keyword validation is bypassed. The main connection is left untouched.
+func (db *DB) ReadOnly(ctx context.Context) (*sql.DB, error) {
+	if db == nil || db.path == "" {
+		return nil, fmt.Errorf("database is not open")
+	}
+	dsn := "file:" + filepath.ToSlash(db.path) + "?_pragma=query_only(1)&_pragma=busy_timeout(5000)"
+	conn, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		return nil, fmt.Errorf("open read-only sqlite: %w", err)
+	}
+	conn.SetMaxOpenConns(1)
+	if err := conn.PingContext(ctx); err != nil {
+		_ = conn.Close()
+		return nil, fmt.Errorf("ping read-only sqlite: %w", err)
+	}
+	return conn, nil
+}
+
 func isUNCPath(path string) bool {
 	slashed := strings.ReplaceAll(filepath.ToSlash(path), "\\", "/")
 	return strings.HasPrefix(slashed, "//")

@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strings"
 )
 
 // Demo represents a row in the demos table.
@@ -157,6 +158,107 @@ func (r *DemoRepository) List(ctx context.Context) ([]Demo, error) {
 		out = append(out, d)
 	}
 	return out, rows.Err()
+}
+
+// ListPage returns one page of demos with the same ordering as List, so large
+// libraries can be browsed without materialising every row.
+func (r *DemoRepository) ListPage(ctx context.Context, limit, offset int) ([]Demo, error) {
+	if limit <= 0 || limit > 1000 {
+		limit = 100
+	}
+	if offset < 0 {
+		offset = 0
+	}
+	rows, err := r.db.sql.QueryContext(ctx, demoSelectBase+
+		` ORDER BY COALESCE(match_date, added_at) DESC, id DESC LIMIT ? OFFSET ?`, limit, offset)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []Demo
+	for rows.Next() {
+		d, err := scanDemo(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, d)
+	}
+	return out, rows.Err()
+}
+
+// CountDemos returns the total number of indexed demos.
+func (r *DemoRepository) CountDemos(ctx context.Context) (int, error) {
+	var n int
+	err := r.db.sql.QueryRowContext(ctx, `SELECT COUNT(*) FROM demos`).Scan(&n)
+	return n, err
+}
+
+// IngestMetadata carries advisory metadata discovered outside the demo file,
+// such as a sidecar .info document. Zero values mean "not provided".
+type IngestMetadata struct {
+	SourcePlatform string
+	MatchDate      string
+	TeamAName      string
+	TeamBName      string
+	TeamAScore     int
+	TeamBScore     int
+	HasScore       bool
+	MatchID        string
+}
+
+// ApplyIngestMetadata fills only empty or default-valued demo fields and never
+// overwrites parsed results (for ready demos) or user annotations. It reports
+// whether any column changed.
+func (r *DemoRepository) ApplyIngestMetadata(ctx context.Context, id int64, m IngestMetadata) (bool, error) {
+	d, err := r.GetByID(ctx, id)
+	if err != nil {
+		return false, err
+	}
+
+	sets := make([]string, 0, 6)
+	args := make([]any, 0, 8)
+	add := func(column string, value any) {
+		sets = append(sets, column+" = ?")
+		args = append(args, value)
+	}
+
+	if m.SourcePlatform != "" && (d.SourcePlatform == "" || strings.EqualFold(d.SourcePlatform, "unknown")) {
+		add("source_platform", m.SourcePlatform)
+	}
+	if m.MatchDate != "" && (d.MatchDate == nil || strings.TrimSpace(*d.MatchDate) == "") {
+		add("match_date", m.MatchDate)
+	}
+	if d.ParseStatus != "parsed" {
+		if m.TeamAName != "" && isDefaultTeamName(d.TeamAName, "Team A") {
+			add("team_a_name", m.TeamAName)
+		}
+		if m.TeamBName != "" && isDefaultTeamName(d.TeamBName, "Team B") {
+			add("team_b_name", m.TeamBName)
+		}
+		if m.HasScore && d.TeamAScore == 0 && d.TeamBScore == 0 {
+			add("team_a_score", m.TeamAScore)
+			add("team_b_score", m.TeamBScore)
+		}
+	}
+	if m.MatchID != "" && (d.Remark == nil || strings.TrimSpace(*d.Remark) == "") {
+		add("remark", m.MatchID)
+	}
+
+	if len(sets) == 0 {
+		return false, nil
+	}
+	args = append(args, id)
+	if _, err := r.db.sql.ExecContext(ctx,
+		"UPDATE demos SET "+strings.Join(sets, ", ")+" WHERE id = ?", args...); err != nil {
+		return false, fmt.Errorf("apply ingest metadata: %w", err)
+	}
+	return true, nil
+}
+
+func isDefaultTeamName(current, fallback string) bool {
+	trimmed := strings.TrimSpace(current)
+	return trimmed == "" || trimmed == fallback
 }
 
 func (r *DemoRepository) UpdateAnnotations(ctx context.Context, id int64, displayName, remark *string, isFavorite bool) error {

@@ -61,6 +61,7 @@ type View struct {
 	introPath      string
 	outroPath      string
 	bgmPath        string
+	audioTracks    []audioTrackDraft
 	clipVol        float64
 	bgmVol         float64
 	transition     string
@@ -76,19 +77,20 @@ type View struct {
 // NewView constructs a Highlights & Montage view.
 func NewView(db *storage.DB, agent AgentCaller, ffmpegPath string, onStartRender func()) *View {
 	return &View{
-		db:            db,
-		agent:         agent,
-		ffmpegPath:    ffmpegPath,
-		videosByID:    make(map[int64]storage.MediaVideo),
-		radarBySteam:  make(map[string]storage.RadarCard),
-		playerWidget:  components.NewVideoPlayerWidget(ffmpegPath),
-		activeTab: "library",
+		db:           db,
+		agent:        agent,
+		ffmpegPath:   ffmpegPath,
+		videosByID:   make(map[int64]storage.MediaVideo),
+		radarBySteam: make(map[string]storage.RadarCard),
+		playerWidget: components.NewVideoPlayerWidget(ffmpegPath),
+		activeTab:    "library",
 		filter: HighlightFilter{
 			PlayerQuery: "全部选手",
 			ClipType:    "全部类型",
 			TagQuery:    "全部标签",
 		},
 		title:         "Strikeye Highlight Montage",
+		audioTracks:   defaultAudioTracks(),
 		clipVol:       1.0,
 		bgmVol:        0.35,
 		transition:    "fade",
@@ -622,6 +624,7 @@ func (v *View) renderWorkbench(c *ui.Context) {
 				ui.TextInput(c, &v.introPath).FillWidth().Placeholder("片头 MP4 路径 (可选)")
 				ui.TextInput(c, &v.outroPath).FillWidth().Placeholder("片尾 MP4 路径 (可选)")
 				ui.TextInput(c, &v.bgmPath).FillWidth().Placeholder("BGM 音频路径 (可选)")
+				renderAudioTrackEditor(c, &v.audioTracks)
 				theme.RowCenter(c).FillWidth().Gap(8).Children(func() {
 					theme.MutedText(c, "转场效果").Width(64)
 					ui.Select(c, &v.transition, []string{"fade", "fadewhite", "wipeleft", "smoothleft", "cut"}).Width(180)
@@ -639,6 +642,7 @@ func (v *View) renderWorkbench(c *ui.Context) {
 				if theme.AccentButton(c, "导出合辑 MP4").Clicked() && len(v.montageItems) > 0 && v.agent != nil {
 					spec := BuildMontageSpec(demoID, v.title, v.introPath, v.outroPath, v.bgmPath, v.outputPath,
 						v.clipVol, v.bgmVol, v.transition, v.transitionDur, v.showNameCard, v.montageItems)
+					spec.AudioTracks = toAudioTracks(v.audioTracks)
 					var res map[string]any
 					if err := v.agent.Call(context.Background(), "montage.export", map[string]any{"spec": spec}, &res); err != nil {
 						v.mu.Lock()

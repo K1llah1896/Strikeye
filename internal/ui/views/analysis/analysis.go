@@ -1,11 +1,13 @@
-// Package analysis implements View 3: Match Analysis with 5 tabs:
-// Overview & Scoreboard, Rounds & Economy, Players & CS Data Radar, 2D Replay, and Heatmaps.
+// Package analysis implements View 3: Match Analysis with 7 tabs: Overview &
+// Scoreboard, Rounds & Economy, Players & CS Data Radar, 2D Replay, Heatmaps,
+// and Callout Zones.
 package analysis
 
 import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math"
 	"sort"
 	"strings"
 	"sync"
@@ -13,15 +15,22 @@ import (
 
 	"github.com/egoist/mygo/ui"
 	"strikeye/assets/maps"
+	"strikeye/internal/callouts"
 	"strikeye/internal/config"
+	"strikeye/internal/killctx"
+	"strikeye/internal/mapcontrol"
+	"strikeye/internal/nadebook"
 	"strikeye/internal/parser"
+	"strikeye/internal/profile"
 	"strikeye/internal/radar"
 	"strikeye/internal/storage"
 	"strikeye/internal/ui/components"
 	"strikeye/internal/ui/theme"
+	"strikeye/internal/voice"
+	"strikeye/internal/zones"
 )
 
-// Tab identifies one of the 5 Match Analysis sub-views.
+// Tab identifies one of the Match Analysis sub-views.
 type Tab string
 
 const (
@@ -31,45 +40,59 @@ const (
 	TabRadar       Tab = "radar"
 	TabReplay2D    Tab = "replay2d"
 	TabHeatmaps    Tab = "heatmaps"
+	TabZones       Tab = "zones"
+	TabTeam        Tab = "team"
 )
 
-// View manages Match Analysis state across all 6 tabs.
+// View manages Match Analysis state across all 7 tabs.
 type View struct {
-	mu                sync.RWMutex
-	db                *storage.DB
-	dataRoot          string
-	ffmpegPath        string
-	demo              *storage.Demo
-	players           []storage.MatchPlayer
-	playerSides       []storage.MatchPlayerSide
-	rounds            []storage.MatchRound
-	events            []storage.MatchEvent
-	cards             []storage.RadarCard
-	activeTab         Tab
-	sortKey           string
-	sortDesc          bool
-	sideFilter        string // "ALL", "CT", "T"
-	ecoAdjusted       bool
-	expandedPlayerSID string
-	selectedRoundNum  int
-	compareA          string
-	compareB          string
-	selectedCardID    string
-	portraitInput     string
-	logoInput         string
-	radarPreview      *components.RadarHexPreview
-	radarCanvas       *components.Radar2DCanvas
-	heatmapCanvas     *components.Radar2DCanvas
-	replayIndex       []parser.RoundIndexEntry
-	replayRound       parser.ReplayRoundData
-	replayRoundNum    int
-	replayFrameIdx    int
-	replayFramePos    float64
-	replaySpeed       float64
-	replayPlaying     bool
-	playStop          chan struct{}
-	lastStepAt        time.Time
-	lowerLayer        bool
+	mu                 sync.RWMutex
+	db                 *storage.DB
+	dataRoot           string
+	ffmpegPath         string
+	demo               *storage.Demo
+	players            []storage.MatchPlayer
+	avatars            map[string]*ui.Bitmap
+	trends             map[string][]profile.TrendPoint
+	trendLoading       map[string]bool
+	playerSides        []storage.MatchPlayerSide
+	rounds             []storage.MatchRound
+	events             []storage.MatchEvent
+	purchases          map[int][]storage.MatchPurchase
+	cards              []storage.RadarCard
+	activeTab          Tab
+	sortKey            string
+	sortDesc           bool
+	sideFilter         string // "ALL", "CT", "T"
+	ecoAdjusted        bool
+	expandedPlayerSID  string
+	selectedRoundNum   int
+	compareA           string
+	compareB           string
+	selectedCardID     string
+	portraitInput      string
+	logoInput          string
+	radarPreview       *components.RadarHexPreview
+	radarCanvas        *components.Radar2DCanvas
+	heatmapCanvas      *components.Radar2DCanvas
+	replayIndex        []parser.RoundIndexEntry
+	replayRound        parser.ReplayRoundData
+	replayRoundNum     int
+	replayFrameIdx     int
+	replayFramePos     float64
+	replaySpeed        float64
+	replayPlaying      bool
+	playStop           chan struct{}
+	lastStepAt         time.Time
+	lowerLayer         bool
+	showShots          bool
+	showDeaths         bool
+	showBomb           bool
+	showRoute          bool
+	showKillFeed       bool
+	lowerOffsetX       float64
+	lowerOffsetY       float64
+	lowerOpacity       float64
 	hmPlayer           string
 	hmTeam             string
 	hmMode             string
@@ -80,15 +103,46 @@ type View struct {
 	replayLoading      bool
 	heatmapReady       bool
 	heatmapLoading     bool
-	replaySeq         uint64
-	frameRenderSeq    uint64
-	heatmapSeq        uint64
-	statusMsg         string
-	opMu              sync.RWMutex
-	opLoading         bool
-	opProgress        float64
-	opStage           string
-	onInvalidate      func()
+	zoneReady          bool
+	zoneLoading        bool
+	zoneErr            string
+	zoneTotals         zones.SetupTotals
+	zoneDeaths         []zones.Death
+	zoneKillCtx        map[string]killctx.Kill
+	zoneControl        mapcontrol.Result
+	zoneLineups        []nadebook.Lineup
+	zoneSet            *callouts.Set
+	zoneAnnotations    []storage.MapAnnotation
+	zonePins           []components.Pin
+	zoneStrokes        []storage.MapStroke
+	zoneRound          int
+	brushActive        bool
+	brushPts           []components.StrokePoint
+	zoneControlErr     string
+	voiceReady         bool
+	voiceLoading       bool
+	voiceErr           error
+	voiceBlocks        []voice.Activity
+	voiceSeq           uint64
+	profileDraft       profileDraft
+	avatarBusy         bool
+	avatarMsg          string
+	teamFocus          string
+	teamReady          bool
+	teamLoading        bool
+	teamErr            error
+	teamBundle         teamBundle
+	teamSeq            uint64
+	replaySeq          uint64
+	frameRenderSeq     uint64
+	heatmapSeq         uint64
+	zoneSeq            uint64
+	statusMsg          string
+	opMu               sync.RWMutex
+	opLoading          bool
+	opProgress         float64
+	opStage            string
+	onInvalidate       func()
 }
 
 // SetInvalidate registers a UI window invalidation callback for background updates.
@@ -201,6 +255,12 @@ func NewView(db *storage.DB, dataRoot, ffmpegPath string) *View {
 		hmTeam:        "全部阵营",
 		hmMode:        "position",
 		hmRoundType:   "全部回合",
+		showShots:     true,
+		showDeaths:    true,
+		showBomb:      true,
+		showRoute:     true,
+		showKillFeed:  true,
+		lowerOpacity:  1,
 	}
 }
 
@@ -214,8 +274,13 @@ func (v *View) SetActiveTab(tab Tab) {
 	v.mu.Unlock()
 	if tab == TabReplay2D {
 		v.ensureReplayReadyAsync()
+		v.ensureVoiceActivityAsync()
+	} else if tab == TabTeam {
+		v.ensureTeamAsync()
 	} else if tab == TabHeatmaps {
 		v.ensureHeatmapReadyAsync()
+	} else if tab == TabZones {
+		v.ensureZonesReadyAsync()
 	}
 }
 
@@ -400,6 +465,7 @@ func (v *View) SelectDemo(ctx context.Context, demoID int64) error {
 	playerSides, _ := v.db.Analysis().ListMatchPlayerSides(ctx, demoID)
 	rounds, _ := v.db.Analysis().ListMatchRounds(ctx, demoID)
 	events, _ := v.db.Analysis().ListMatchEvents(ctx, demoID, nil)
+	purchases, _ := v.db.Analysis().ListMatchPurchases(ctx, demoID)
 	cards, _ := v.db.Analysis().ListRadarCards(ctx, demoID)
 
 	var replayIndex []parser.RoundIndexEntry
@@ -426,9 +492,17 @@ func (v *View) SelectDemo(ctx context.Context, demoID int64) error {
 	v.heatmapSeq++
 	v.demo = &d
 	v.players = players
+	v.avatars = loadAvatars(v.dataRoot, players)
+	v.radarCanvas.SetSlotNames(slotNameMap(players))
+	if d.TickRate > 0 {
+		v.radarCanvas.SetTickRate(d.TickRate)
+	}
+	v.trends = map[string][]profile.TrendPoint{}
+	v.trendLoading = map[string]bool{}
 	v.playerSides = playerSides
 	v.rounds = rounds
 	v.events = events
+	v.purchases = groupPurchasesByRound(purchases)
 	v.cards = cards
 	v.expandedPlayerSID = ""
 	v.selectedRoundNum = 0
@@ -443,6 +517,27 @@ func (v *View) SelectDemo(ctx context.Context, demoID int64) error {
 	v.heatmapLoading = false
 	v.heatmapRounds = nil
 	v.heatmapSampleCount = 0
+	v.zoneReady = false
+	v.zoneLoading = false
+	v.zoneErr = ""
+	v.zoneTotals = zones.SetupTotals{}
+	v.zoneDeaths = nil
+	v.zoneControl = mapcontrol.Result{}
+	v.zoneLineups = nil
+	v.zoneControlErr = ""
+	v.voiceReady = false
+	v.voiceLoading = false
+	v.voiceErr = nil
+	v.voiceBlocks = nil
+	v.voiceSeq++
+	v.teamReady = false
+	v.teamLoading = false
+	v.teamErr = nil
+	v.teamBundle = teamBundle{}
+	v.teamFocus = ""
+	v.profileDraft = profileDraft{}
+	v.teamSeq++
+	v.zoneSeq++
 	v.selectedCardID = firstCardID
 	if len(players) >= 2 {
 		v.compareA = players[0].PlayerName
@@ -451,10 +546,21 @@ func (v *View) SelectDemo(ctx context.Context, demoID int64) error {
 	activeTab := v.activeTab
 	v.mu.Unlock()
 
+	// Per-map lower-level alignment is loaded outside the lock because the
+	// repository hits SQLite.
+	if d.MapName != nil {
+		v.loadLowerViewPrefs(*d.MapName)
+	}
+
 	if activeTab == TabReplay2D {
 		v.ensureReplayReadyAsync()
+		v.ensureVoiceActivityAsync()
+	} else if activeTab == TabTeam {
+		v.ensureTeamAsync()
 	} else if activeTab == TabHeatmaps {
 		v.ensureHeatmapReadyAsync()
+	} else if activeTab == TabZones {
+		v.ensureZonesReadyAsync()
 	}
 	return nil
 }
@@ -477,9 +583,11 @@ func (v *View) loadReplayRound(roundNum int) {
 		v.stopPlaybackLocked()
 		v.replayRound = rd
 		v.replayRoundNum = roundNum
+		v.zoneRound = roundNum
 		v.replayFrameIdx = 0
 		v.replayFramePos = 0
 		v.mu.Unlock()
+		v.applyStrokes()
 	}
 }
 
@@ -516,6 +624,7 @@ func (v *View) loadReplayRoundAsync(roundNum int) {
 			if err == nil {
 				v.replayRound = rd
 				v.replayRoundNum = roundNum
+				v.zoneRound = roundNum
 				v.replayFrameIdx = 0
 				v.replayFramePos = 0
 				v.replayMapReady = true
@@ -523,6 +632,7 @@ func (v *View) loadReplayRoundAsync(roundNum int) {
 			v.replayLoading = false
 		}
 		v.mu.Unlock()
+		v.applyStrokes()
 		v.invalidate()
 	}()
 }
@@ -539,9 +649,13 @@ func (v *View) renderReplayFrameAsync(frameIdx int, reconfigureMap bool) {
 	lower := v.lowerLayer
 	v.mu.Unlock()
 
+	canvas := v.radarCanvas
+	if canvas == nil {
+		return
+	}
 	go func() {
 		if reconfigureMap {
-			v.radarCanvas.ConfigureMap(mapName, lower, [4]float64{-2500, 2500, -2500, 2500})
+			canvas.ConfigureMap(mapName, lower, [4]float64{-2500, 2500, -2500, 2500})
 		}
 		v.mu.RLock()
 		stale := v.frameRenderSeq != seq
@@ -549,7 +663,7 @@ func (v *View) renderReplayFrameAsync(frameIdx int, reconfigureMap bool) {
 		if stale {
 			return
 		}
-		v.radarCanvas.RenderReplayFrame(round, frameIdx)
+		canvas.RenderReplayFrame(round, frameIdx)
 		v.invalidate()
 	}()
 }
@@ -614,6 +728,7 @@ func (v *View) refreshHeatmapAsync(reconfigureMap bool) {
 	hmTeam := v.hmTeam
 	hmMode := v.hmMode
 	hmRoundType := v.hmRoundType
+	tickRate := v.demo.TickRate
 	v.mu.Unlock()
 	v.invalidate()
 
@@ -652,6 +767,7 @@ func (v *View) refreshHeatmapAsync(reconfigureMap bool) {
 		}
 
 		f := resolveHeatmapFilter(players, hmPlayer, hmTeam, hmMode, hmRoundType, teamAName)
+		f.TickRate = tickRate
 		pts := BuildHeatmapPointsMulti(events, rounds, players, cachedRounds, f)
 		v.heatmapCanvas.RenderHeatmap(pts)
 
@@ -667,6 +783,18 @@ func (v *View) refreshHeatmapAsync(reconfigureMap bool) {
 		v.mu.Unlock()
 		v.invalidate()
 	}()
+}
+
+// slotNameMap maps spec slots to player names for canvas overlays such as the
+// kill feed. Slots without a spec entry are omitted rather than guessed.
+func slotNameMap(players []storage.MatchPlayer) map[uint8]string {
+	names := make(map[uint8]string, len(players))
+	for _, p := range players {
+		if p.SpecSlot != nil && *p.SpecSlot > 0 && p.PlayerName != "" {
+			names[uint8(*p.SpecSlot)] = p.PlayerName
+		}
+	}
+	return names
 }
 
 func resolveHeatmapFilter(players []storage.MatchPlayer, hmPlayer, hmTeam, hmMode, hmRoundType, teamAName string) HeatmapFilter {
@@ -705,6 +833,7 @@ type HeatmapFilter struct {
 	TeamAName      string
 	Mode           string // "position", "firefight", "kill", "death"
 	RoundType      string // "全部回合", "手枪局", "长枪局", "Eco"
+	TickRate       float64
 }
 
 // BuildHeatmapPoints extracts world-space HeatmapPoints from events and a single replay round.
@@ -731,7 +860,9 @@ func BuildHeatmapPointsMulti(
 ) []components.HeatmapPoint {
 	roundAllowed := make(map[int]bool, len(rounds))
 	roundSides := make(map[int][2]string, len(rounds))
+	roundMeta := make(map[int]storage.MatchRound, len(rounds))
 	for _, r := range rounds {
+		roundMeta[r.RoundNumber] = r
 		sideA := strings.ToUpper(strings.TrimSpace(r.TeamASide))
 		sideB := strings.ToUpper(strings.TrimSpace(r.TeamBSide))
 		roundSides[r.RoundNumber] = [2]string{sideA, sideB}
@@ -816,6 +947,53 @@ func BuildHeatmapPointsMulti(
 					}
 					pts = append(pts, components.HeatmapPoint{X: float64(p.X), Y: float64(p.Y), Z: float64(p.Z), Weight: 1})
 				}
+			}
+		}
+		return pts
+	}
+
+	if f.Mode == "setup" {
+		if len(roundReplays) == 0 {
+			return nil
+		}
+		tickRate := f.TickRate
+		if tickRate <= 0 {
+			tickRate = 64.0
+		}
+		setupTicks := int64(math.Round(20.0 * tickRate))
+		for rn, rd := range roundReplays {
+			if len(rounds) > 0 && !roundAllowed[rn] {
+				continue
+			}
+			if len(rd.Frames) == 0 {
+				continue
+			}
+			target := rd.Frames[0].Tick + setupTicks
+			if rm, ok := roundMeta[rn]; ok && rm.FreezeEndTick > 0 {
+				target = rm.FreezeEndTick + setupTicks
+			}
+			idx := sort.Search(len(rd.Frames), func(i int) bool {
+				return rd.Frames[i].Tick >= target
+			})
+			if idx >= len(rd.Frames) {
+				idx = len(rd.Frames) - 1
+			} else if idx > 0 && target-rd.Frames[idx-1].Tick < rd.Frames[idx].Tick-target {
+				idx--
+			}
+			for _, p := range rd.Frames[idx].Players {
+				if !p.Alive {
+					continue
+				}
+				if f.Team == "T" && p.Team != 1 {
+					continue
+				}
+				if f.Team == "CT" && p.Team != 2 {
+					continue
+				}
+				if f.PlayerSpecSlot > 0 && int(p.Slot) != f.PlayerSpecSlot {
+					continue
+				}
+				pts = append(pts, components.HeatmapPoint{X: float64(p.X), Y: float64(p.Y), Z: float64(p.Z), Weight: 1})
 			}
 		}
 		return pts
@@ -1026,6 +1204,8 @@ func (v *View) Render(c *ui.Context) {
 				{Key: string(TabRadar), Label: "4. 选手对比与雷达图", Icon: theme.IconRadar},
 				{Key: string(TabReplay2D), Label: "5. 2D 雷达回放", Icon: theme.IconSpectator},
 				{Key: string(TabHeatmaps), Label: "6. 战术热力图", Icon: theme.IconHighlights},
+				{Key: string(TabZones), Label: "7. 区域控制", Icon: theme.IconRadar},
+				{Key: string(TabTeam), Label: "8. 队伍视角", Icon: theme.IconHighlights},
 			}, string(activeTab), func(k string) {
 				v.SetActiveTab(Tab(k))
 			})
@@ -1068,6 +1248,10 @@ func (v *View) Render(c *ui.Context) {
 							v.renderReplay2D(c)
 						case TabHeatmaps:
 							v.renderHeatmaps(c)
+						case TabZones:
+							v.renderZones(c)
+						case TabTeam:
+							v.renderTeam(c)
 						}
 					})
 			})
@@ -1198,6 +1382,22 @@ func (v *View) renderScoreboardGroup(c *ui.Context, title string, accent ui.Colo
 	theme.RowCenter(c).FillWidth().Gap(8).PaddingY(2).Children(func() {
 		theme.StatusDot(c, accent, 7)
 		ui.Text(c, title).Font("Rajdhani").FontSize(12).Bold().TextColor(accent)
+		if title == "全场选手数据" {
+			ui.Spacer(c)
+			v.mu.RLock()
+			avatarMsg := v.avatarMsg
+			busy := v.avatarBusy
+			v.mu.RUnlock()
+			if avatarMsg != "" {
+				theme.MutedText(c, avatarMsg)
+			}
+			if busy {
+				theme.PillBadge(c, "下载头像...", theme.AccentAmber)
+			}
+			if theme.ActionButton(c, "刷新头像").Clicked() {
+				v.refreshAvatars()
+			}
+		}
 	})
 	for idx, p := range rows {
 		bg := ui.Transparent
@@ -1223,7 +1423,11 @@ func (v *View) renderScoreboardGroup(c *ui.Context, title string, accent ui.Colo
 		rowBtn.Children(func() {
 			theme.RowCenter(c).FillWidth().Gap(4).Children(func() {
 				theme.RowCenter(c).Width(150).Gap(6).Children(func() {
-					theme.StatusDot(c, accent, 6)
+					if img, ok := v.avatarFor(p.SteamID64); ok {
+						ui.Image(c, img).Width(18).Height(18).Radius(9)
+					} else {
+						theme.StatusDot(c, accent, 6)
+					}
 					ui.Text(c, p.PlayerName).FontSize(12).Bold().TextColor(theme.TextPrimary)
 				})
 				statCell(c, fmt.Sprintf("%d", p.Kills))
@@ -1256,6 +1460,7 @@ func (v *View) renderScoreboardGroup(c *ui.Context, title string, accent ui.Colo
 				v.expandedPlayerSID = ""
 			} else {
 				v.expandedPlayerSID = p.SteamID64
+				v.loadTrend(p.SteamID64)
 			}
 		}
 
@@ -1291,11 +1496,24 @@ func (v *View) renderPlayerDetailDrawer(c *ui.Context, p storage.MatchPlayer) {
 			theme.StatText(c, fmt.Sprintf("残局明细: %s", clutchText)).FontSize(12).TextColor(theme.AccentCyan)
 		})
 		theme.RowCenter(c).FillWidth().Gap(16).Children(func() {
+			theme.StatText(c, fmt.Sprintf("平均 TTK: %.0fms (%d 次对枪)", p.TTKAvgMS, p.TTKSamples)).FontSize(12).TextColor(theme.TextPrimary)
+			theme.StatText(c, fmt.Sprintf("平均 TTD: %.0fms (%d 次先手)", p.TTDAvgMS, p.TTDSamples)).FontSize(12).TextColor(theme.TextPrimary)
 			theme.StatText(c, fmt.Sprintf("道具 ADR: %.1f", p.UtilityADR)).FontSize(12).TextColor(theme.TextPrimary)
 			theme.StatText(c, fmt.Sprintf("首杀胜率: %.1f%%", p.OpeningDuelWinRate)).FontSize(12).TextColor(theme.TextPrimary)
 			theme.StatText(c, fmt.Sprintf("AWP 击杀: %d", p.AWPKills)).FontSize(12).TextColor(theme.TextPrimary)
 			theme.StatText(c, fmt.Sprintf("闪光助攻: %d  •  致盲敌人: %d (%.1fs)", p.FlashAssists, p.EnemiesFlashed, p.TotalFlashSec)).FontSize(12).TextColor(theme.AccentAmber)
 		})
+		v.renderProfileEditor(c, p)
+		points := v.trendFor(p.SteamID64)
+		if len(points) > 1 {
+			ratingLine, adrLine := trendSummary(points, 10)
+			recent := trendMatchesText(points, 3)
+			theme.RowCenter(c).FillWidth().Gap(16).Children(func() {
+				theme.StatText(c, ratingLine).FontSize(12).TextColor(theme.AccentCyan)
+				theme.StatText(c, adrLine).FontSize(12).TextColor(theme.TextPrimary)
+				theme.StatText(c, "最近: "+recent).FontSize(11).TextColor(theme.TextMuted)
+			})
+		}
 	})
 }
 
@@ -1408,8 +1626,8 @@ func (v *View) renderEconomy(c *ui.Context) {
 		theme.RowCenter(c).FillWidth().Background(theme.BgInput).Radius(4).PaddingX(8).PaddingY(6).Gap(10).Children(func() {
 			ui.Text(c, "回合").Width(36).FontSize(11).Bold().TextColor(theme.TextMuted)
 			ui.Text(c, "胜方与方式").Width(150).FontSize(11).Bold().TextColor(theme.TextMuted)
-			ui.Text(c, fmt.Sprintf("%s 装备 / 经济", demo.TeamAName)).Width(58+barMaxW+84+20).FontSize(11).Bold().TextColor(theme.TeamCT)
-			ui.Text(c, fmt.Sprintf("%s 装备 / 经济", demo.TeamBName)).Width(58+barMaxW+84+20).FontSize(11).Bold().TextColor(theme.TeamT)
+			ui.Text(c, fmt.Sprintf("%s 装备 / 经济", demo.TeamAName)).Width(58 + barMaxW + 84 + 20).FontSize(11).Bold().TextColor(theme.TeamCT)
+			ui.Text(c, fmt.Sprintf("%s 装备 / 经济", demo.TeamBName)).Width(58 + barMaxW + 84 + 20).FontSize(11).Bold().TextColor(theme.TeamT)
 		})
 		for idx, r := range rounds {
 			sideA := strings.ToUpper(strings.TrimSpace(r.TeamASide))
@@ -1544,6 +1762,7 @@ func (v *View) renderRoundDetailDrawer(c *ui.Context, r storage.MatchRound) {
 	v.mu.RLock()
 	demo := v.demo
 	events := v.events
+	buyRows := append([]storage.MatchPurchase(nil), v.purchases[r.RoundNumber]...)
 	v.mu.RUnlock()
 	econRows := ParsePlayerEconomy(r.PlayerEconomyJSON)
 	var roundKills []storage.MatchEvent
@@ -1602,8 +1821,26 @@ func (v *View) renderRoundDetailDrawer(c *ui.Context, r storage.MatchRound) {
 					theme.StatText(c, fmt.Sprintf("剩余 $%d", rem)).Width(72).FontSize(11).TextColor(theme.StatusGreen)
 					ui.Text(c, loadout).Grow(1).MinWidth(0).FontSize(11).TextColor(theme.TextPrimary)
 				})
+				if buys, spend := purchaseSummary(buyRows, pe.SteamID64); buys != "" {
+					theme.RowCenter(c).FillWidth().Gap(8).Children(func() {
+						ui.Box(c).Width(116)
+						ui.Text(c, fmt.Sprintf("购买 $%d", spend)).Width(146).FontSize(10).TextColor(theme.AccentAmber)
+						ui.Text(c, buys).Grow(1).MinWidth(0).FontSize(10).TextColor(theme.TextMuted)
+					})
+				}
 			}
 		})
+	}
+	if len(buyRows) > 0 {
+		teamSpend := map[string]int{}
+		for _, p := range buyRows {
+			teamSpend[p.PlayerName] += p.Cost
+		}
+		total := 0
+		for _, v := range teamSpend {
+			total += v
+		}
+		theme.MutedText(c, fmt.Sprintf("本回合购买 %d 笔，合计 $%d；时间为冻结期结束前后的相对时刻。", len(buyRows), total))
 	}
 
 	drawer := ui.Column(c).FillWidth().Background(theme.BgBase).Border(1, theme.BorderSubtle).Radius(6).Padding(10).Gap(8).
@@ -2121,6 +2358,41 @@ func (v *View) renderReplay2D(c *ui.Context) {
 						FontSize(12).TextColor(theme.AccentCyan)
 				})
 
+				if demo.MapName != nil && maps.HasLowerLayer(*demo.MapName) && v.lowerLayer {
+					if v.renderLowerViewControls(c, *demo.MapName) {
+						v.renderReplayFrameAsync(replayFrameIdx, true)
+					}
+				}
+
+				theme.RowCenter(c).FillWidth().Gap(10).Children(func() {
+					layersChanged := false
+					if ui.Checkbox(c, &v.showShots, "弹道").Changed() {
+						layersChanged = true
+					}
+					if ui.Checkbox(c, &v.showDeaths, "死亡标记").Changed() {
+						layersChanged = true
+					}
+					if ui.Checkbox(c, &v.showBomb, "C4 与爆炸范围").Changed() {
+						layersChanged = true
+					}
+					if ui.Checkbox(c, &v.showRoute, "移动路线").Changed() {
+						layersChanged = true
+					}
+					if ui.Checkbox(c, &v.showKillFeed, "击杀信息").Changed() {
+						layersChanged = true
+					}
+					if layersChanged {
+						v.radarCanvas.SetLayers(components.ReplayLayers{
+							Shots:    v.showShots,
+							Deaths:   v.showDeaths,
+							Bomb:     v.showBomb,
+							Route:    v.showRoute,
+							KillFeed: v.showKillFeed,
+						})
+						v.renderReplayFrameAsync(replayFrameIdx, false)
+					}
+				})
+
 				frameVal := float64(replayFrameIdx)
 				maxF := float64(maxInt(1, frameCount-1))
 				if ui.Slider(c, &frameVal, 0, maxF).FillWidth().Changed() {
@@ -2150,10 +2422,20 @@ func (v *View) renderReplay2D(c *ui.Context) {
 						theme.StatusDot(c, theme.AccentCyan, 8)
 						theme.MutedText(c, "投掷物轨迹")
 					})
+					theme.RowCenter(c).Gap(12).Children(func() {
+						theme.StatusDot(c, theme.AccentAmber, 8)
+						theme.MutedText(c, "弹道")
+						theme.StatusDot(c, theme.StatusRed, 8)
+						theme.MutedText(c, "死亡 / 爆炸范围")
+						theme.StatusDot(c, theme.TeamCT, 8)
+						theme.MutedText(c, "移动轨迹（按队伍着色）")
+					})
 				})
 			})
 		})
 	})
+
+	v.renderVoiceTimeline(c)
 }
 
 func (v *View) renderHeatmaps(c *ui.Context) {
@@ -2187,12 +2469,12 @@ func (v *View) renderHeatmaps(c *ui.Context) {
 						theme.PillBadge(c, fmt.Sprintf("采样点 %d", sampleCount), theme.AccentAmber)
 					}
 				})
-				theme.MutedText(c, "通过核密度估计 (KDE) 叠加展示交火、击杀与站位分布。")
+				theme.MutedText(c, "通过核密度估计 (KDE) 叠加展示交火、击杀与站位分布。setup 采样每回合开局 20 秒的存活站位。")
 
 				ui.Column(c).FillWidth().Background(theme.BgInput).Border(1, theme.RimBorder).Radius(14).Padding(14).Gap(10).Children(func() {
 					theme.RowCenter(c).FillWidth().Gap(8).Children(func() {
 						theme.MutedText(c, "分析维度").Width(72)
-						if ui.Select(c, &v.hmMode, []string{"position", "firefight", "kill", "death"}).Width(220).Changed() {
+						if ui.Select(c, &v.hmMode, []string{"setup", "position", "firefight", "kill", "death"}).Width(220).Changed() {
 							v.refreshHeatmapAsync(false)
 						}
 					})
@@ -2217,6 +2499,11 @@ func (v *View) renderHeatmaps(c *ui.Context) {
 					if demo.MapName != nil && maps.HasLowerLayer(*demo.MapName) {
 						if ui.Checkbox(c, &v.lowerLayer, "切换下层地图 (Lower)").Changed() {
 							v.refreshHeatmapAsync(true)
+						}
+						if v.lowerLayer {
+							if v.renderLowerViewControls(c, *demo.MapName) {
+								v.refreshHeatmapAsync(true)
+							}
 						}
 					}
 					theme.RowCenter(c).FillWidth().Children(func() {
@@ -2247,4 +2534,41 @@ func maxInt(a, b int) int {
 		return a
 	}
 	return b
+}
+
+// groupPurchasesByRound indexes purchases by round for the round drawer.
+func groupPurchasesByRound(rows []storage.MatchPurchase) map[int][]storage.MatchPurchase {
+	if len(rows) == 0 {
+		return nil
+	}
+	out := make(map[int][]storage.MatchPurchase, len(rows))
+	for _, p := range rows {
+		out[p.RoundNumber] = append(out[p.RoundNumber], p)
+	}
+	return out
+}
+
+// formatPurchaseTime renders a buy timestamp as mm:ss before/after freeze time.
+func formatPurchaseTime(sec float64) string {
+	sign := ""
+	if sec < 0 {
+		sign = "-"
+		sec = -sec
+	}
+	return fmt.Sprintf("%s%d:%02d", sign, int(sec)/60, int(sec)%60)
+}
+
+// purchaseSummary renders "AK-47 0:04 · 烟雾 -0:02" plus the total spend for one
+// player in one round.
+func purchaseSummary(rows []storage.MatchPurchase, steamID string) (string, int) {
+	var parts []string
+	total := 0
+	for _, p := range rows {
+		if p.SteamID64 != steamID {
+			continue
+		}
+		total += p.Cost
+		parts = append(parts, fmt.Sprintf("%s %s", p.Weapon, formatPurchaseTime(p.TimeSec)))
+	}
+	return strings.Join(parts, " · "), total
 }

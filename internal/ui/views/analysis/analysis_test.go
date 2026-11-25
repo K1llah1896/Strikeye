@@ -367,3 +367,30 @@ func TestKillFeedRendersOfficialWeaponAndModifierSVGs(t *testing.T) {
 		t.Fatalf("expected attacker and victim names in killfeed")
 	}
 }
+
+func TestBuildHeatmapPointsSetupSamplesAtTwentySeconds(t *testing.T) {
+	rounds := []storage.MatchRound{{RoundNumber: 1, FreezeEndTick: 1000, TeamASide: "T", TeamBSide: "CT"}}
+	replays := map[int]parser.ReplayRoundData{
+		1: {
+			RoundNumber: 1,
+			Frames: []parser.ReplayFrame{
+				{Tick: 1000, Players: []parser.ReplayPlayerPose{
+					{Slot: 1, Alive: true, Team: 1, X: -900, Y: -900},
+					{Slot: 2, Alive: true, Team: 2, X: 900, Y: 900},
+				}},
+				{Tick: 1640, Players: []parser.ReplayPlayerPose{
+					{Slot: 1, Alive: true, Team: 1, X: 120, Y: 240},
+					{Slot: 2, Alive: false, Team: 2, X: 0, Y: 0},
+				}},
+			},
+		},
+	}
+	pts := BuildHeatmapPointsMulti(nil, rounds, nil, replays, HeatmapFilter{Mode: "setup", TickRate: 32})
+	if len(pts) != 1 || pts[0].X != 120 || pts[0].Y != 240 {
+		t.Fatalf("setup points = %+v, want the alive player at 20s", pts)
+	}
+	ct := BuildHeatmapPointsMulti(nil, rounds, nil, replays, HeatmapFilter{Mode: "setup", TickRate: 32, Team: "CT"})
+	if len(ct) != 0 {
+		t.Fatalf("dead CT should not be sampled, got %+v", ct)
+	}
+}

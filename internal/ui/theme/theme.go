@@ -28,33 +28,33 @@ func ColorEffect(pos vec2, color vec4) vec4 {
 
 // Default Spatial Obsidian color tokens.
 var (
-	BgBase       = ui.Hex("#05070B") // Deep obsidian spatial canvas
-	BgSurface    = ui.RGBA(15, 20, 30, 0.78) // Translucent glass card surface
-	BgElevated   = ui.RGBA(24, 32, 48, 0.86) // Hover / elevated glass panel
-	BgInput      = ui.RGBA(9, 13, 21, 0.85)  // Input / recessed glass well
+	BgBase       = ui.Hex("#05070B")            // Deep obsidian spatial canvas
+	BgSurface    = ui.RGBA(15, 20, 30, 0.78)    // Translucent glass card surface
+	BgElevated   = ui.RGBA(24, 32, 48, 0.86)    // Hover / elevated glass panel
+	BgInput      = ui.RGBA(9, 13, 21, 0.85)     // Input / recessed glass well
 	BorderSubtle = ui.RGBA(255, 255, 255, 0.09) // Luminous hairline glass rim
 	RimBorder    = ui.RGBA(255, 255, 255, 0.09) // Specular glass edge highlight
-	TextPrimary  = ui.Hex("#F8FAFC") // Crisp primary text
-	TextMuted    = ui.Hex("#8B98AD") // Secondary label text
-	AccentAmber  = ui.Hex("#38BDF8") // Primary highlight / action accent (ice cyan)
-	AccentCyan   = ui.Hex("#22D3EE") // Secondary data / active accent
-	StatusGreen  = ui.Hex("#22C55E") // Ready / verified
-	StatusYellow = ui.Hex("#EAB308") // Queued / pending
-	StatusRed    = ui.Hex("#EF4444") // Failed / error
-	StatusGray   = ui.Hex("#64748B") // Unrendered / idle
-	TeamCT       = ui.Hex("#38BDF8") // Counter-Terrorist blue
-	TeamT        = ui.Hex("#F59E0B") // Terrorist amber
+	TextPrimary  = ui.Hex("#F8FAFC")            // Crisp primary text
+	TextMuted    = ui.Hex("#8B98AD")            // Secondary label text
+	AccentAmber  = ui.Hex("#38BDF8")            // Primary highlight / action accent (ice cyan)
+	AccentCyan   = ui.Hex("#22D3EE")            // Secondary data / active accent
+	StatusGreen  = ui.Hex("#22C55E")            // Ready / verified
+	StatusYellow = ui.Hex("#EAB308")            // Queued / pending
+	StatusRed    = ui.Hex("#EF4444")            // Failed / error
+	StatusGray   = ui.Hex("#64748B")            // Unrendered / idle
+	TeamCT       = ui.Hex("#38BDF8")            // Counter-Terrorist blue
+	TeamT        = ui.Hex("#F59E0B")            // Terrorist amber
 
-	themeMu        sync.RWMutex
-	activeIsDark   = true
-	accentHover    = ui.Hex("#7DD3FC")
-	accentPressed  = ui.Hex("#0284C7")
-	accentText     = ui.Hex("#05070B")
-	overlayColor   = ui.RGBA(5, 7, 11, 0.72)
-	bgImagePath    string
-	bgBitmap       *ui.Bitmap
-	hasGradient    = true
-	bgGradient     = ui.LinearGradient{
+	themeMu       sync.RWMutex
+	activeIsDark  = true
+	accentHover   = ui.Hex("#7DD3FC")
+	accentPressed = ui.Hex("#0284C7")
+	accentText    = ui.Hex("#05070B")
+	overlayColor  = ui.RGBA(5, 7, 11, 0.72)
+	bgImagePath   string
+	bgBitmap      *ui.Bitmap
+	hasGradient   = true
+	bgGradient    = ui.LinearGradient{
 		Angle: 135,
 		Stops: []ui.GradientStop{
 			{Color: ui.Hex("#05070B"), At: 0},

@@ -12,14 +12,14 @@ import (
 
 // EconomyKPIs summarizes team-level tactical and economy conversion rates.
 type EconomyKPIs struct {
-	PistolAWins, PistolTotal           int
-	ConversionAWins, ConversionTotal   int
-	FullVsFullAWins, FullVsFullTotal   int
-	ForceVsFullWins, ForceVsFullTotal  int
-	EcoVsFullWins, EcoVsFullTotal      int
-	PostPlantWins, PostPlantTotal      int
-	SiteAWins, SiteATotal              int
-	SiteBWins, SiteBTotal              int
+	PistolAWins, PistolTotal          int
+	ConversionAWins, ConversionTotal  int
+	FullVsFullAWins, FullVsFullTotal  int
+	ForceVsFullWins, ForceVsFullTotal int
+	EcoVsFullWins, EcoVsFullTotal     int
+	PostPlantWins, PostPlantTotal     int
+	SiteAWins, SiteATotal             int
+	SiteBWins, SiteBTotal             int
 }
 
 func isTeamAKey(key, teamAName string) bool {

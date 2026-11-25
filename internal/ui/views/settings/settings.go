@@ -14,6 +14,7 @@ import (
 
 	"github.com/egoist/mygo/ui"
 	"strikeye/internal/config"
+	"strikeye/internal/sqlconsole"
 	"strikeye/internal/storage"
 	"strikeye/internal/ui/theme"
 	"strikeye/internal/updater"
@@ -27,15 +28,15 @@ type AgentCaller interface {
 
 // View manages Settings & Tasks state and rendering.
 type View struct {
-	db          *storage.DB
-	agent       AgentCaller
-	dataRoot    string
-	cfg         config.Config
-	probe       config.ProbeReport
-	resChoice   string
-	fpsChoice   string
-	aliasesText string
-	watchDirsTx string
+	db              *storage.DB
+	agent           AgentCaller
+	dataRoot        string
+	cfg             config.Config
+	probe           config.ProbeReport
+	resChoice       string
+	fpsChoice       string
+	aliasesText     string
+	watchDirsTx     string
 	tasks           []storage.RenderTask
 	taskFilter      string
 	agentLogs       string
@@ -60,6 +61,26 @@ type View struct {
 	onInvalidate   func()
 	onRestart      func()
 	onTasksChanged func()
+
+	// mapDataBusy guards the single in-flight navmesh/callout download.
+	mapDataBusy      bool
+	mapDataNavCount  int
+	mapDataGeometry  int
+	mapDataCallouts  int64
+	mapDataCheckedAt time.Time
+
+	// GSI setup state
+	gsiListen   string
+	gsiToken    string
+	gsiMsg      string
+	gsiReceiver *gsiReceiver
+
+	// read-only SQL console state
+	sqlQuery  string
+	sqlPreset string
+	sqlResult sqlconsole.Result
+	sqlErr    string
+	sqlBusy   bool
 }
 
 // SetCallbacks registers UI invalidation and app restart callbacks for async update flows.
@@ -125,6 +146,7 @@ func NewView(db *storage.DB, agent AgentCaller, dataRoot string) *View {
 		agent:      agent,
 		dataRoot:   dataRoot,
 		taskFilter: "全部任务",
+		gsiListen:  "127.0.0.1:3000",
 	}
 	_ = v.Reload(context.Background())
 	return v
@@ -457,6 +479,10 @@ func (v *View) Render(c *ui.Context) {
 					v.renderTaskRow(c, t)
 				}
 			})
+
+			v.renderGSICard(c)
+			v.renderMapDataCard(c)
+			v.renderSQLConsole(c)
 
 			// 5. Appearance & Theme Customization
 			theme.Card(c, func() {

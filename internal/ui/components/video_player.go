@@ -16,12 +16,12 @@ import (
 
 // TimelineAnchor represents a clickable match event marker on the player timeline.
 type TimelineAnchor struct {
-	EventID   int64
-	Tick      int64
-	TimeSec   float64
-	Kind      string // "kill", "death", "teammate_kill", "bomb_plant", "bomb_defuse", "bomb_explode"
-	Label     string
-	RoundNum  int
+	EventID  int64
+	Tick     int64
+	TimeSec  float64
+	Kind     string // "kill", "death", "teammate_kill", "bomb_plant", "bomb_defuse", "bomb_explode"
+	Label    string
+	RoundNum int
 }
 
 // FFmpegVideoSeeker implements ui.VideoSeeker by streaming scaled RGBA frames from ffmpeg.

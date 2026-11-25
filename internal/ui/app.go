@@ -38,10 +38,10 @@ const (
 
 // AppOptions configures the main Strikeye MyGo Native UI shell.
 type AppOptions struct {
-	DataRoot   string
-	DB         *storage.DB
-	Agent      *ipc.Client
-	OnExitNow  func()
+	DataRoot  string
+	DB        *storage.DB
+	Agent     *ipc.Client
+	OnExitNow func()
 }
 
 const strikeyeGitHubURL = "https://github.com/K1llah1896/Strikeye"
@@ -408,6 +408,9 @@ func (a *App) RestartForUpdate() {
 
 // Close releases view resources (such as active video decoders and replay tickers).
 func (a *App) Close() {
+	if a.settingsView != nil {
+		a.settingsView.Close()
+	}
 	if a.analysisView != nil {
 		a.analysisView.Close()
 	}

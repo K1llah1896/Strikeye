@@ -5,12 +5,17 @@ package library
 import (
 	"context"
 	"fmt"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/egoist/mygo/ui"
 	"strikeye/internal/config"
+	"strikeye/internal/gcpd"
+	"strikeye/internal/gsi"
+	"strikeye/internal/launcher"
+	"strikeye/internal/series"
 	"strikeye/internal/storage"
 	"strikeye/internal/ui/theme"
 	"strikeye/internal/watcher"
@@ -38,12 +43,21 @@ type FilterCriteria struct {
 	Platform      string
 	ParseStatus   string
 	FavoritesOnly bool
+	GroupBySeries bool
+	// ExtraDemoIDs extends the keyword match with full-text index hits (annotation
+	// notes, team names, players of demos whose cards would not otherwise match).
+	ExtraDemoIDs map[int64]bool
 }
 
 // MatchEntry pairs a Demo row with pre-fetched player names and video counts for fast filtering.
 type MatchEntry struct {
-	Demo           storage.Demo
-	PlayerNames    []string
+	Demo        storage.Demo
+	PlayerNames []string
+	PlayerTags  []string
+	// BannedPlayers counts accounts with a cached ban snapshot (VAC, community or
+	// game ban). Zero also means "no snapshot yet", which is why the UI only
+	// shows a badge for positive counts.
+	BannedPlayers  int
 	HighlightCount int
 	POVCount       int
 }
@@ -56,19 +70,33 @@ type ParseProgressInfo struct {
 
 // View manages Match Library state and rendering.
 type View struct {
-	mu               sync.RWMutex
-	db               *storage.DB
-	agent            AgentCaller
-	dataRoot         string
-	entries          []MatchEntry
-	parseProgress    map[int64]ParseProgressInfo
-	filter           FilterCriteria
-	manualPath       string
-	showManualImport bool
-	editingID        int64
-	remarkDraft      string
-	statusMsg        string
-	onNavigate       func(target NavTarget, demoID int64)
+	mu                sync.RWMutex
+	db                *storage.DB
+	agent             AgentCaller
+	dataRoot          string
+	live              gsi.State
+	liveOK            bool
+	liveChecked       time.Time
+	entries           []MatchEntry
+	parseProgress     map[int64]ParseProgressInfo
+	filter            FilterCriteria
+	manualPath        string
+	showManualImport  bool
+	showSteamDownload bool
+	steamCookieDraft  string
+	steamTab          string
+	steamLimit        int
+	steamBusy         bool
+	sharecodeDraft    string
+	apiKeyDraft       string
+	showAPIKeyPrompt  bool
+	editingID         int64
+	remarkDraft       string
+	statusMsg         string
+	ftsIDs            map[int64]bool
+	ftsQuery          string
+	ftsPending        bool
+	onNavigate        func(target NavTarget, demoID int64)
 }
 
 // NewView constructs a Match Library view.
@@ -78,10 +106,12 @@ func NewView(db *storage.DB, agent AgentCaller, dataRoot string, onNavigate func
 		agent:         agent,
 		dataRoot:      dataRoot,
 		parseProgress: make(map[int64]ParseProgressInfo),
+		steamTab:      gcpd.Tabs[0],
+		steamLimit:    3,
 		onNavigate:    onNavigate,
 		filter: FilterCriteria{
 			Map:         "全部地图",
-			Platform:    "全部平台",
+			Platform:    allPlatformsOption,
 			ParseStatus: "全部状态",
 		},
 	}
@@ -129,12 +159,31 @@ func (v *View) Refresh(ctx context.Context) error {
 		}
 		players, _ := v.db.Analysis().ListMatchPlayers(ctx, d.ID)
 		names := make([]string, 0, len(players))
+		ids := make([]string, 0, len(players))
 		for _, p := range players {
 			names = append(names, p.PlayerName)
+			if p.SteamID64 != "" {
+				ids = append(ids, p.SteamID64)
+			}
 		}
+		tagMap, _ := v.db.PlayerProfiles().TagsForSteamIDs(ctx, ids)
+		tags := make([]string, 0, 4)
+		seenTag := make(map[string]bool, 4)
+		for _, p := range players {
+			for _, t := range tagMap[p.SteamID64] {
+				key := strings.ToLower(t)
+				if !seenTag[key] {
+					seenTag[key] = true
+					tags = append(tags, t)
+				}
+			}
+		}
+		bannedMap, _ := v.db.PlayerBans().BannedFor(ctx, ids)
 		entries = append(entries, MatchEntry{
 			Demo:           d,
 			PlayerNames:    names,
+			PlayerTags:     tags,
+			BannedPlayers:  len(bannedMap),
 			HighlightCount: hlCount,
 			POVCount:       povCount,
 		})
@@ -149,8 +198,80 @@ func (v *View) Refresh(ctx context.Context) error {
 func (v *View) FilteredEntries() []MatchEntry {
 	v.mu.RLock()
 	entries := v.entries
+	filter := v.filter
+	kw := strings.TrimSpace(filter.Keyword)
+	synced := kw != "" && v.ftsQuery == kw
+	ids := v.ftsIDs
 	v.mu.RUnlock()
-	return FilterMatches(entries, v.filter)
+	if kw != "" {
+		v.ensureFullTextSearch(kw)
+	}
+	if synced {
+		filter.ExtraDemoIDs = ids
+	}
+	return FilterMatches(entries, filter)
+}
+
+// ensureFullTextSearch refreshes the FTS hit set for a keyword in the
+// background. It is a no-op while a query for the same keyword is in flight,
+// so calling it from the render loop is cheap.
+func (v *View) ensureFullTextSearch(keyword string) {
+	v.mu.Lock()
+	if v.db == nil || v.ftsPending || v.ftsQuery == keyword {
+		v.mu.Unlock()
+		return
+	}
+	v.ftsPending = true
+	db := v.db
+	v.mu.Unlock()
+
+	go func() {
+		ctx := context.Background()
+		ids := make(map[int64]bool, 16)
+		if _, err := db.Search().EnsureSearchIndex(ctx); err == nil {
+			if hits, err := db.Search().Query(ctx, keyword, 500); err == nil {
+				for _, hit := range hits {
+					ids[hit.DemoID] = true
+				}
+			}
+		}
+		v.mu.Lock()
+		v.ftsIDs = ids
+		v.ftsQuery = keyword
+		v.ftsPending = false
+		v.mu.Unlock()
+	}()
+}
+
+// groupFiltered reorders filtered entries so each multi-map series is
+// contiguous, and returns the series lookup plus visible map counts per key.
+func groupFiltered(filtered []MatchEntry) ([]MatchEntry, map[int64]series.Series, map[string]int) {
+	demos := make([]storage.Demo, 0, len(filtered))
+	for _, e := range filtered {
+		demos = append(demos, e.Demo)
+	}
+	groups := series.Group(demos)
+	byID := series.ByDemoID(groups)
+	visible := make(map[string]int, len(groups))
+	for _, e := range filtered {
+		if s, ok := byID[e.Demo.ID]; ok {
+			visible[s.Key]++
+		}
+	}
+	ordered := make([]MatchEntry, 0, len(filtered))
+	for _, g := range groups {
+		for _, e := range filtered {
+			if s, ok := byID[e.Demo.ID]; ok && s.Key == g.Key {
+				ordered = append(ordered, e)
+			}
+		}
+	}
+	for _, e := range filtered {
+		if _, ok := byID[e.Demo.ID]; !ok {
+			ordered = append(ordered, e)
+		}
+	}
+	return ordered, byID, visible
 }
 
 // FilterMatches filters MatchEntry items purely in-memory for deterministic UI updates & testing.
@@ -166,13 +287,13 @@ func FilterMatches(entries []MatchEntry, f FilterCriteria) []MatchEntry {
 		if f.Map != "" && f.Map != "全部地图" && !strings.EqualFold(mapName, f.Map) {
 			continue
 		}
-		if f.Platform != "" && f.Platform != "全部平台" && !strings.EqualFold(d.SourcePlatform, f.Platform) {
+		if f.Platform != "" && f.Platform != allPlatformsOption && !platformMatches(d.SourcePlatform, f.Platform) {
 			continue
 		}
 		if f.ParseStatus != "" && f.ParseStatus != "全部状态" && !strings.EqualFold(d.ParseStatus, f.ParseStatus) {
 			continue
 		}
-		if kw != "" {
+		if kw != "" && !f.ExtraDemoIDs[d.ID] {
 			matched := strings.Contains(strings.ToLower(d.Filename), kw) ||
 				strings.Contains(strings.ToLower(mapName), kw) ||
 				strings.Contains(strings.ToLower(derefStr(d.Remark)), kw) ||
@@ -183,6 +304,14 @@ func FilterMatches(entries []MatchEntry, f FilterCriteria) []MatchEntry {
 					if strings.Contains(strings.ToLower(pn), kw) {
 						matched = true
 						break
+					}
+				}
+				if !matched {
+					for _, tag := range e.PlayerTags {
+						if strings.Contains(strings.ToLower(tag), kw) {
+							matched = true
+							break
+						}
 					}
 				}
 			}
@@ -213,7 +342,19 @@ func (v *View) mapOptions() []string {
 
 // Render draws the Match Library toolbar and scrollable match cards.
 func (v *View) Render(c *ui.Context) {
+	v.refreshLiveState()
 	ui.Column(c).Fill().Padding(14).Gap(14).Children(func() {
+		if v.liveOK {
+			theme.GlassCard(c, func() {
+				theme.RowCenter(c).FillWidth().Gap(10).Children(func() {
+					theme.StatusDot(c, theme.StatusGreen, 8)
+					ui.Text(c, "GSI 直播").Font("Rajdhani").FontSize(12).Bold().TextColor(theme.StatusGreen)
+					ui.Text(c, liveHeadline(v.live)).FontSize(12).TextColor(theme.TextPrimary)
+					ui.Spacer(c)
+					theme.MutedText(c, "来自 strikeye-cli gsi")
+				})
+			})
+		}
 		// Floating glass filter capsule bar (2-row layout so action buttons never clip at narrower widths)
 		theme.GlassCard(c, func() {
 			theme.RowCenter(c).FillWidth().Gap(8).Children(func() {
@@ -224,6 +365,21 @@ func (v *View) Render(c *ui.Context) {
 				if theme.IconActionButton(c, theme.IconPlus, "+ 手动导入 Demo").Shrink(0).Clicked() {
 					v.showManualImport = !v.showManualImport
 				}
+				if theme.IconActionButton(c, theme.IconShield, "刷新封禁").Shrink(0).Clicked() {
+					if loadSteamAPIKey(v.dataRoot) == "" {
+						v.showAPIKeyPrompt = true
+						v.statusMsg = "封禁查询需要 Steam Web API Key"
+					} else {
+						v.statusMsg = "正在查询封禁状态..."
+						go v.runBanRefreshNow()
+					}
+				}
+				if theme.IconActionButton(c, theme.IconDownload, "从 Steam 下载").Shrink(0).Clicked() {
+					v.showSteamDownload = !v.showSteamDownload
+					if v.showSteamDownload && v.steamCookieDraft == "" {
+						v.steamCookieDraft = loadSteamCookie(v.dataRoot)
+					}
+				}
 				if theme.IconActionButton(c, theme.IconRefresh, "刷新").Shrink(0).Clicked() {
 					v.scanAndRefresh(context.Background())
 				}
@@ -233,11 +389,14 @@ func (v *View) Render(c *ui.Context) {
 			})
 			theme.RowCenter(c).FillWidth().Gap(8).Children(func() {
 				ui.Select(c, &v.filter.Map, v.mapOptions())
-				ui.Select(c, &v.filter.Platform, []string{"全部平台", "valve", "faceit", "5e", "perfectworld", "custom"})
-				ui.Select(c, &v.filter.ParseStatus, []string{"全部状态", "ready", "parsing", "pending", "failed"})
+				ui.Select(c, &v.filter.Platform, platformFilterOptions())
+				ui.Select(c, &v.filter.ParseStatus, []string{"全部状态", "parsed", "parsing", "pending", "failed"})
+				ui.Checkbox(c, &v.filter.GroupBySeries, "按系列赛分组")
 				ui.Checkbox(c, &v.filter.FavoritesOnly, "仅看收藏")
 				ui.Spacer(c)
 			})
+			v.renderAPIKeyPanel(c)
+			v.renderSteamDownload(c)
 			if v.showManualImport {
 				importRow := theme.RowCenter(c).FillWidth().Gap(8).
 					Transition(ui.ElementTransition{
@@ -274,13 +433,23 @@ func (v *View) Render(c *ui.Context) {
 
 		// Match card list
 		filtered := v.FilteredEntries()
+		grouped := make(map[int64]series.Series)
+		visible := make(map[string]int)
+		if v.filter.GroupBySeries {
+			filtered, grouped, visible = groupFiltered(filtered)
+		}
 		ui.Scroll(c).FillWidth().Grow(1).MinHeight(0).Children(func() {
 			ui.Column(c).FillWidth().Gap(12).Children(func() {
 				if len(filtered) == 0 {
 					theme.EmptyStateCard(c, theme.IconLibrary, "暂无符合条件的比赛 Demo", "请将 .dem 文件放入监听目录，或在上方输入本地路径手动添加。")
 					return
 				}
+				seenSeries := make(map[string]bool)
 				for _, e := range filtered {
+					if s, ok := grouped[e.Demo.ID]; ok && visible[s.Key] >= 2 && !seenSeries[s.Key] {
+						seenSeries[s.Key] = true
+						renderSeriesHeader(c, s)
+					}
 					// Keyed wrappers let newly filtered cards fade in and moving
 					// cards glide to their new slots without rebuilding the view.
 					ui.Column(c.Key(e.Demo.ID)).FillWidth().
@@ -298,6 +467,14 @@ func (v *View) Render(c *ui.Context) {
 				}
 			})
 		})
+	})
+}
+
+func renderSeriesHeader(c *ui.Context, s series.Series) {
+	theme.RowCenter(c).FillWidth().Gap(8).PaddingX(4).Children(func() {
+		theme.PillBadge(c, "系列赛", theme.AccentCyan)
+		ui.Text(c, s.Label()).FontSize(13).Bold().TextColor(theme.TextPrimary)
+		theme.MutedText(c, fmt.Sprintf("%d 图 · %s", len(s.Maps), s.Date))
 	})
 }
 
@@ -329,6 +506,15 @@ func (v *View) renderMatchCard(c *ui.Context, e MatchEntry) {
 			ui.Spacer(c)
 			if d.IsFavorite {
 				theme.PillBadge(c, "已收藏", theme.AccentAmber)
+			}
+			for i, tag := range e.PlayerTags {
+				if i >= 3 {
+					break
+				}
+				theme.PillBadge(c, tag, theme.StatusYellow)
+			}
+			if e.BannedPlayers > 0 {
+				theme.PillBadge(c, fmt.Sprintf("封禁 %d", e.BannedPlayers), theme.StatusRed)
 			}
 			theme.PillBadge(c, theme.ParseStatusLabel(d.ParseStatus), theme.ParseStatusColor(d.ParseStatus))
 			videoBadge := "未生成视频"
@@ -405,6 +591,21 @@ func (v *View) renderMatchCard(c *ui.Context, e MatchEntry) {
 				v.editingID = d.ID
 				v.remarkDraft = derefStr(d.Remark)
 			}
+			if theme.IconActionButton(c, theme.IconDownload, "导出数据").Clicked() {
+				dir, count, err := exportDemo(context.Background(), v.db, v.dataRoot, d.ID)
+				if err != nil {
+					v.statusMsg = "导出失败: " + err.Error()
+				} else {
+					v.statusMsg = fmt.Sprintf("已导出 %d 个文件到 %s", count, dir)
+				}
+			}
+			if theme.IconActionButton(c, theme.IconPlay, "用 CS2 打开").Clicked() {
+				if err := openDemoInCS2(d, launcher.Open); err != nil {
+					v.statusMsg = "启动 CS2 失败: " + err.Error()
+				} else {
+					v.statusMsg = "已请求 CS2 载入该 demo（Steam 需在运行）"
+				}
+			}
 			ui.Spacer(c)
 			if theme.IconAccentButton(c, theme.IconSpectator, "进入独立观战").Clicked() && v.onNavigate != nil {
 				v.onNavigate(NavSpectator, d.ID)
@@ -430,7 +631,10 @@ func (v *View) scanAndRefresh(ctx context.Context) {
 				Config: cfg,
 				Probe:  probe,
 			})
-			w := watcher.New(v.db, watcher.Options{Targets: targets})
+			w := watcher.New(v.db, watcher.Options{
+				Targets:   targets,
+				ImportDir: filepath.Join(v.dataRoot, "media", "imports"),
+			})
 			if localRep, scanErr := w.ScanNowWithReport(ctx); scanErr == nil {
 				rep = localRep
 			}

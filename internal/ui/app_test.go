@@ -146,9 +146,12 @@ func TestTopRightNotificationsAndGitHub(t *testing.T) {
 
 	app := NewApp(AppOptions{DataRoot: tmp, DB: db})
 	defer app.Close()
+	// Startup may already have queued "bundled assets installed" notices, so the
+	// assertion is about the increment, not an absolute count.
+	baseline := app.UnreadNotificationCount()
 	app.AddNotification("Demo 解析完成", "de_mirage 已就绪", theme.StatusGreen)
-	if app.UnreadNotificationCount() != 1 {
-		t.Fatalf("expected 1 unread notification, got %d", app.UnreadNotificationCount())
+	if app.UnreadNotificationCount() != baseline+1 {
+		t.Fatalf("expected %d unread notifications, got %d", baseline+1, app.UnreadNotificationCount())
 	}
 
 	tt := mygoui.NewTester(app.Render, 1360, 840)

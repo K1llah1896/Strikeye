@@ -111,7 +111,7 @@ func Run(ctx context.Context, dataRoot, pipeOverride string) error {
 
 // NewService constructs an agent Service with all JSON-RPC handlers registered.
 func NewService(dataRoot string, cfg config.Config, db *storage.DB) *Service {
-	probe := config.ProbeToolchain(config.ProbeOptions{Configured: cfg.Paths})
+	probe := config.ProbeToolchain(config.ProbeOptions{Configured: cfg.Paths, DataRoot: dataRoot})
 	rpcSrv := ipc.NewServer()
 	lockDir := filepath.Join(dataRoot, "cache")
 	svc := &Service{
@@ -299,7 +299,7 @@ func (s *Service) registerRPCHandlers() {
 			return nil, err
 		}
 		s.cfg = cfg
-		s.probe = config.ProbeToolchain(config.ProbeOptions{Configured: cfg.Paths})
+		s.probe = config.ProbeToolchain(config.ProbeOptions{Configured: cfg.Paths, DataRoot: s.dataRoot})
 		if s.watcher != nil {
 			targets := watcher.DiscoverWatchTargets(watcher.DiscoverOptions{
 				Config: cfg,

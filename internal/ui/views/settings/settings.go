@@ -14,8 +14,10 @@ import (
 
 	"github.com/egoist/mygo/ui"
 	"strikeye/internal/config"
+	"strikeye/internal/mapassets"
 	"strikeye/internal/sqlconsole"
 	"strikeye/internal/storage"
+	"strikeye/internal/toolbundle"
 	"strikeye/internal/ui/theme"
 	"strikeye/internal/updater"
 	"strikeye/internal/version"
@@ -159,7 +161,7 @@ func (v *View) Reload(ctx context.Context) error {
 		return err
 	}
 	v.cfg = cfg
-	v.probe = config.ProbeToolchain(config.ProbeOptions{Configured: cfg.Paths})
+	v.probe = config.ProbeToolchain(config.ProbeOptions{Configured: cfg.Paths, DataRoot: v.dataRoot})
 	v.resChoice = fmt.Sprintf("%dx%d", cfg.Render.Width, cfg.Render.Height)
 	v.fpsChoice = fmt.Sprintf("%d", cfg.Render.FPS)
 	v.aliasesText = strings.Join(cfg.PrimaryPlayerAliases, ", ")
@@ -355,17 +357,13 @@ func (v *View) Render(c *ui.Context) {
 					theme.SectionTitle(c, "1. 环境检测与工具路径")
 					ui.Spacer(c)
 					if !toolBusy && (!v.probe.HLAE.Available || !v.probe.AfxHookSource2.Available) {
-						if theme.ActionButton(c, "下载安装 HLAE").Clicked() {
-							v.startInstallTool(updater.ToolHLAE)
-						}
+						v.toolInstallButtons(c, updater.ToolHLAE, "HLAE")
 					}
 					if !toolBusy && (!v.probe.FFmpeg.Available || !v.probe.FFprobe.Available) {
-						if theme.ActionButton(c, "下载安装 FFmpeg").Clicked() {
-							v.startInstallTool(updater.ToolFFmpeg)
-						}
+						v.toolInstallButtons(c, updater.ToolFFmpeg, "FFmpeg")
 					}
 					if theme.IconActionButton(c, theme.IconRefresh, "重新探测").Clicked() {
-						v.probe = config.ProbeToolchain(config.ProbeOptions{Configured: v.cfg.Paths})
+						v.probe = config.ProbeToolchain(config.ProbeOptions{Configured: v.cfg.Paths, DataRoot: v.dataRoot})
 					}
 				})
 				ffmpegLabel := "ffmpeg"
@@ -575,6 +573,99 @@ func (v *View) Render(c *ui.Context) {
 	})
 }
 
+// toolInstallButtons offers the bundled install first and only exposes the
+// network download when this build has no sidecar for the tool.
+func (v *View) toolInstallButtons(c *ui.Context, toolID, label string) {
+	if theme.ActionButton(c, "从内置包安装 "+label).Clicked() {
+		v.startProvisionBundledTools(toolID)
+		return
+	}
+	if _, ok := toolbundle.Find(v.dataRoot, mapassets.ExeDir(), toolID); ok {
+		return
+	}
+	if theme.ActionButton(c, "联网安装 "+label).Clicked() {
+		v.startInstallTool(toolID)
+	}
+}
+
+// startProvisionBundledTools stages a tool from the archive that ships with the
+// package. No network is involved: when the sidecar is missing this reports
+// where it expects to find it instead of silently falling back to a download.
+func (v *View) startProvisionBundledTools(toolID string) {
+	v.updateMu.Lock()
+	if v.toolBusy {
+		v.updateMu.Unlock()
+		return
+	}
+	v.toolBusy = true
+	v.toolProgress = 0.1
+	v.toolStage = "正在解压内置 " + strings.ToUpper(toolID) + " 包..."
+	v.toolError = ""
+	dataRoot := v.dataRoot
+	cfgCopy := v.cfg
+	v.updateMu.Unlock()
+	v.invalidate()
+
+	go func() {
+		archive, ok := toolbundle.Find(dataRoot, mapassets.ExeDir(), toolID)
+		if !ok {
+			v.updateMu.Lock()
+			v.toolBusy = false
+			v.toolError = fmt.Sprintf("本安装包未附带 %s（期望文件名 %s）：源码构建请运行 `strikeye-cli assets-pack --tools-out <发布目录>`",
+				toolID, toolbundle.ArchiveName(toolID))
+			v.updateMu.Unlock()
+			v.invalidate()
+			return
+		}
+		res, err := updater.InstallToolFromArchive(toolID, archive, dataRoot, func(st string, p float64) {
+			v.updateMu.Lock()
+			v.toolStage = st
+			v.toolProgress = p
+			v.updateMu.Unlock()
+			v.invalidate()
+		})
+		if err != nil {
+			v.updateMu.Lock()
+			v.toolBusy = false
+			v.toolError = err.Error()
+			v.updateMu.Unlock()
+			v.invalidate()
+			return
+		}
+		applyToolResult(&cfgCopy, res)
+		_ = config.Save(dataRoot, cfgCopy)
+		probeRep := config.ProbeToolchain(config.ProbeOptions{Configured: cfgCopy.Paths, DataRoot: v.dataRoot})
+		pathsCopy := cfgCopy.Paths
+
+		v.updateMu.Lock()
+		v.toolBusy = false
+		v.pendingPaths = &pathsCopy
+		v.pendingProbe = &probeRep
+		v.pendingStatus = strings.ToUpper(toolID) + " 已从内置包安装并配置完成"
+		v.updateMu.Unlock()
+		if v.agent != nil {
+			_ = v.agent.Call(context.Background(), "config.reload", nil, nil)
+		}
+		v.invalidate()
+	}()
+}
+
+// applyToolResult copies staged binary paths into the config being saved.
+func applyToolResult(cfg *config.Config, res updater.InstallToolResult) {
+	if res.HLAEExe != "" {
+		cfg.Paths.HLAEExe = res.HLAEExe
+	}
+	if res.AfxHookSource2DLL != "" {
+		cfg.Paths.AfxHookSource2DLL = res.AfxHookSource2DLL
+	}
+	if res.FFmpegExe != "" {
+		cfg.Paths.FFmpegExe = res.FFmpegExe
+	}
+	if res.FFprobeExe != "" {
+		cfg.Paths.FFprobeExe = res.FFprobeExe
+	}
+}
+
 func (v *View) startInstallTool(toolID string) {
 	v.updateMu.Lock()
 	if v.toolBusy {
@@ -610,20 +701,9 @@ func (v *View) startInstallTool(toolID string) {
 			v.invalidate()
 			return
 		}
-		if res.HLAEExe != "" {
-			cfgCopy.Paths.HLAEExe = res.HLAEExe
-		}
-		if res.AfxHookSource2DLL != "" {
-			cfgCopy.Paths.AfxHookSource2DLL = res.AfxHookSource2DLL
-		}
-		if res.FFmpegExe != "" {
-			cfgCopy.Paths.FFmpegExe = res.FFmpegExe
-		}
-		if res.FFprobeExe != "" {
-			cfgCopy.Paths.FFprobeExe = res.FFprobeExe
-		}
+		applyToolResult(&cfgCopy, res)
 		_ = config.Save(dataRoot, cfgCopy)
-		probeRep := config.ProbeToolchain(config.ProbeOptions{Configured: cfgCopy.Paths})
+		probeRep := config.ProbeToolchain(config.ProbeOptions{Configured: cfgCopy.Paths, DataRoot: v.dataRoot})
 		pathsCopy := cfgCopy.Paths
 
 		v.updateMu.Lock()

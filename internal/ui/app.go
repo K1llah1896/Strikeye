@@ -14,7 +14,9 @@ import (
 	mygoui "github.com/egoist/mygo/ui"
 	"strikeye/internal/config"
 	"strikeye/internal/ipc"
+	"strikeye/internal/mapassets"
 	"strikeye/internal/storage"
+	"strikeye/internal/toolbundle"
 	"strikeye/internal/ui/theme"
 	"strikeye/internal/ui/views/analysis"
 	"strikeye/internal/ui/views/highlights"
@@ -87,7 +89,15 @@ type App struct {
 func NewApp(opts AppOptions) *App {
 	cfg, _, _ := config.Load(opts.DataRoot)
 	theme.Apply(cfg.Theme)
-	probe := config.ProbeToolchain(config.ProbeOptions{Configured: cfg.Paths})
+	// External tools ship as sidecars next to the executables: stage them before
+	// the very first probe so rendering, montage and recording work on a fresh
+	// install without anyone opening the settings page. The extract is a one-off
+	// (2-3s with the real archives); later launches short-circuit in ~1ms.
+	toolRep, toolErr := toolbundle.Provision(opts.DataRoot, mapassets.ExeDir())
+	// Same for the map datasets: ~8.5 MB of nav meshes plus the callout table,
+	// written before the first view can ask for them (~50 ms once installed).
+	assetRep, assetErr := mapassets.Install(opts.DataRoot, mapassets.ExeDir())
+	probe := config.ProbeToolchain(config.ProbeOptions{Configured: cfg.Paths, DataRoot: opts.DataRoot})
 
 	var caller library.AgentCaller
 	if opts.Agent != nil {
@@ -120,6 +130,20 @@ func NewApp(opts AppOptions) *App {
 		app.invalidateWindow()
 	})
 	app.refreshQueuedCount()
+
+	if assetErr != nil {
+		app.AddNotification("内置地图数据未就绪", assetErr.Error(), theme.StatusRed)
+	} else if assetRep.NavsWritten > 0 || assetRep.CalloutsWritten {
+		app.AddNotification("内置地图数据已安装",
+			fmt.Sprintf("导航网格 %d 张 · callout 表已写入", assetRep.NavsWritten+assetRep.NavsPresent),
+			theme.StatusGreen)
+	}
+
+	if toolErr != nil {
+		app.AddNotification("内置工具未就绪", toolErr.Error(), theme.StatusRed)
+	} else if len(toolRep.Installed) > 0 {
+		app.AddNotification("内置工具已安装", toolRep.Summary(), theme.StatusGreen)
+	}
 
 	if cfg.Update.AutoCheck {
 		go func() {

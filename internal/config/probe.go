@@ -35,6 +35,10 @@ type ProbeOptions struct {
 	ExtraSearchDirs []string
 	EnvLookup       func(string) string
 	SkipSystemPATH  bool
+	// DataRoot enables discovery of tools staged from the archives that ship
+	// with the package (<DataRoot>/tools/<tool>), so a fresh install finds
+	// FFmpeg/HLAE without anyone filling in paths.
+	DataRoot string
 }
 
 var vdfPathRegexp = regexp.MustCompile(`"path"\s+"([^"]*)"`)
@@ -207,6 +211,7 @@ func hlaeCandidates(opts ProbeOptions) []string {
 	for _, d := range opts.ExtraSearchDirs {
 		out = append(out, filepath.Join(d, "HLAE.exe"), filepath.Join(d, "hlae", "HLAE.exe"))
 	}
+	out = append(out, stagedToolCandidates(opts, "hlae", "HLAE.exe")...)
 	out = append(out, platformHLAECandidates(opts.EnvLookup)...)
 	return out
 }
@@ -231,12 +236,47 @@ func toolCandidates(base string, opts ProbeOptions) []string {
 			out = append(out, filepath.Join(d, base+".exe"), filepath.Join(d, "bin", base+".exe"))
 		}
 	}
+	out = append(out, stagedToolCandidates(opts, base, exeName)...)
 	if !opts.SkipSystemPATH {
 		if found, err := exec.LookPath(base); err == nil {
 			out = append(out, found)
 		}
 	}
 	out = append(out, platformMediaToolCandidates(base, opts.EnvLookup)...)
+	return out
+}
+
+// stagedToolCandidates globs the bundled-tool staging directory so binaries
+// extracted from <tool>-windows-amd64.zip are found at their archive layout
+// (<DataRoot>/tools/<tool>[/<build>]/[bin/]<exe>).
+func stagedToolCandidates(opts ProbeOptions, tool, exeName string) []string {
+	root := strings.TrimSpace(opts.DataRoot)
+	if root == "" {
+		return nil
+	}
+	base := filepath.Join(filepath.Clean(root), "tools", tool)
+	names := []string{exeName}
+	if !strings.HasSuffix(strings.ToLower(exeName), ".exe") {
+		names = append(names, exeName+".exe")
+	}
+	var patterns []string
+	for _, name := range names {
+		patterns = append(patterns,
+			filepath.Join(base, name),
+			filepath.Join(base, "bin", name),
+			filepath.Join(base, "*", name),
+			filepath.Join(base, "*", "bin", name),
+			filepath.Join(base, "*", "*", "bin", name),
+		)
+	}
+	var out []string
+	for _, pattern := range patterns {
+		matches, err := filepath.Glob(pattern)
+		if err != nil {
+			continue
+		}
+		out = append(out, matches...)
+	}
 	return out
 }
 

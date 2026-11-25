@@ -626,7 +626,7 @@ func (v *View) scanAndRefresh(ctx context.Context) {
 	if !scannedViaAgent && v.db != nil && v.dataRoot != "" {
 		cfg, _, err := config.Load(v.dataRoot)
 		if err == nil {
-			probe := config.ProbeToolchain(config.ProbeOptions{Configured: cfg.Paths})
+			probe := config.ProbeToolchain(config.ProbeOptions{Configured: cfg.Paths, DataRoot: v.dataRoot})
 			targets := watcher.DiscoverWatchTargets(watcher.DiscoverOptions{
 				Config: cfg,
 				Probe:  probe,

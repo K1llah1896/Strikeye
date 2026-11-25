@@ -1,0 +1,106 @@
+name: CI
+
+# Gate every push and pull request: formatting, vet, tests, cross-compilation and
+# the OpenSpec contract. The release workflow only runs on tags, so without this
+# a broken parse pipeline could reach a release without any gate.
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Pinned to the version the specs were authored against; a newer CLI can
+  # change validation rules and fail specs that are otherwise intact.
+  OPENSPEC_VERSION: "1.15.0"
+
+jobs:
+  test:
+    name: Vet, test, cross-build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Verify formatting
+        run: |
+          set -euo pipefail
+          unformatted="$(gofmt -l ./cmd ./internal)"
+          if [[ -n "${unformatted}" ]]; then
+            echo "::error::gofmt needed on:"; echo "${unformatted}"; exit 1
+          fi
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Test
+        run: go test ./... -count=1 -timeout 20m
+
+      - name: Cross-compile
+        run: |
+          set -euo pipefail
+          for target in linux/amd64 darwin/arm64 windows/amd64; do
+            goos="${target%/*}"; goarch="${target#*/}"
+            echo "building ${target}"
+            GOOS="${goos}" GOARCH="${goarch}" go build ./...
+          done
+
+  specs:
+    name: OpenSpec validate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install openspec
+        run: npm install --global "@fission-ai/openspec@${OPENSPEC_VERSION}"
+
+      - name: Validate specs
+        run: openspec validate --all --strict
+
+  corpus:
+    name: Metric regression corpus
+    # Fixture metrics depend on downloaded map geometry, so this job is opt-in
+    # via workflow_dispatch to keep pull-request runs hermetic.
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build CLI
+        run: go build -o bin/strikeye-cli ./cmd/strikeye-cli
+
+      - name: Fetch map geometry
+        run: |
+          set -euo pipefail
+          ./bin/strikeye-cli maps-fetch --data-root .ci-data --map de_ancient --map de_dust2
+
+      - name: Compare against golden snapshots
+        run: |
+          set -euo pipefail
+          ./bin/strikeye-cli corpus --geometry-dir .ci-data/cache/map_geometry

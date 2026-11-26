@@ -2,6 +2,8 @@ package main
 
 import (
 	"archive/zip"
+	"bytes"
+	"compress/gzip"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -29,6 +31,7 @@ type assetsPackOptions struct {
 	SkipNav     bool
 	SkipGeom    bool
 	SkipTools   bool
+	AllGeometry bool
 	BaseURL     string
 	ToolsAPI    string
 }
@@ -80,7 +83,7 @@ func runAssetsPack(ctx context.Context, opts assetsPackOptions, out io.Writer) e
 			return fmt.Errorf("create geometry dir: %w", err)
 		}
 		bundle := filepath.Join(geomOut, mapassets.GeometryBundleName)
-		maps, size, err := packGeometry(ctx, client, opts.BaseURL, bundle)
+		maps, size, err := packGeometry(ctx, client, opts.BaseURL, bundle, opts.AllGeometry)
 		if err != nil {
 			return err
 		}
@@ -103,8 +106,9 @@ func runAssetsPack(ctx context.Context, opts assetsPackOptions, out io.Writer) e
 	return enc.Encode(res)
 }
 
-// packTools downloads the external tool archives that Strikeye would otherwise
-// fetch on demand, so the release package can ship them as sidecars.
+// packTools produces the external tool sidecars a fresh install unpacks on
+// first run: the upstream HLAE zip verbatim, and a slimmed FFmpeg tar.zst that
+// holds only ffmpeg.exe/ffprobe.exe (see toolbundle.PackFFmpeg).
 func packTools(ctx context.Context, client *http.Client, outDir, api string, usePinned bool) ([]string, error) {
 	if err := os.MkdirAll(outDir, 0o755); err != nil {
 		return nil, fmt.Errorf("create tools dir: %w", err)
@@ -118,8 +122,32 @@ func packTools(ctx context.Context, client *http.Client, outDir, api string, use
 			continue
 		}
 		fmt.Fprintf(os.Stderr, "fetching %s archive...\n", tool)
+		url, pinned := toolbundle.PinnedURL(tool)
+		if tool == updater.ToolFFmpeg {
+			// Upstream only ships a zip full of ffplay.exe and docs; rewrite it
+			// into the slim solid tar.zst the app actually ships.
+			upstream := dest + ".upstream.zip"
+			var fetchErr error
+			if pinned && usePinned {
+				fetchErr = updater.DownloadArchiveURL(ctx, client, url, upstream, nil)
+			} else {
+				fetchErr = updater.DownloadToolArchive(ctx, client, tool, upstream, api, nil)
+			}
+			if fetchErr != nil {
+				_ = os.Remove(upstream)
+				return written, fmt.Errorf("fetch %s archive: %w", tool, fetchErr)
+			}
+			size, packErr := toolbundle.PackFFmpeg(upstream, dest)
+			_ = os.Remove(upstream)
+			if packErr != nil {
+				return written, fmt.Errorf("pack %s archive: %w", tool, packErr)
+			}
+			fmt.Fprintf(os.Stderr, "%s: %s (%.1f MB)\n", name, dest, float64(size)/1e6)
+			written = append(written, name)
+			continue
+		}
 		var fetchErr error
-		if url, ok := toolbundle.PinnedURL(tool); ok && usePinned {
+		if pinned && usePinned {
 			fetchErr = updater.DownloadArchiveURL(ctx, client, url, dest, nil)
 		} else {
 			fetchErr = updater.DownloadToolArchive(ctx, client, tool, dest, api, nil)
@@ -154,7 +182,17 @@ func packCallouts(ctx context.Context, client *http.Client, dest string) error {
 	return nil
 }
 
-func packGeometry(ctx context.Context, client *http.Client, baseURL, bundlePath string) ([]string, int64, error) {
+// packGeometry builds the geometry sidecar. By default it carries only the
+// competitive pool (internal/mapgeom.CoreMaps), which is what a fresh install
+// needs; allGeometry adds the casual and arms-race maps, and both variants stay
+// fetchable through `strikeye-cli maps-fetch`.
+//
+// Each published `.tri` is a gzip stream that re-compresses to nothing, so the
+// bundle unwraps it and stores the raw CSDAGEO payload as an xz frame instead:
+// 33% smaller than shipping the gzip files, and still a single-file, checksummed
+// artifact per map. The encoding is recorded in the manifest; the extractor
+// inflates it while verifying the checksum of the extracted bytes.
+func packGeometry(ctx context.Context, client *http.Client, baseURL, bundlePath string, allGeometry bool) ([]string, int64, error) {
 	if baseURL == "" {
 		baseURL = mapgeom.DefaultBaseURL
 	}
@@ -163,6 +201,18 @@ func packGeometry(ctx context.Context, client *http.Client, baseURL, bundlePath 
 		return nil, 0, err
 	}
 	names := manifest.MapNames()
+	if !allGeometry {
+		filtered := make([]string, 0, len(mapgeom.CoreMaps))
+		for _, name := range names {
+			if mapgeom.IsCoreMap(name) {
+				filtered = append(filtered, name)
+			}
+		}
+		if len(filtered) == 0 {
+			return nil, 0, fmt.Errorf("geometry manifest has none of the %d core maps", len(mapgeom.CoreMaps))
+		}
+		names = filtered
+	}
 	workDir, err := os.MkdirTemp("", "strikeye-geom-")
 	if err != nil {
 		return nil, 0, err
@@ -170,11 +220,26 @@ func packGeometry(ctx context.Context, client *http.Client, baseURL, bundlePath 
 	defer os.RemoveAll(workDir)
 
 	base := strings.TrimRight(baseURL, "/")
+	entries := make(map[string]mapassets.GeometryEntry, len(names))
 	for _, name := range names {
 		entry := manifest.Maps[name]
 		dest := filepath.Join(workDir, name+mapgeom.Extension)
 		if err := downloadPinned(ctx, client, base+"/"+entry.File, dest, entry.Size, entry.SHA256); err != nil {
 			return nil, 0, fmt.Errorf("fetch geometry %s: %w", name, err)
+		}
+		payload, err := geometryPayload(dest)
+		if err != nil {
+			return nil, 0, fmt.Errorf("decode geometry %s: %w", name, err)
+		}
+		sum := sha256.Sum256(payload)
+		entries[name] = mapassets.GeometryEntry{
+			File:     name + mapgeom.Extension,
+			Size:     int64(len(payload)),
+			SHA256:   hex.EncodeToString(sum[:]),
+			Encoding: mapassets.GeometryEncodingXZ,
+		}
+		if err := os.WriteFile(dest, payload, 0o644); err != nil {
+			return nil, 0, err
 		}
 	}
 
@@ -184,15 +249,14 @@ func packGeometry(ctx context.Context, client *http.Client, baseURL, bundlePath 
 		return nil, 0, err
 	}
 	zw := zip.NewWriter(f)
-	// Ship the dataset manifest verbatim so the extractor can verify each map
-	// without a second network call.
-	if err := writeJSONToZip(zw, "manifest.json", manifest); err != nil {
+	manifestJSON := mapassets.BundleManifest(entries)
+	if err := writeBytesToZip(zw, "manifest.json", manifestJSON); err != nil {
 		_ = f.Close()
 		_ = os.Remove(tmp)
 		return nil, 0, err
 	}
 	for _, name := range names {
-		if err := writeFileToZip(zw, name+mapgeom.Extension, filepath.Join(workDir, name+mapgeom.Extension)); err != nil {
+		if err := writeCompressedToZip(zw, name+mapgeom.Extension+".xz", filepath.Join(workDir, name+mapgeom.Extension)); err != nil {
 			_ = f.Close()
 			_ = os.Remove(tmp)
 			return nil, 0, err
@@ -219,37 +283,52 @@ func packGeometry(ctx context.Context, client *http.Client, baseURL, bundlePath 
 	return names, info.Size(), nil
 }
 
-func writeJSONToZip(zw *zip.Writer, name string, v any) error {
-	w, err := zw.Create(name)
-	if err != nil {
-		return err
-	}
-	enc := json.NewEncoder(w)
-	enc.SetIndent("", "  ")
-	return enc.Encode(v)
-}
-
-func writeFileToZip(zw *zip.Writer, name, path string) error {
-	src, err := os.Open(path)
-	if err != nil {
-		return err
-	}
-	defer src.Close()
-	info, err := src.Stat()
-	if err != nil {
-		return err
-	}
-	hdr, err := zip.FileInfoHeader(info)
-	if err != nil {
-		return err
-	}
-	hdr.Name = name
-	hdr.Method = zip.Deflate
+func writeBytesToZip(zw *zip.Writer, name string, data []byte) error {
+	hdr := &zip.FileHeader{Name: name, Method: zip.Deflate}
+	hdr.SetMode(0o644)
 	w, err := zw.CreateHeader(hdr)
 	if err != nil {
 		return err
 	}
-	_, err = io.Copy(w, src)
+	_, err = w.Write(data)
+	return err
+}
+
+// geometryPayload unwraps the gzip container the dataset publishes, leaving the
+// raw CSDAGEO payload the bundle stores and the loader reads.
+func geometryPayload(path string) ([]byte, error) {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	if len(raw) < 2 || raw[0] != 0x1f || raw[1] != 0x8b {
+		return raw, nil
+	}
+	gz, err := gzip.NewReader(bytes.NewReader(raw))
+	if err != nil {
+		return nil, err
+	}
+	defer gz.Close()
+	return io.ReadAll(gz)
+}
+
+// writeCompressedToZip stores an xz frame in the zip without deflating it again.
+func writeCompressedToZip(zw *zip.Writer, name, path string) error {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	frame, err := mapassets.CompressGeometryXZ(raw)
+	if err != nil {
+		return fmt.Errorf("compress %s: %w", filepath.Base(path), err)
+	}
+	hdr := &zip.FileHeader{Name: name, Method: zip.Store, UncompressedSize64: uint64(len(frame))}
+	hdr.SetMode(0o644)
+	w, err := zw.CreateHeader(hdr)
+	if err != nil {
+		return err
+	}
+	_, err = w.Write(frame)
 	return err
 }
 

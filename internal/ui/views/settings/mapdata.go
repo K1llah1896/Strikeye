@@ -6,8 +6,10 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
+	"strikeye/internal/mapassets"
 	"strikeye/internal/mapdata"
 	"strikeye/internal/mapgeom"
 )
@@ -94,4 +96,48 @@ func geometryCount(dataRoot string) int {
 		return 0
 	}
 	return len(files)
+}
+
+// bundledGeometryMaps lists the maps inside the packaged geometry sidecar.
+func bundledGeometryMaps(bundlePath string) []string {
+	if bundlePath == "" {
+		return nil
+	}
+	maps, err := mapassets.BundleMaps(bundlePath)
+	if err != nil {
+		return nil
+	}
+	return maps
+}
+
+// missingGeometryMaps reports the maps the upstream dataset has but neither the
+// bundle nor the cache provides. The release ships the competitive pool only, so
+// this is what "补充其他地图几何" fetches (casual and arms-race maps).
+func missingGeometryMaps(bundlePath, dataRoot string) []string {
+	cached := map[string]bool{}
+	if names, err := mapgeom.CachedMaps(geometryDir(dataRoot)); err == nil {
+		for _, name := range names {
+			cached[strings.ToLower(name)] = true
+		}
+	}
+	bundled := map[string]bool{}
+	for _, name := range bundledGeometryMaps(bundlePath) {
+		bundled[strings.ToLower(name)] = true
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	client := &http.Client{Timeout: 30 * time.Second}
+	manifest, err := mapgeom.FetchManifest(ctx, client, mapgeom.DefaultBaseURL)
+	if err != nil {
+		return nil
+	}
+	var missing []string
+	for _, name := range manifest.MapNames() {
+		key := strings.ToLower(name)
+		if bundled[key] || cached[key] {
+			continue
+		}
+		missing = append(missing, name)
+	}
+	return missing
 }

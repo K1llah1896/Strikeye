@@ -12,17 +12,17 @@ var fs embed.FS
 
 // MapMeta describes CS2 radar image world-to-pixel coordinate transformation.
 type MapMeta struct {
-	PosX               float64 `json:"pos_x"`
-	PosY               float64 `json:"pos_y"`
-	Scale              float64 `json:"scale"`
-	Rotate             *int    `json:"rotate,omitempty"`
+	PosX               float64  `json:"pos_x"`
+	PosY               float64  `json:"pos_y"`
+	Scale              float64  `json:"scale"`
+	Rotate             *int     `json:"rotate,omitempty"`
 	Zoom               *float64 `json:"zoom,omitempty"`
-	LowerLevelMaxUnits float64 `json:"lower_level_max_units"`
-	ContentX           int     `json:"content_x"`
-	ContentY           int     `json:"content_y"`
-	ContentWidth       int     `json:"content_width"`
-	ContentHeight      int     `json:"content_height"`
-	TransformVersion   int     `json:"transform_version"`
+	LowerLevelMaxUnits float64  `json:"lower_level_max_units"`
+	ContentX           int      `json:"content_x"`
+	ContentY           int      `json:"content_y"`
+	ContentWidth       int      `json:"content_width"`
+	ContentHeight      int      `json:"content_height"`
+	TransformVersion   int      `json:"transform_version"`
 }
 
 var parsedMeta map[string]MapMeta

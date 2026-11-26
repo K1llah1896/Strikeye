@@ -372,7 +372,22 @@
 | `bundled-map-assets` | 地图数据全部随包：导航网格 + callout 表 `go:embed` 进 exe（首次运行按 sha256 校验落盘），200 MB 碰撞几何作为 `map_geometry.zip` 边车按图按需解压；启动/GUI 后台自动安装，设置页与 CLI 的下载按钮降级为“从内置包安装”；`strikeye-cli assets-pack` 成为唯一生成入口 |
 | `zero-click-refresh` | 最后两类必须联网的数据改为自动补齐：分析页打开比赛时抓取缺失头像（30 天 TTL、命中缓存零请求）、资料库刷新时更新超过 24h 的封禁快照（需 Steam key，`refresh=false` 复用 TTL）；新增 `avatarAutoFetch`/`avatarClient` 注入点让渲染测试保持无网络 |
 | `bundled-toolchain` | FFmpeg（119 MB）与 HLAE（9 MB）以 `*-windows-amd64.zip` 边车随包分发，启动前自动解压到 `<DataRoot>/tools/<tool>`；探测用 glob 发现 `tools/` 下的二进制（包内版本优先于 PATH）；打包改用钉定直链（HLAE `v2.193.2`、BtbN `latest`）避开 GitHub API 每小时 60 次的限流；设置页按钮改为离线「从内置包安装」 |
+| `release-size-reduction` | 发布包 527 MB → 255 MB 且不减能力：几何边车改存 xz 原始 `CSDAGEO` 负载并只带 11 张竞技图（`--all-geometry` 可全量）、FFmpeg 边车改 `.tar.zst` 只留 ffmpeg/ffprobe、exe `-s -w` + `zip -9`、CJK 字体 GBK 子集 + 覆盖测试（见 §8.1） |
 | `ci-gate` | `.github/workflows/ci.yml`：gofmt / vet / test / 三平台交叉编译 / `openspec validate --all --strict`（CLI 钉 1.15.0），语料回归走 `workflow_dispatch`；仓库内 8 个文件统一 gofmt |
+
+## 8.1 发布包体积（2026-11-26，v0.4.0）
+
+0.3.1 的 `strikeye-windows-amd64.zip` 达到 527 MB。按“核心能力一项不减”的前提重做编码与打包后降到 255 MB：
+
+| 组成 | 0.3.1 | 0.4.0 | 做法 |
+|---|---|---|---|
+| `strikeye.exe` / `agent` / `cli` | 68.0 / 48.7 / 30.4 MB | 62.6 / 43.2 / 31.1 MB | `-ldflags "-s -w"`（符号表与 DWARF 去掉，约 −18%）+ `zip -9` |
+| `map_geometry.zip` | 199.7 MB（16 图） | 119.9 MB（11 张竞技图） | 解掉发布方原有的 gzip 包装，改以 xz 帧存原始 `CSDAGEO` 负载（`de_inferno`：40.0→32.6 MB）；休闲图由设置页一键补充 |
+| FFmpeg 边车 | 119.5 MB `.zip`（含 ffplay 与文档） | 51.3 MB `.tar.zst`（只留 ffmpeg/ffprobe，固态压缩） | 上游换 gyan.dev essentials（两个 110 MB 二进制，非 master 的 172 MB）；旧 `.zip` 名仍被接受 |
+| HLAE 边车 | 9.1 MB | 9.1 MB | 保持上游压缩包 |
+| 内嵌 CJK 字体 | 每字重 10.55 MB × 3 个 exe | 每字重 7.7 MB | GBK 子集 + 源码非 ASCII 字符集，`scripts/subset-fonts.sh` 可重建，覆盖测试拦缺字 |
+
+校验：全新 DataRoot 跑内置安装 → `22 nav meshes, callouts=1`，解析真实 de_dust2 demo 后按需解压 `de_dust2.tri` 16.6 MB，`killctx` 平均交火 760.9 单位 / 遮挡 20.4% / 穿烟 7.3%，TTD 569.7 ms（161 样本）、TTK 509.1 ms（63 样本），与压缩前完全一致。开放数据集的 xz 编码代价是首次用到某图时约 1–5 秒解码，之后常驻缓存。
 
 ## 9. 仍未补齐及原因
 
@@ -383,5 +398,5 @@
 | 开镜 FOV 的引擎精确值 | 已用回放 v3 记录的 `Zoom`（0/1/2）把视锥收窄为 53°→20°→7.5°，TTD 与击杀光学都吃这套判定；残余差异在于 demo 不暴露投影 FOV 本身，20°/7.5° 是标定近似。 |
 | Steam 登录态相关（需凭据） | `download` 已实现 Cookie 解析与 GCPD 分页下载；实际拉取需要用户自己的 Steam Cookie，属凭据而非能力缺口。 |
 | 选手头像的离线预置 | 头像按 SteamID 抓取（`steamcommunity.com/profiles/<id>?xml=1`），目标集合随用户导入的 demo 变化、数量无上界，无法预先打包；现在打开比赛即自动抓取并缓存 30 天，用户不再需要点按钮。 |
-| 内置地图/工具数据无法进 git | 导航网格 8.5 MB、callout 780 KB、碰撞几何 200 MB、FFmpeg 119 MB、HLAE 9 MB 都是构建输入而非源码，仓库只提交 `assets-pack` 与钉定校验和；发布 zip 内全部具备，源码构建则按需生成。 |
+| 内置地图/工具数据无法进 git | 导航网格 8.5 MB、callout 780 KB、碰撞几何 120 MB、FFmpeg 51 MB、HLAE 9 MB 都是构建输入而非源码，仓库只提交 `assets-pack` 与钉定校验和；发布 zip 内全部具备（见 §8.1），源码构建则按需生成。 |
 | Web 版 GSI 直播 HUD（P2 残项） | GSI 只读接入与资料库直播条已落地；浏览器/覆盖层渲染与“零侵入本地工具”定位冲突，仍不做。 |

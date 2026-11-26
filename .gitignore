@@ -42,4 +42,5 @@ internal/mapassets/assets/*.zip
 internal/mapassets/assets/*.csv
 assets/map_geometry.zip
 assets/ffmpeg-windows-amd64.zip
+assets/ffmpeg-windows-amd64.tar.zst
 assets/hlae-windows-amd64.zip

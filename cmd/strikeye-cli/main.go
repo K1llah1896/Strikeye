@@ -185,6 +185,7 @@ func main() {
 			skipNavFlag := fs.Bool("skip-nav", false, "Skip the embedded nav mesh and callout blobs")
 			skipGeomFlag := fs.Bool("skip-geom", false, "Skip the collision geometry bundle")
 			skipToolsFlag := fs.Bool("skip-tools", false, "Skip the bundled FFmpeg/HLAE archives")
+			allGeomFlag := fs.Bool("all-geometry", false, "Bundle every map's geometry instead of the competitive pool")
 			baseURLFlag := fs.String("geometry-base-url", "", "Override geometry dataset base URL")
 			toolsAPIFlag := fs.String("tools-api-url", "", "Override the tool release API used for the bundled archives")
 			_ = fs.Parse(flag.Args()[1:])
@@ -197,6 +198,7 @@ func main() {
 				SkipNav:     *skipNavFlag,
 				SkipGeom:    *skipGeomFlag,
 				SkipTools:   *skipToolsFlag,
+				AllGeometry: *allGeomFlag,
 				BaseURL:     *baseURLFlag,
 				ToolsAPI:    *toolsAPIFlag,
 			}, os.Stdout); err != nil {

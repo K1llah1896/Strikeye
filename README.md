@@ -72,8 +72,9 @@ Strikeye 围绕比赛的完整生命周期，构建统一的 Demo 管理、观�
 碰撞几何、导航网格、callout 表，以及 FFmpeg/HLAE，都随安装包分发，全新解压即可离线使用区域控制、地图控制曲线、TTD、击杀视线、录制与合成，**不需要点任何下载按钮**：
 
 - 导航网格（`navs.zip`，7.7 MB）与 callout 表（780 KB）用 `go:embed` 编入可执行文件，启动时校验 sha256 后写入 `<DataRoot>/cache/`；
-- 碰撞几何合计约 200 MB，作为 `map_geometry.zip` 边车与 exe 同目录分发，按图按需解压（首次用到某图才落盘 6–20 MB）；
-- FFmpeg（`ffmpeg-windows-amd64.zip`，119 MB）与 HLAE（`hlae-windows-amd64.zip`，9 MB）同样作为边车随包，启动前解压到 `<DataRoot>/tools/`，探测时包内版本优先于系统 PATH；
+- 碰撞几何（`map_geometry.zip`，120 MB）覆盖 11 张竞技图，以 xz 帧保存原始碰撞网格，与 exe 同目录分发、按图按需解压（首次用到某图才落盘 6–17 MB）；休闲图（`cs_italy`/`cs_office` 等）由设置页一键补充；
+- FFmpeg（`ffmpeg-windows-amd64.tar.zst`，51 MB，只含 `ffmpeg`/`ffprobe`）与 HLAE（`hlae-windows-amd64.zip`，9 MB）同样作为边车随包，启动前解压到 `<DataRoot>/tools/`，探测时包内版本优先于系统 PATH；
+- 体积是打包环节的结果而不是靠删功能换来的：exe 用 `-s -w` 链接并 `zip -9` 压缩，已压缩的边车以 `zip -0` 存放，CJK 字体是 GBK 子集（每字重 7.7 MB，`scripts/subset-fonts.sh` 可重建，覆盖测试会拦下缺字的新文案）。整套发布包 255 MB，比 0.3.1 的 527 MB 少一半，能力一项未减；
 - 应用内热更新会把所有边车一并替换，升级后依旧无需下载。
 
 唯一需要联网的两类数据也都不再需要点按钮：打开一场比赛会自动补齐缺失的选手头像（30 天 TTL，命中缓存则零请求）；配置了 Steam Web API key 时，资料库刷新会自动更新超过 24 小时的封禁快照。两者的手动按钮保留为强制刷新。

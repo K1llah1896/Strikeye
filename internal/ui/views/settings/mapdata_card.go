@@ -39,7 +39,7 @@ func (v *View) renderMapDataCard(c *ui.Context) {
 			v.mapDataNavCount, v.mapDataGeometry, humanBytes(v.mapDataCallouts), v.mapDataCheckedAt.Format("15:04:05")))
 		switch {
 		case bundled && hasBundle:
-			theme.MutedText(c, "内置离线数据：导航网格与 callout 随程序提供，碰撞几何从 map_geometry.zip 按需解压（"+shortPath(bundlePath)+"），无需联网。")
+			theme.MutedText(c, "内置离线数据：导航网格、callout 与竞技图碰撞几何随程序提供（"+shortPath(bundlePath)+"），首次用到某张图时自动解压，无需联网。")
 		case bundled:
 			theme.MutedText(c, "内置离线数据：导航网格与 callout 随程序提供；未找到 map_geometry.zip，TTD 与击杀视线会在缺失时自动降级。")
 		default:
@@ -63,6 +63,22 @@ func (v *View) renderMapDataCard(c *ui.Context) {
 						return "", err
 					}
 					return "callout 已更新: " + path, nil
+				})
+			}
+			// The packaged bundle carries the competitive pool; casual and
+			// arms-race maps stay one click away instead of adding 55 MB to
+			// everyone's download.
+			if bundled && hasBundle && theme.ActionButton(c, "补充其他地图几何（休闲图）").Clicked() && !v.mapDataBusy {
+				v.startMapDataTask("休闲图几何", func(ctx context.Context) (string, error) {
+					missing := missingGeometryMaps(bundlePath, v.dataRootOf())
+					if len(missing) == 0 {
+						return "内置几何已覆盖全部官方地图", nil
+					}
+					files, err := fetchGeometry(ctx, v.dataRootOf(), missing)
+					if err != nil {
+						return "", err
+					}
+					return fmt.Sprintf("已补充 %d 张地图的碰撞几何", len(files)), nil
 				})
 			}
 			if !bundled && theme.ActionButton(c, "下载碰撞几何（全部官方图）").Clicked() && !v.mapDataBusy {

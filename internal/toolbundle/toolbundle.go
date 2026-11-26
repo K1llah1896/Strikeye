@@ -3,7 +3,7 @@
 // to click "安装" or reach the network.
 //
 // The archives are data sidecars placed next to the executables
-// (ffmpeg-windows-amd64.zip, hlae-windows-amd64.zip). They are produced by
+// (ffmpeg-windows-amd64.tar.zst, hlae-windows-amd64.zip). They are produced by
 // `strikeye-cli assets-pack --tools-out <dir>` at packaging time and extracted
 // into <DataRoot>/tools/<tool> on first run, reusing the exact extraction and
 // binary detection the network installer uses.
@@ -24,15 +24,27 @@ const (
 	TargetOS   = "windows"
 	TargetArch = "amd64"
 
-	HLAAArchiveName   = "hlae-" + TargetOS + "-" + TargetArch + ".zip"
-	FFmpegArchiveName = "ffmpeg-" + TargetOS + "-" + TargetArch + ".zip"
+	HLAAArchiveName = "hlae-" + TargetOS + "-" + TargetArch + ".zip"
+	// FFmpeg travels as a slim tar.zst holding only ffmpeg.exe and ffprobe.exe:
+	// one solid zstd frame keeps the near-identical static binaries at 51 MB
+	// instead of 80 MB for a zip of the same two files, or 119 MB for the whole
+	// upstream archive (which also ships ffplay.exe and the HTML docs).
+	FFmpegArchiveName = "ffmpeg-" + TargetOS + "-" + TargetArch + updater.TarZstExt
+	// legacyFFmpegArchiveName is the older zip sidecar, still honoured when it
+	// sits next to an executable from a previous release.
+	legacyFFmpegArchiveName = "ffmpeg-" + TargetOS + "-" + TargetArch + ".zip"
 
 	// Pinned upstream archives. Packaging uses these direct URLs instead of the
 	// GitHub release API, so builds are reproducible and immune to the
 	// unauthenticated API rate limit (60 requests/hour per IP).
-	HLAEVersion      = "v2.193.2"
-	HLAEArchiveURL   = "https://github.com/AdvancedFX/advancedfx/releases/download/" + HLAEVersion + "/hlae_2_193_2.zip"
-	FFmpegArchiveURL = "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl.zip"
+	HLAEVersion    = "v2.193.2"
+	HLAEArchiveURL = "https://github.com/AdvancedFX/advancedfx/releases/download/" + HLAEVersion + "/hlae_2_193_2.zip"
+	// FFmpeg comes from gyan.dev's essentials build rather than BtbN's master
+	// build: both work, but the master binaries are 172 MB each versus 110 MB,
+	// which turns the sidecar from 51 MB into 118 MB for no feature Strikeye
+	// uses. Essentials carries libx264, AAC and the filter set the composer
+	// needs.
+	FFmpegArchiveURL = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip"
 )
 
 // PinnedURL returns the direct download URL for a tool archive, if one is
@@ -92,19 +104,33 @@ func Dirs(dataRoot, exeDir string) []string {
 }
 
 // Find returns the sidecar path for tool when one of the searched directories
-// holds it.
+// holds it. The current archive name wins over the legacy zip sidecar.
 func Find(dataRoot, exeDir, tool string) (string, bool) {
-	name := ArchiveName(tool)
-	if name == "" {
+	names := ArchiveNames(tool)
+	if len(names) == 0 {
 		return "", false
 	}
 	for _, dir := range Dirs(dataRoot, exeDir) {
-		candidate := filepath.Join(dir, name)
-		if info, err := os.Stat(candidate); err == nil && !info.IsDir() && info.Size() > 0 {
-			return candidate, true
+		for _, name := range names {
+			candidate := filepath.Join(dir, name)
+			if info, err := os.Stat(candidate); err == nil && !info.IsDir() && info.Size() > 0 {
+				return candidate, true
+			}
 		}
 	}
 	return "", false
+}
+
+// ArchiveNames lists the acceptable sidecar file names for a tool, current
+// format first.
+func ArchiveNames(tool string) []string {
+	switch tool {
+	case updater.ToolFFmpeg:
+		return []string{FFmpegArchiveName, legacyFFmpegArchiveName}
+	case updater.ToolHLAE:
+		return []string{HLAAArchiveName}
+	}
+	return nil
 }
 
 // StagedPath is where a tool is unpacked: <DataRoot>/tools/<tool>.

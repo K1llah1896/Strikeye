@@ -5,9 +5,11 @@
 //
 //   - Navigation meshes (7.7 MB) and the callout table (780 KB) are embedded in
 //     the binaries and written into the DataRoot on startup.
-//   - Collision geometry is ~200 MB, so it travels as map_geometry.zip next to
-//     the executables and is extracted one map at a time, the first time a map
-//     is actually needed.
+//   - Collision geometry is large (137 MB for the competitive pool, compressed),
+//     so it travels as map_geometry.zip next to the executables and is extracted
+//     one map at a time, the first time a map is actually needed. The `.tri`
+//     files are themselves gzip streams, so each bundle entry carries a second
+//     zstd frame and is inflated during extraction.
 //
 // Both paths verify pinned SHA-256 checksums before anything is unpacked, and
 // both are idempotent: an already-installed file of the right size is reused.
@@ -17,6 +19,7 @@ package mapassets
 
 import (
 	"archive/zip"
+	"bufio"
 	"bytes"
 	"crypto/sha256"
 	"embed"
@@ -30,6 +33,9 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+
+	"github.com/klauspost/compress/zstd"
+	"github.com/ulikunitz/xz"
 )
 
 //go:embed all:assets
@@ -243,11 +249,36 @@ func FindGeometryBundle(dataRoot, exeDir string) (string, bool) {
 	return "", false
 }
 
-// GeometryEntry is one map inside the bundle manifest.
+const (
+	// GeometryEncodingZstd marks a bundle entry holding a zstd frame around the
+	// raw CSDAGEO payload.
+	GeometryEncodingZstd = "zstd"
+	// GeometryEncodingXZ marks an xz (LZMA2) frame around the same payload. The
+	// release bundle uses xz: on the collision meshes it lands ~23% smaller than
+	// zstd and ~33% smaller than the published gzip files.
+	GeometryEncodingXZ = "xz"
+)
+
+// geometryEntrySuffix is the archive suffix per encoding, derived from the
+// encoding name so the two fields cannot drift apart.
+func geometryEntrySuffix(encoding string) string {
+	switch {
+	case strings.EqualFold(encoding, GeometryEncodingZstd):
+		return ".zst"
+	case strings.EqualFold(encoding, GeometryEncodingXZ):
+		return ".xz"
+	}
+	return ""
+}
+
+// GeometryEntry is one map inside the bundle manifest. Size and SHA256 describe
+// the extracted `.tri` bytes, so a cached file can be validated without inflating
+// the bundle entry again.
 type GeometryEntry struct {
-	File   string `json:"file"`
-	Size   int64  `json:"size"`
-	SHA256 string `json:"sha256"`
+	File     string `json:"file"`
+	Size     int64  `json:"size"`
+	SHA256   string `json:"sha256"`
+	Encoding string `json:"encoding,omitempty"`
 }
 
 type geometryManifest struct {
@@ -310,7 +341,7 @@ func ExtractGeometry(bundlePath, geometryDir string, maps []string) error {
 		if !ok {
 			return fmt.Errorf("%w: %s", ErrMapNotBundled, key)
 		}
-		file, ok := entries[filepath.Base(entry.File)]
+		file, ok := entries[bundleEntryName(entry)]
 		if !ok {
 			return fmt.Errorf("%w: %s", ErrMapNotBundled, entry.File)
 		}
@@ -394,19 +425,41 @@ func readBundleManifest(zr *zip.ReadCloser) (geometryManifest, map[string]*zip.F
 	return manifest, entries, nil
 }
 
+// bundleEntryName is the name a map's entry carries inside the archive: the
+// extracted file name, plus ".zst" when the entry is compressed.
+func bundleEntryName(entry GeometryEntry) string {
+	return filepath.Base(entry.File) + geometryEntrySuffix(entry.Encoding)
+}
+
 func extractVerified(f *zip.File, dest string, entry GeometryEntry) error {
 	rc, err := f.Open()
 	if err != nil {
 		return err
 	}
 	defer rc.Close()
+	source := io.Reader(rc)
+	switch {
+	case strings.EqualFold(entry.Encoding, GeometryEncodingZstd):
+		dec, err := zstd.NewReader(rc, zstd.WithDecoderConcurrency(1), zstd.WithDecoderMaxMemory(1<<30))
+		if err != nil {
+			return fmt.Errorf("open zstd entry %s: %w", f.Name, err)
+		}
+		defer dec.Close()
+		source = dec
+	case strings.EqualFold(entry.Encoding, GeometryEncodingXZ):
+		dec, err := xz.NewReader(bufio.NewReaderSize(rc, 1<<20))
+		if err != nil {
+			return fmt.Errorf("open xz entry %s: %w", f.Name, err)
+		}
+		source = dec
+	}
 	tmp := dest + ".part"
 	out, err := os.Create(tmp)
 	if err != nil {
 		return err
 	}
 	h := sha256.New()
-	written, copyErr := io.Copy(io.MultiWriter(out, h), io.LimitReader(rc, entry.Size+1))
+	written, copyErr := io.Copy(io.MultiWriter(out, h), io.LimitReader(source, entry.Size+1))
 	closeErr := out.Close()
 	if copyErr != nil || closeErr != nil {
 		_ = os.Remove(tmp)
@@ -428,6 +481,59 @@ func extractVerified(f *zip.File, dest string, entry GeometryEntry) error {
 		return err
 	}
 	return nil
+}
+
+// CompressGeometry returns a zstd frame for one geometry payload.
+func CompressGeometry(raw []byte) ([]byte, error) {
+	var buf bytes.Buffer
+	enc, err := zstd.NewWriter(&buf,
+		zstd.WithEncoderLevel(zstd.SpeedBestCompression),
+		zstd.WithEncoderConcurrency(1),
+	)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := enc.Write(raw); err != nil {
+		_ = enc.Close()
+		return nil, err
+	}
+	if err := enc.Close(); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
+}
+
+// CompressGeometryXZ returns an xz (LZMA2) frame for one geometry payload. It is
+// the encoding the release bundle uses: the payload is mostly BVH nodes and
+// float vertices, which LZMA models noticeably better than zstd, and the cost is
+// paid once per map because the extracted `.tri` stays in the cache.
+func CompressGeometryXZ(raw []byte) ([]byte, error) {
+	var buf bytes.Buffer
+	enc, err := xz.WriterConfig{
+		DictCap:   128 << 20,
+		BlockSize: 0,
+	}.NewWriter(&buf)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := enc.Write(raw); err != nil {
+		_ = enc.Close()
+		return nil, err
+	}
+	if err := enc.Close(); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
+}
+
+// BundleManifest is the map index written into map_geometry.zip.
+func BundleManifest(entries map[string]GeometryEntry) []byte {
+	manifest := geometryManifest{FormatVersion: 1, Maps: entries}
+	encoded, err := json.MarshalIndent(manifest, "", "  ")
+	if err != nil {
+		return []byte("{}")
+	}
+	return append(encoded, '\n')
 }
 
 func extractEntry(f *zip.File, dest string) error {
@@ -472,4 +578,14 @@ func ExeDir() string {
 		exe = resolved
 	}
 	return filepath.Dir(exe)
+}
+
+// LooksLikeXZ reports whether data starts with the xz stream magic.
+func LooksLikeXZ(data []byte) bool {
+	return len(data) >= 6 && bytes.HasPrefix(data, []byte{0xfd, '7', 'z', 'X', 'Z', 0x00})
+}
+
+// LooksLikeZstd reports whether data starts with the zstd frame magic.
+func LooksLikeZstd(data []byte) bool {
+	return len(data) >= 4 && bytes.HasPrefix(data, []byte{0x28, 0xb5, 0x2f, 0xfd})
 }

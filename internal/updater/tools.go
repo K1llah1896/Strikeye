@@ -154,7 +154,7 @@ func InstallToolFromArchive(tool, archivePath, dataRoot string, onProgress func(
 	if err := os.MkdirAll(destDir, 0o755); err != nil {
 		return InstallToolResult{}, fmt.Errorf("创建工具目录失败: %w", err)
 	}
-	if err := extractZipSafe(archivePath, destDir); err != nil {
+	if err := ExtractToolArchive(archivePath, destDir); err != nil {
 		return InstallToolResult{}, err
 	}
 	report("扫描可执行文件", 0.9)

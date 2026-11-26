@@ -1,11 +1,14 @@
 package toolbundle
 
 import (
+	"archive/tar"
 	"archive/zip"
 	"bytes"
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/klauspost/compress/zstd"
 
 	"strikeye/internal/updater"
 )
@@ -35,6 +38,38 @@ func writeArchive(t *testing.T, path string, entries map[string][]byte) {
 	}
 }
 
+// writeTarZst builds a zstd-compressed tar, the container FFmpeg ships in.
+func writeTarZst(t *testing.T, path string, entries map[string][]byte) {
+	t.Helper()
+	var buf bytes.Buffer
+	enc, err := zstd.NewWriter(&buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tw := tar.NewWriter(enc)
+	for name, body := range entries {
+		hdr := &tar.Header{Name: name, Mode: 0o755, Size: int64(len(body)), Format: tar.FormatPAX}
+		if err := tw.WriteHeader(hdr); err != nil {
+			t.Fatalf("tar header %s: %v", name, err)
+		}
+		if _, err := tw.Write(body); err != nil {
+			t.Fatalf("tar body %s: %v", name, err)
+		}
+	}
+	if err := tw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := enc.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, buf.Bytes(), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func ffmpegEntries() map[string][]byte {
 	return map[string][]byte{
 		"ffmpeg-x/bin/ffmpeg.exe":  []byte("ffmpeg-binary"),
@@ -52,7 +87,7 @@ func hlaeEntries() map[string][]byte {
 }
 
 func TestArchiveNamesAreFixedToWindows(t *testing.T) {
-	if got := ArchiveName(updater.ToolFFmpeg); got != "ffmpeg-windows-amd64.zip" {
+	if got := ArchiveName(updater.ToolFFmpeg); got != "ffmpeg-windows-amd64.tar.zst" {
 		t.Fatalf("ffmpeg name = %q", got)
 	}
 	if got := ArchiveName(updater.ToolHLAE); got != "hlae-windows-amd64.zip" {
@@ -66,7 +101,7 @@ func TestArchiveNamesAreFixedToWindows(t *testing.T) {
 func TestProvisionExtractsBundledTools(t *testing.T) {
 	dataRoot := t.TempDir()
 	exeDir := t.TempDir()
-	writeArchive(t, filepath.Join(exeDir, FFmpegArchiveName), ffmpegEntries())
+	writeTarZst(t, filepath.Join(exeDir, FFmpegArchiveName), ffmpegEntries())
 	writeArchive(t, filepath.Join(exeDir, HLAAArchiveName), hlaeEntries())
 
 	rep, err := Provision(dataRoot, exeDir)
@@ -94,7 +129,7 @@ func TestProvisionExtractsBundledTools(t *testing.T) {
 func TestProvisionIsIdempotent(t *testing.T) {
 	dataRoot := t.TempDir()
 	exeDir := t.TempDir()
-	writeArchive(t, filepath.Join(exeDir, FFmpegArchiveName), ffmpegEntries())
+	writeTarZst(t, filepath.Join(exeDir, FFmpegArchiveName), ffmpegEntries())
 	writeArchive(t, filepath.Join(exeDir, HLAAArchiveName), hlaeEntries())
 	if _, err := Provision(dataRoot, exeDir); err != nil {
 		t.Fatalf("first Provision: %v", err)
@@ -131,7 +166,7 @@ func TestProvisionWithoutBundlesReportsMissing(t *testing.T) {
 func TestFindSearchesDataRootAndAssets(t *testing.T) {
 	dataRoot := t.TempDir()
 	assets := filepath.Join(dataRoot, "assets")
-	writeArchive(t, filepath.Join(assets, FFmpegArchiveName), ffmpegEntries())
+	writeTarZst(t, filepath.Join(assets, FFmpegArchiveName), ffmpegEntries())
 	got, ok := Find(dataRoot, t.TempDir(), updater.ToolFFmpeg)
 	if !ok {
 		t.Fatal("expected to find ffmpeg archive under DataRoot/assets")
@@ -154,7 +189,7 @@ func TestProvisionFailsOnBrokenArchive(t *testing.T) {
 	dataRoot := t.TempDir()
 	exeDir := t.TempDir()
 	// Valid zip, but without the required binaries.
-	writeArchive(t, filepath.Join(exeDir, FFmpegArchiveName), map[string][]byte{"readme.txt": []byte("nothing here")})
+	writeTarZst(t, filepath.Join(exeDir, FFmpegArchiveName), map[string][]byte{"readme.txt": []byte("nothing here")})
 	if _, err := Provision(dataRoot, exeDir); err == nil {
 		t.Fatal("expected an error when the archive lacks ffmpeg binaries")
 	}

@@ -345,9 +345,10 @@ func applyZipPackage(zipPath, targetDir string) error {
 	// they are staged with 0644 and an older release without them simply leaves
 	// the existing copies in place.
 	dataFiles := map[string]bool{
-		"map_geometry.zip":         true,
-		"ffmpeg-windows-amd64.zip": true,
-		"hlae-windows-amd64.zip":   true,
+		"map_geometry.zip":             true,
+		"ffmpeg-windows-amd64.tar.zst": true,
+		"ffmpeg-windows-amd64.zip":     true,
+		"hlae-windows-amd64.zip":       true,
 	}
 
 	replaced := 0

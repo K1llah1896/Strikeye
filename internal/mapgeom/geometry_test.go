@@ -7,6 +7,9 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/klauspost/compress/zstd"
+	"github.com/ulikunitz/xz"
 )
 
 func TestLoadQuad(t *testing.T) {
@@ -54,5 +57,54 @@ func TestReadRejectsTruncatedSection(t *testing.T) {
 	truncated := raw[:len(raw)-8]
 	if _, err := Read(bytes.NewReader(gzipBytes(t, truncated))); err == nil {
 		t.Fatal("expected error for truncated node section")
+	}
+}
+
+// TestReadAcceptsEveryContainer pins the packed-bundle contract: the loader takes
+// the published gzip files, the raw payload, and the zstd/xz frames the release
+// sidecar stores, all of which decode to the same mesh.
+func TestReadAcceptsEveryContainer(t *testing.T) {
+	gzipped := writeQuad(t)
+	raw, err := gunzip(gzipped)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var zstdBuf bytes.Buffer
+	zw, err := zstd.NewWriter(&zstdBuf, zstd.WithEncoderLevel(zstd.SpeedBestCompression))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := zw.Write(raw); err != nil {
+		t.Fatal(err)
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	var xzBuf bytes.Buffer
+	xw, err := xz.WriterConfig{}.NewWriter(&xzBuf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := xw.Write(raw); err != nil {
+		t.Fatal(err)
+	}
+	if err := xw.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	cases := map[string][]byte{
+		"gzip": gzipped,
+		"raw":  raw,
+		"zstd": zstdBuf.Bytes(),
+		"xz":   xzBuf.Bytes(),
+	}
+	for name, data := range cases {
+		bvh, err := Read(bytes.NewReader(data))
+		if err != nil {
+			t.Fatalf("%s: Read: %v", name, err)
+		}
+		if len(bvh.Vertices) != 4 || len(bvh.Nodes) != 1 {
+			t.Fatalf("%s: unexpected geometry %d/%d", name, len(bvh.Vertices), len(bvh.Nodes))
+		}
 	}
 }

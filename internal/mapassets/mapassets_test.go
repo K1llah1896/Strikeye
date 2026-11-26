@@ -7,9 +7,11 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
+	"sort"
 	"testing"
 	"testing/fstest"
 )
@@ -185,14 +187,50 @@ func TestInstallReportsMissingBundle(t *testing.T) {
 // writeGeometryBundle builds a sidecar archive with a manifest and the given maps.
 func writeGeometryBundle(t *testing.T, dir string, maps map[string][]byte, corrupt map[string]bool) string {
 	t.Helper()
+	return writeGeometryBundleWith(t, dir, maps, corrupt, "")
+}
+
+// writeGeometryBundleWith is writeGeometryBundle with an opt-in for the encoding
+// the release bundle uses ("zstd" or "xz"; empty keeps the published layout).
+func writeGeometryBundleWith(t *testing.T, dir string, maps map[string][]byte, corrupt map[string]bool, encoding string) string {
+	t.Helper()
+	type zipEntry struct {
+		name string
+		body []byte
+	}
 	manifest := geometryManifest{FormatVersion: 1, Maps: map[string]GeometryEntry{}}
-	for name, body := range maps {
+	entries := make([]zipEntry, 0, len(maps))
+	names := make([]string, 0, len(maps))
+	for name := range maps {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		body := maps[name]
 		sum := sha256.Sum256(body)
 		sha := hex.EncodeToString(sum[:])
 		if corrupt[name] {
 			sha = "00" + sha[2:]
 		}
-		manifest.Maps[name] = GeometryEntry{File: name + ".tri", Size: int64(len(body)), SHA256: sha}
+		entry := GeometryEntry{File: name + ".tri", Size: int64(len(body)), SHA256: sha}
+		payload, zipName := body, name+".tri"
+		if encoding != "" {
+			var frame []byte
+			var err error
+			switch encoding {
+			case GeometryEncodingXZ:
+				frame, err = CompressGeometryXZ(body)
+			default:
+				frame, err = CompressGeometry(body)
+			}
+			if err != nil {
+				t.Fatalf("compress %s: %v", name, err)
+			}
+			entry.Encoding = encoding
+			payload, zipName = frame, entry.File+geometryEntrySuffix(encoding)
+		}
+		manifest.Maps[name] = entry
+		entries = append(entries, zipEntry{name: zipName, body: payload})
 	}
 	path := filepath.Join(dir, GeometryBundleName)
 	f, err := os.Create(path)
@@ -207,12 +245,12 @@ func writeGeometryBundle(t *testing.T, dir string, maps map[string][]byte, corru
 	if err := json.NewEncoder(mw).Encode(manifest); err != nil {
 		t.Fatal(err)
 	}
-	for name, body := range maps {
-		w, err := zw.Create(name + ".tri")
+	for _, entry := range entries {
+		w, err := zw.Create(entry.name)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if _, err := w.Write(body); err != nil {
+		if _, err := w.Write(entry.body); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -352,5 +390,123 @@ func TestEmbeddedNavsParse(t *testing.T) {
 	}
 	if info.Size() == 0 {
 		t.Fatal("de_dust2.nav is empty")
+	}
+}
+
+// TestExtractGeometryInflatesZstdEntries pins the release bundle layout: entries
+// are zstd frames, the manifest checksum covers the extracted `.tri` bytes, and
+// the cached file is therefore reusable without touching the bundle again.
+func TestExtractGeometryInflatesZstdEntries(t *testing.T) {
+	exeDir := t.TempDir()
+	body := bytes.Repeat([]byte("tri-payload-"), 256)
+	bundle := writeGeometryBundleWith(t, exeDir, map[string][]byte{
+		"de_dust2": body,
+		"de_nuke":  []byte("tri-nuke"),
+	}, nil, GeometryEncodingZstd)
+	dataRoot := t.TempDir()
+
+	path, ok := EnsureGeometry(dataRoot, exeDir, "de_dust2")
+	if !ok {
+		t.Fatal("EnsureGeometry reported no geometry for a zstd entry")
+	}
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, body) {
+		t.Fatalf("extracted %d bytes, want %d", len(got), len(body))
+	}
+	// The bundle entry itself must be a zstd frame, not the raw payload.
+	if !LooksLikeZstd(bundleZstdEntry(t, bundle, "de_dust2.tri.zst")) {
+		t.Fatal("bundle entry is not a zstd frame")
+	}
+	if err := os.Remove(bundle); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := EnsureGeometry(dataRoot, exeDir, "de_dust2"); !ok {
+		t.Fatal("cached geometry should survive removal of the bundle")
+	}
+}
+
+// TestExtractGeometryRejectsCorruptZstdEntry keeps the checksum contract for the
+// compressed path too: bad bytes must not land in the cache.
+func TestExtractGeometryRejectsCorruptZstdEntry(t *testing.T) {
+	exeDir := t.TempDir()
+	writeGeometryBundleWith(t, exeDir, map[string][]byte{"de_dust2": []byte("tri")}, map[string]bool{"de_dust2": true}, GeometryEncodingXZ)
+	dataRoot := t.TempDir()
+	if path, ok := EnsureGeometry(dataRoot, exeDir, "de_dust2"); ok {
+		t.Fatalf("checksum mismatch must not yield geometry, got %q", path)
+	}
+}
+
+// TestBundleManifestRoundTrips checks the packer's manifest is readable by the
+// extractor, including the encoding field.
+func TestBundleManifestRoundTrips(t *testing.T) {
+	blob := BundleManifest(map[string]GeometryEntry{
+		"de_dust2": {File: "de_dust2.tri", Size: 10, SHA256: "aa", Encoding: GeometryEncodingZstd},
+	})
+	var manifest geometryManifest
+	if err := json.Unmarshal(blob, &manifest); err != nil {
+		t.Fatalf("decode manifest: %v", err)
+	}
+	if manifest.FormatVersion != 1 {
+		t.Fatalf("format version = %d", manifest.FormatVersion)
+	}
+	if manifest.Maps["de_dust2"].Encoding != GeometryEncodingZstd {
+		t.Fatalf("encoding lost: %+v", manifest.Maps["de_dust2"])
+	}
+}
+
+func bundleZstdEntry(t *testing.T, bundlePath, name string) []byte {
+	t.Helper()
+	zr, err := zip.OpenReader(bundlePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer zr.Close()
+	for _, f := range zr.File {
+		if filepath.Base(f.Name) != name {
+			continue
+		}
+		rc, err := f.Open()
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer rc.Close()
+		raw, err := io.ReadAll(rc)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return raw
+	}
+	t.Fatalf("entry %s missing from bundle", name)
+	return nil
+}
+
+// TestExtractGeometryInflatesXZEntries covers the xz encoding the release
+// bundle uses, the same contract as the zstd case.
+func TestExtractGeometryInflatesXZEntries(t *testing.T) {
+	exeDir := t.TempDir()
+	body := bytes.Repeat([]byte("tri-payload-"), 512)
+	writeGeometryBundleWith(t, exeDir, map[string][]byte{
+		"de_inferno": body,
+		"de_nuke":    []byte("tri-nuke"),
+	}, nil, GeometryEncodingXZ)
+	dataRoot := t.TempDir()
+
+	path, ok := EnsureGeometry(dataRoot, exeDir, "de_inferno")
+	if !ok {
+		t.Fatal("EnsureGeometry reported no geometry for an xz entry")
+	}
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, body) {
+		t.Fatalf("extracted %d bytes, want %d", len(got), len(body))
+	}
+	entry := bundleZstdEntry(t, filepath.Join(exeDir, GeometryBundleName), "de_inferno.tri.xz")
+	if !LooksLikeXZ(entry) {
+		t.Fatal("bundle entry is not an xz stream")
 	}
 }

@@ -16,10 +16,45 @@ import (
 	"io"
 	"math"
 	"os"
+	"strings"
+
+	"github.com/klauspost/compress/zstd"
+	"github.com/ulikunitz/xz"
 )
 
 // Extension is the geometry file extension.
 const Extension = ".tri"
+
+// CoreMaps are the competitive-pool maps whose geometry ships inside the release
+// package. Casual and arms-race maps stay available through `maps-fetch` and the
+// settings card, so a small download tops up an install instead of being a
+// prerequisite for every map.
+var CoreMaps = []string{
+	"de_ancient",
+	"de_anubis",
+	"de_cache",
+	"de_cbble",
+	"de_dust2",
+	"de_inferno",
+	"de_mirage",
+	"de_nuke",
+	"de_overpass",
+	"de_train",
+	"de_vertigo",
+}
+
+// IsCoreMap reports whether name belongs to CoreMaps (case-insensitive, with or
+// without the .tri extension and the workshop prefix).
+func IsCoreMap(name string) bool {
+	name = strings.ToLower(strings.TrimSpace(name))
+	name = strings.TrimSuffix(name, Extension)
+	for _, core := range CoreMaps {
+		if name == core {
+			return true
+		}
+	}
+	return false
+}
 
 const (
 	// FormatVersion is bumped when the layout changes; readers reject others.
@@ -51,6 +86,44 @@ type Node struct {
 	Count       uint32
 }
 
+// Container magics accepted by decompressGeometry.
+var (
+	gzipMagic = []byte{0x1f, 0x8b}
+	zstdMagic = []byte{0x28, 0xb5, 0x2f, 0xfd}
+	xzMagic   = []byte{0xfd, '7', 'z', 'X', 'Z', 0x00}
+)
+
+// decompressGeometry unwraps the container around the raw CSDAGEO payload.
+// Plain payloads are accepted as well, which keeps any older cached file usable.
+func decompressGeometry(r io.Reader) (io.Reader, func(), error) {
+	br := bufio.NewReaderSize(r, 1<<20)
+	head, err := br.Peek(6)
+	if err != nil && !errors.Is(err, io.EOF) {
+		return nil, nil, fmt.Errorf("%w: %w", ErrInvalidGeometry, err)
+	}
+	switch {
+	case bytes.HasPrefix(head, gzipMagic):
+		gz, err := gzip.NewReader(br)
+		if err != nil {
+			return nil, nil, fmt.Errorf("%w: %w", ErrInvalidGeometry, err)
+		}
+		return gz, func() { _ = gz.Close() }, nil
+	case bytes.HasPrefix(head, zstdMagic):
+		dec, err := zstd.NewReader(br, zstd.WithDecoderConcurrency(1), zstd.WithDecoderMaxMemory(1<<30))
+		if err != nil {
+			return nil, nil, fmt.Errorf("%w: %w", ErrInvalidGeometry, err)
+		}
+		return dec, dec.Close, nil
+	case bytes.HasPrefix(head, xzMagic):
+		dec, err := xz.NewReader(br)
+		if err != nil {
+			return nil, nil, fmt.Errorf("%w: %w", ErrInvalidGeometry, err)
+		}
+		return dec, nil, nil
+	}
+	return br, nil, nil
+}
+
 // BVH is a bounding volume hierarchy over map triangles.
 type BVH struct {
 	Vertices []Vec3
@@ -72,14 +145,18 @@ func Load(path string) (*BVH, string, error) {
 	return bvh, hex.EncodeToString(sum[:]), nil
 }
 
-// Read decodes a gzip-compressed geometry stream.
+// Read decodes a geometry stream. The dataset publishes gzip-compressed files;
+// bundled sidecars re-compress the payload with zstd (or xz) to save space, so
+// the container is detected from its magic bytes.
 func Read(r io.Reader) (*BVH, error) {
-	gz, err := gzip.NewReader(bufio.NewReaderSize(r, 1<<20))
+	payload, closer, err := decompressGeometry(r)
 	if err != nil {
-		return nil, fmt.Errorf("%w: %w", ErrInvalidGeometry, err)
+		return nil, err
 	}
-	defer gz.Close()
-	br := bufio.NewReaderSize(gz, 1<<20)
+	if closer != nil {
+		defer closer()
+	}
+	br := bufio.NewReaderSize(payload, 1<<20)
 
 	header := make([]byte, headerSize)
 	if _, err := io.ReadFull(br, header); err != nil {

@@ -16,6 +16,7 @@ import (
 	"io"
 	"math"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/klauspost/compress/zstd"
@@ -47,7 +48,7 @@ var CoreMaps = []string{
 // without the .tri extension and the workshop prefix).
 func IsCoreMap(name string) bool {
 	name = strings.ToLower(strings.TrimSpace(name))
-	name = strings.TrimSuffix(name, Extension)
+	name = strings.TrimSuffix(filepath.Base(name), Extension)
 	for _, core := range CoreMaps {
 		if name == core {
 			return true

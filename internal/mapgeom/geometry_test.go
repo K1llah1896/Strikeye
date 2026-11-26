@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/klauspost/compress/zstd"
@@ -105,6 +106,30 @@ func TestReadAcceptsEveryContainer(t *testing.T) {
 		}
 		if len(bvh.Vertices) != 4 || len(bvh.Nodes) != 1 {
 			t.Fatalf("%s: unexpected geometry %d/%d", name, len(bvh.Vertices), len(bvh.Nodes))
+		}
+	}
+}
+
+// TestCoreMaps pins the maps the release bundle carries: they must be the
+// competitive pool, and the lookup must tolerate the name shapes the manifest
+// and the demo headers produce.
+func TestCoreMaps(t *testing.T) {
+	if len(CoreMaps) != 11 {
+		t.Fatalf("CoreMaps has %d entries, want 11", len(CoreMaps))
+	}
+	for _, name := range CoreMaps {
+		if !strings.HasPrefix(name, "de_") && !strings.HasPrefix(name, "cs_") {
+			t.Fatalf("suspicious map name %q", name)
+		}
+	}
+	for _, name := range []string{"de_dust2", "DE_MIRAGE", "workshop/123/de_inferno.tri"} {
+		if !IsCoreMap(name) {
+			t.Fatalf("IsCoreMap(%q) = false", name)
+		}
+	}
+	for _, name := range []string{"cs_italy", "cs_office", "de_poseidon", ""} {
+		if IsCoreMap(name) {
+			t.Fatalf("IsCoreMap(%q) = true", name)
 		}
 	}
 }

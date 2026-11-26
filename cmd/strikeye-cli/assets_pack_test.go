@@ -57,3 +57,34 @@ func TestPackToolsRequiresDownloadWhenMissing(t *testing.T) {
 		t.Fatal("expected a fetch failure for an unpopulated tools dir")
 	}
 }
+
+// TestGeometryTargetsFiltersToCoreMaps pins the default bundle contents: the
+// release carries the competitive pool, and --all-geometry restores the rest.
+func TestGeometryTargetsFiltersToCoreMaps(t *testing.T) {
+	available := []string{"cs_italy", "de_dust2", "de_inferno", "de_poseidon", "de_mirage"}
+	core, err := geometryTargets(available, false)
+	if err != nil {
+		t.Fatalf("geometryTargets: %v", err)
+	}
+	want := []string{"de_dust2", "de_inferno", "de_mirage"}
+	if len(core) != len(want) {
+		t.Fatalf("got %v, want %v", core, want)
+	}
+	for i, name := range want {
+		if core[i] != name {
+			t.Fatalf("got %v, want %v", core, want)
+		}
+	}
+
+	all, err := geometryTargets(available, true)
+	if err != nil {
+		t.Fatalf("geometryTargets(all): %v", err)
+	}
+	if len(all) != len(available) {
+		t.Fatalf("all geometry dropped maps: %v", all)
+	}
+
+	if _, err := geometryTargets([]string{"cs_italy"}, false); err == nil {
+		t.Fatal("expected an error when the manifest has no core maps")
+	}
+}

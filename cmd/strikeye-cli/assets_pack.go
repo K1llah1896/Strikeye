@@ -182,6 +182,24 @@ func packCallouts(ctx context.Context, client *http.Client, dest string) error {
 	return nil
 }
 
+// geometryTargets picks the maps the bundle should carry: the competitive pool by
+// default, everything the dataset publishes when all is set.
+func geometryTargets(available []string, all bool) ([]string, error) {
+	if all {
+		return available, nil
+	}
+	filtered := make([]string, 0, len(mapgeom.CoreMaps))
+	for _, name := range available {
+		if mapgeom.IsCoreMap(name) {
+			filtered = append(filtered, name)
+		}
+	}
+	if len(filtered) == 0 {
+		return nil, fmt.Errorf("geometry manifest has none of the %d core maps", len(mapgeom.CoreMaps))
+	}
+	return filtered, nil
+}
+
 // packGeometry builds the geometry sidecar. By default it carries only the
 // competitive pool (internal/mapgeom.CoreMaps), which is what a fresh install
 // needs; allGeometry adds the casual and arms-race maps, and both variants stay
@@ -200,18 +218,9 @@ func packGeometry(ctx context.Context, client *http.Client, baseURL, bundlePath 
 	if err != nil {
 		return nil, 0, err
 	}
-	names := manifest.MapNames()
-	if !allGeometry {
-		filtered := make([]string, 0, len(mapgeom.CoreMaps))
-		for _, name := range names {
-			if mapgeom.IsCoreMap(name) {
-				filtered = append(filtered, name)
-			}
-		}
-		if len(filtered) == 0 {
-			return nil, 0, fmt.Errorf("geometry manifest has none of the %d core maps", len(mapgeom.CoreMaps))
-		}
-		names = filtered
+	names, err := geometryTargets(manifest.MapNames(), allGeometry)
+	if err != nil {
+		return nil, 0, err
 	}
 	workDir, err := os.MkdirTemp("", "strikeye-geom-")
 	if err != nil {

@@ -105,9 +105,10 @@ jobs:
           ldflags="-s -w -X strikeye/internal/version.AppVersion=${VERSION}"
           # One binary carries every entry point: the desktop shell by default,
           # `strikeye agent` for the headless service, `strikeye cli <command>`
-          # for the command line. GUI subsystem so no console window flashes on
-          # start; the CLI runs from the same file and still owns its own stdout.
-          go build -trimpath -ldflags "${ldflags} -H windowsgui" -o dist/strikeye.exe ./cmd/strikeye
+          # for the command line. Console subsystem on purpose: cmd.exe and
+          # PowerShell only wait for console applications, so `strikeye cli …`
+          # has to be one — the shell hides its own console window instead.
+          go build -trimpath -ldflags "${ldflags}" -o dist/strikeye.exe ./cmd/strikeye
           ls -l dist
 
       - name: Package

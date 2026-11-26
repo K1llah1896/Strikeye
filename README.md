@@ -126,7 +126,7 @@ go build ./...
 
 ```bash
 GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -trimpath \
-  -ldflags "-X strikeye/internal/version.AppVersion=0.2.0 -H windowsgui" \
+  -ldflags "-X strikeye/internal/version.AppVersion=0.5.1" \
   -o dist/strikeye.exe ./cmd/strikeye
 ```
 
@@ -149,7 +149,7 @@ strikeye.exe agent --data-root D # 无界面后台代理（IPC 服务）
 strikeye.exe cli doctor          # 命令行：doctor / parse / zones / export / sql / corpus …
 ```
 
-命令行模式会附着父控制台，因此在 Windows 终端里能正常看到输出；把文件复制成 `strikeye-cli.exe` / `strikeye-agent.exe` 时，程序名同样会被识别，旧脚本不必改。源码里的 `cmd/strikeye-cli`、`cmd/strikeye-agent` 只是开发用薄壳（`go run` 与 CI 脚本仍然可用），不进入发布包。
+可执行文件以控制台子系统链接，所以 `strikeye cli …` 在 `cmd.exe`/PowerShell/批处理里会阻塞、按顺序输出并把退出码交回脚本；桌面外壳启动时若发现控制台只属于自己（双击启动）就隐藏并释放它，若控制台是用户终端共享的（在终端里运行 `strikeye`）则完全不动，日志照旧可见。把文件复制成 `strikeye-cli.exe` / `strikeye-agent.exe` 时，程序名同样会被识别，旧脚本不必改。源码里的 `cmd/strikeye-cli`、`cmd/strikeye-agent` 只是开发用薄壳（`go run` 与 CI 脚本仍然可用），不进入发布包。
 
 ## 开发校验
 

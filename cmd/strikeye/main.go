@@ -38,6 +38,8 @@ func main() {
 		return
 	}
 
+	detachConsoleForDesktop()
+
 	showVersion := flag.Bool("version", false, "Print version information and exit")
 	envCheck := flag.Bool("env-check", false, "Print runtime environment summary and exit")
 	agentMode := flag.Bool("agent", false, "Run headless background agent service")

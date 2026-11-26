@@ -403,7 +403,7 @@
 | `strikeye.exe cli doctor` | 命令行子命令（doctor/parse/zones/export/sql/corpus…） |
 | 复制成 `strikeye-cli.exe` / `strikeye-agent.exe` | 按程序名认回旧入口，旧脚本无需修改 |
 
-代价与对策：exe 以 `-H windowsgui` 链接（否则每次开 GUI 都会闪控制台），因此命令行模式在 Windows 上先 `AttachConsole(ATTACH_PARENT_PROCESS)` 并重绑标准流，输出仍落在调用方的终端里；热更新在装入合并包时删除旧的 `strikeye-agent`/`strikeye-cli`（含 `.old`），过渡包仍带旧名称时一个都不删。`cmd/strikeye-cli`、`cmd/strikeye-agent` 保留为开发薄壳供 `go run` 与 CI 使用，不再打包。
+代价与对策：exe 以**控制台子系统**链接——`cmd.exe`/PowerShell 只等待控制台应用，GUI 子系统会让 `strikeye cli …` 立刻返回、输出乱序且拿不到退出码；桌面外壳启动时用 `GetConsoleProcessList` 判断控制台是否只属于自己（双击 = 独占），独占则 `ShowWindow(SW_HIDE)` + `FreeConsole`，与真实终端共享（在终端里运行 `strikeye`）则完全不动；另有 `AttachConsole(ATTACH_PARENT_PROCESS)` 兜底，使手工用 `-H windowsgui` 构建的版本仍能输出；热更新在装入合并包时删除旧的 `strikeye-agent`/`strikeye-cli`（含 `.old`），过渡包仍带旧名称时一个都不删。`cmd/strikeye-cli`、`cmd/strikeye-agent` 保留为开发薄壳供 `go run` 与 CI 使用，不再打包。
 
 ## 9. 仍未补齐及原因
 

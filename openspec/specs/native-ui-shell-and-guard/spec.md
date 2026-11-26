@@ -171,9 +171,33 @@ The UI shell SHALL provide a reusable progress bar primitive supporting determin
 - **WHEN** 把发布包中的 `strikeye.exe` 复制为 `strikeye-cli.exe` 并运行 `--version`
 - **THEN** 输出命令行版本信息而不是打开桌面外壳
 
+### Requirement: Console fidelity for the merged binary
+
+合并后的可执行文件 SHALL 同时满足脚本化的命令行与无终端的桌面启动：
+
+- 可执行文件 SHALL 以控制台子系统链接，使命令行模式在 `cmd.exe` 与 PowerShell 中阻塞、顺序输出并把退出码交回调用方；
+- 桌面外壳启动时 SHALL 隐藏并释放仅属于本进程的控制台窗口（`GetConsoleProcessList` 返回 1）；
+- 桌面外壳 SHALL NOT 隐藏与真实终端共享的控制台（`GetConsoleProcessList` 大于 1）；
+- 进程在无控制台时 SHALL 尝试附着父控制台并重绑标准流，使以 GUI 子系统链接的自建版本仍能输出。
+
+#### Scenario: Script sees the CLI finish
+
+- **WHEN** 在 `.bat` 或 PowerShell 脚本中运行 `strikeye cli export …`
+- **THEN** 脚本等待命令结束，输出按顺序出现，`%ERRORLEVEL%`/`$LASTEXITCODE` 反映该命令的结果
+
+#### Scenario: Double-click leaves no terminal behind
+
+- **WHEN** 从资源管理器双击 `strikeye.exe` 打开桌面外壳
+- **THEN** 为本进程创建的控制台窗口在渲染首帧前被隐藏并释放，不会留下空终端
+
+#### Scenario: Terminal-launched shell keeps its console
+
+- **WHEN** 在终端里运行 `strikeye` 打开桌面外壳
+- **THEN** 该终端的窗口不被隐藏，其日志输出继续可见
+
 #### Scenario: CLI output survives the GUI subsystem
 
-- **WHEN** 在 Windows 控制台中运行 `strikeye cli doctor`
+- **WHEN** 用 `-H windowsgui` 手工构建后在 Windows 控制台中运行 `strikeye cli doctor`
 - **THEN** 命令输出出现在该控制台（进程附着父控制台并重绑标准流），而不是静默丢弃
 
 ### Requirement: Merged binary replaces split executables on update

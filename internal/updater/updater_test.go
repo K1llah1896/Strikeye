@@ -200,3 +200,81 @@ func TestCheckUpdateGitHubReleasesAPI(t *testing.T) {
 		t.Fatalf("unexpected GitHub CheckResult: %+v", res)
 	}
 }
+
+// TestApplyZipPackageRemovesLegacySplitBinaries keeps an install tidy when it
+// upgrades from the three-binary layout: the merged `strikeye` supersedes the
+// old agents, and a stale copy could still be spawned by the fallback path.
+func TestApplyZipPackageRemovesLegacySplitBinaries(t *testing.T) {
+	dir := t.TempDir()
+	legacy := []string{"strikeye-agent.exe", "strikeye-cli.exe", "strikeye-agent", "strikeye-cli"}
+	for _, name := range legacy {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte("old"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	var zipBuf bytes.Buffer
+	zw := zip.NewWriter(&zipBuf)
+	merged := "strikeye"
+	if runtime.GOOS == "windows" {
+		merged = "strikeye.exe"
+	}
+	fw, err := zw.Create("dist/" + merged)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fw.Write([]byte("merged-binary")); err != nil {
+		t.Fatal(err)
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	zipPath := filepath.Join(t.TempDir(), "pkg.zip")
+	if err := os.WriteFile(zipPath, zipBuf.Bytes(), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := applyZipPackage(zipPath, dir); err != nil {
+		t.Fatalf("applyZipPackage: %v", err)
+	}
+	for _, name := range legacy {
+		if _, err := os.Stat(filepath.Join(dir, name)); !os.IsNotExist(err) {
+			t.Fatalf("legacy binary %s survived the merge update (%v)", name, err)
+		}
+	}
+	if got, err := os.ReadFile(filepath.Join(dir, merged)); err != nil || string(got) != "merged-binary" {
+		t.Fatalf("merged binary not installed: %q %v", got, err)
+	}
+}
+
+// TestApplyZipPackageKeepsSplitBinariesWhenShipped guards the reverse case: a
+// package that still contains the split executables must not have them deleted.
+func TestApplyZipPackageKeepsSplitBinariesWhenShipped(t *testing.T) {
+	dir := t.TempDir()
+	var zipBuf bytes.Buffer
+	zw := zip.NewWriter(&zipBuf)
+	for _, name := range []string{"strikeye.exe", "strikeye-agent.exe", "strikeye-cli.exe"} {
+		fw, err := zw.Create(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := fw.Write([]byte(name)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	zipPath := filepath.Join(t.TempDir(), "pkg.zip")
+	if err := os.WriteFile(zipPath, zipBuf.Bytes(), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := applyZipPackage(zipPath, dir); err != nil {
+		t.Fatalf("applyZipPackage: %v", err)
+	}
+	for _, name := range []string{"strikeye.exe", "strikeye-agent.exe", "strikeye-cli.exe"} {
+		if _, err := os.Stat(filepath.Join(dir, name)); err != nil {
+			t.Fatalf("%s missing: %v", name, err)
+		}
+	}
+}

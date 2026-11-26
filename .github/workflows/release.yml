@@ -3,8 +3,7 @@ name: Release
 # Builds the Windows executables and publishes them to a GitHub Release whenever
 # a version tag (v*) is pushed. The asset layout matches what the in-app updater
 # (internal/updater) expects: a zip whose name contains "windows" and "amd64",
-# holding strikeye.exe / strikeye-agent.exe / strikeye-cli.exe plus the
-# map_geometry.zip sidecar with the bundled collision geometry and the
+# holding strikeye.exe plus the map_geometry.zip sidecar with the bundled collision geometry and the
 # ffmpeg-*/hlae-* archives that used to be downloaded from the settings page.
 # Everything a fresh install needs is inside the zip: no runtime downloads.
 #
@@ -104,10 +103,11 @@ jobs:
           # -s -w drops the symbol table and DWARF data: ~18% off every binary,
           # and nothing in the app reads either.
           ldflags="-s -w -X strikeye/internal/version.AppVersion=${VERSION}"
-          # Desktop shell: GUI subsystem so no console window flashes on start.
+          # One binary carries every entry point: the desktop shell by default,
+          # `strikeye agent` for the headless service, `strikeye cli <command>`
+          # for the command line. GUI subsystem so no console window flashes on
+          # start; the CLI runs from the same file and still owns its own stdout.
           go build -trimpath -ldflags "${ldflags} -H windowsgui" -o dist/strikeye.exe ./cmd/strikeye
-          go build -trimpath -ldflags "${ldflags}" -o dist/strikeye-agent.exe ./cmd/strikeye-agent
-          go build -trimpath -ldflags "${ldflags}" -o dist/strikeye-cli.exe ./cmd/strikeye-cli
           ls -l dist
 
       - name: Package
@@ -120,7 +120,7 @@ jobs:
           # setting; the sidecars are already compressed (gzip map data, zstd
           # FFmpeg, upstream HLAE zip) and are stored as-is to keep packaging
           # fast instead of burning minutes to save nothing.
-          zip -9 -X "$out" strikeye.exe strikeye-agent.exe strikeye-cli.exe
+          zip -9 -X "$out" strikeye.exe
           zip -0 -X "$out" map_geometry.zip ffmpeg-windows-amd64.tar.zst hlae-windows-amd64.zip
           zip -T "$out"
           sha256sum "$out" > SHA256SUMS.txt

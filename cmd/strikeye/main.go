@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"strikeye/internal/agent"
+	"strikeye/internal/cli"
 	"strikeye/internal/config"
 	"strikeye/internal/ipc"
 	"strikeye/internal/storage"
@@ -23,6 +24,20 @@ import (
 )
 
 func main() {
+	mode, args := resolveMode(os.Args[0], os.Args[1:])
+	switch mode {
+	case modeCLI:
+		attachConsoleForCLI()
+		cli.Run(args)
+		return
+	case modeAgent:
+		if err := runAgentEntry(args); err != nil {
+			fmt.Fprintf(os.Stderr, "strikeye-agent error: %v\n", err)
+			os.Exit(1)
+		}
+		return
+	}
+
 	showVersion := flag.Bool("version", false, "Print version information and exit")
 	envCheck := flag.Bool("env-check", false, "Print runtime environment summary and exit")
 	agentMode := flag.Bool("agent", false, "Run headless background agent service")
@@ -209,4 +224,36 @@ func runDesktop(ctx context.Context, dataRoot, pipeOverride string) error {
 		cancel()
 	}
 	return err
+}
+
+// runAgentEntry runs the background agent in this process for the `agent`
+// selector and for a binary renamed to `strikeye-agent`. The flags match the
+// stand-alone agent so a self-spawned child keeps working either way.
+func runAgentEntry(args []string) error {
+	fs := flag.NewFlagSet("strikeye-agent", flag.ExitOnError)
+	showVersion := fs.Bool("version", false, "Print version information and exit")
+	envCheck := fs.Bool("env-check", false, "Print runtime environment summary and exit")
+	dataRoot := fs.String("data-root", "", "Override Strikeye DataRoot directory")
+	pipe := fs.String("pipe", "", "Override IPC named pipe / socket address")
+	_ = fs.Parse(args)
+
+	if *showVersion {
+		fmt.Println(version.Summary("strikeye-agent"))
+		return nil
+	}
+	if *envCheck {
+		fmt.Printf("%s: ready (phase4)\n", version.Summary("strikeye-agent"))
+		return nil
+	}
+	root := *dataRoot
+	if root == "" {
+		resolved, err := config.DefaultDataRoot()
+		if err != nil {
+			return fmt.Errorf("resolve data-root: %w", err)
+		}
+		root = resolved
+	}
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	return agent.Run(ctx, root, *pipe)
 }

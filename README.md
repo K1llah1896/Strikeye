@@ -74,7 +74,7 @@ Strikeye 围绕比赛的完整生命周期，构建统一的 Demo 管理、观�
 - 导航网格（`navs.zip`，7.7 MB）与 callout 表（780 KB）用 `go:embed` 编入可执行文件，启动时校验 sha256 后写入 `<DataRoot>/cache/`；
 - 碰撞几何（`map_geometry.zip`，120 MB）覆盖 11 张竞技图，以 xz 帧保存原始碰撞网格，与 exe 同目录分发、按图按需解压（首次用到某图才落盘 6–17 MB）；休闲图（`cs_italy`/`cs_office` 等）由设置页一键补充；
 - FFmpeg（`ffmpeg-windows-amd64.tar.zst`，51 MB，只含 `ffmpeg`/`ffprobe`）与 HLAE（`hlae-windows-amd64.zip`，9 MB）同样作为边车随包，启动前解压到 `<DataRoot>/tools/`，探测时包内版本优先于系统 PATH；
-- 体积是打包环节的结果而不是靠删功能换来的：exe 用 `-s -w` 链接并 `zip -9` 压缩，已压缩的边车以 `zip -0` 存放，CJK 字体是 GBK 子集（每字重 7.7 MB，`scripts/subset-fonts.sh` 可重建，覆盖测试会拦下缺字的新文案）。整套发布包 255 MB，比 0.3.1 的 527 MB 少一半，能力一项未减；
+- 体积是打包环节的结果而不是靠删功能换来的：全部入口合并进单个 `strikeye.exe`（exe 从三个 137 MB 降到 63.6 MB），exe 用 `-s -w` 链接并 `zip -9` 压缩，已压缩的边车以 `zip -0` 存放，CJK 字体是 GBK 子集（每字重 7.7 MB，`scripts/subset-fonts.sh` 可重建，覆盖测试会拦下缺字的新文案）。整套发布包 215 MB，比 0.3.1 的 527 MB 少六成，能力一项未减；
 - 应用内热更新会把所有边车一并替换，升级后依旧无需下载。
 
 唯一需要联网的两类数据也都不再需要点按钮：打开一场比赛会自动补齐缺失的选手头像（30 天 TTL，命中缓存则零请求）；配置了 Steam Web API key 时，资料库刷新会自动更新超过 24 小时的封禁快照。两者的手动按钮保留为强制刷新。
@@ -137,9 +137,19 @@ git tag v0.1.0
 git push origin v0.1.0
 ```
 
-工作流会执行 `go vet` / `go test`，交叉编译三个可执行文件，打包 `strikeye-windows-amd64.zip`（内含 `strikeye.exe` / `strikeye-agent.exe` / `strikeye-cli.exe`）与 `SHA256SUMS.txt`，并创建对应的 GitHub Release。tag 中的版本号会通过 `-X strikeye/internal/version.AppVersion` 注入，用于应用内更新比较。
+工作流会执行 `go vet` / `go test`，交叉编译可执行文件，打包 `strikeye-windows-amd64.zip`（内含单个 `strikeye.exe` 与地图/工具边车）及 `SHA256SUMS.txt`，并创建对应的 GitHub Release。tag 中的版本号会通过 `-X strikeye/internal/version.AppVersion` 注入，用于应用内更新比较。
 
 带 `-` 的 tag（如 `v0.2.0-rc1`）会发布为 prerelease，不会顶掉 `/releases/latest`；应用内更新（`internal/updater`）读取的正是该地址，因此正式更新请使用 `vX.Y.Z` 形式的 tag。
+
+一个可执行文件承载全部入口，发布包不再分发多个 exe：
+
+```bash
+strikeye.exe                     # 双击或直接运行：打开桌面外壳（内含并自举后台代理）
+strikeye.exe agent --data-root D # 无界面后台代理（IPC 服务）
+strikeye.exe cli doctor          # 命令行：doctor / parse / zones / export / sql / corpus …
+```
+
+命令行模式会附着父控制台，因此在 Windows 终端里能正常看到输出；把文件复制成 `strikeye-cli.exe` / `strikeye-agent.exe` 时，程序名同样会被识别，旧脚本不必改。源码里的 `cmd/strikeye-cli`、`cmd/strikeye-agent` 只是开发用薄壳（`go run` 与 CI 脚本仍然可用），不进入发布包。
 
 ## 开发校验
 

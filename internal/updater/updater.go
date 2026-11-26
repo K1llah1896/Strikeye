@@ -352,6 +352,10 @@ func applyZipPackage(zipPath, targetDir string) error {
 	}
 
 	replaced := 0
+	present := make(map[string]bool, len(zr.File))
+	for _, f := range zr.File {
+		present[filepath.Base(f.Name)] = true
+	}
 	for _, f := range zr.File {
 		if f.FileInfo().IsDir() {
 			continue
@@ -392,7 +396,34 @@ func applyZipPackage(zipPath, targetDir string) error {
 	if replaced == 0 {
 		return errors.New("更新包中未找到有效的 Strikeye 可执行文件")
 	}
+	removeLegacySplitBinaries(targetDir, present)
 	return nil
+}
+
+// legacySplitBinaries are the separate executables releases before 0.5.0 shipped
+// next to the desktop shell. The single binary supersedes them, and a stale copy
+// on disk could still be spawned by the agent fallback, so a package carrying
+// `strikeye` removes them.
+var legacySplitBinaries = []string{
+	"strikeye-agent.exe",
+	"strikeye-agent",
+	"strikeye-cli.exe",
+	"strikeye-cli",
+}
+
+// removeLegacySplitBinaries drops left-over split executables after an update
+// that brought the merged binary.
+func removeLegacySplitBinaries(dir string, shipped map[string]bool) {
+	if !shipped["strikeye.exe"] && !shipped["strikeye"] {
+		return
+	}
+	for _, name := range legacySplitBinaries {
+		if shipped[name] {
+			continue
+		}
+		_ = os.Remove(filepath.Join(dir, name))
+		_ = os.Remove(filepath.Join(dir, name+".old"))
+	}
 }
 
 func replaceBinaryFromFile(srcPath, dstPath string) error {

@@ -373,21 +373,37 @@
 | `zero-click-refresh` | 最后两类必须联网的数据改为自动补齐：分析页打开比赛时抓取缺失头像（30 天 TTL、命中缓存零请求）、资料库刷新时更新超过 24h 的封禁快照（需 Steam key，`refresh=false` 复用 TTL）；新增 `avatarAutoFetch`/`avatarClient` 注入点让渲染测试保持无网络 |
 | `bundled-toolchain` | FFmpeg（119 MB）与 HLAE（9 MB）以 `*-windows-amd64.zip` 边车随包分发，启动前自动解压到 `<DataRoot>/tools/<tool>`；探测用 glob 发现 `tools/` 下的二进制（包内版本优先于 PATH）；打包改用钉定直链（HLAE `v2.193.2`、BtbN `latest`）避开 GitHub API 每小时 60 次的限流；设置页按钮改为离线「从内置包安装」 |
 | `release-size-reduction` | 发布包 527 MB → 255 MB 且不减能力：几何边车改存 xz 原始 `CSDAGEO` 负载并只带 11 张竞技图（`--all-geometry` 可全量）、FFmpeg 边车改 `.tar.zst` 只留 ffmpeg/ffprobe、exe `-s -w` + `zip -9`、CJK 字体 GBK 子集 + 覆盖测试（见 §8.1） |
+| `single-binary-distribution` | 三个可执行文件合并为单个 `strikeye.exe`：`agent` / `cli` 选择子 + 程序名识别 + Windows 附着父控制台；热更新清理被取代的旧 exe（过渡包保留）；发布包 255 MB → 215 MB，exe 137 MB → 63.6 MB |
 | `ci-gate` | `.github/workflows/ci.yml`：gofmt / vet / test / 三平台交叉编译 / `openspec validate --all --strict`（CLI 钉 1.15.0），语料回归走 `workflow_dispatch`；仓库内 8 个文件统一 gofmt |
 
-## 8.1 发布包体积（2026-11-26，v0.4.0）
+## 8.1 发布包体积（2026-11-26，v0.4.0 → v0.5.0）
 
-0.3.1 的 `strikeye-windows-amd64.zip` 达到 527 MB。按“核心能力一项不减”的前提重做编码与打包后降到 255 MB：
+0.3.1 的 `strikeye-windows-amd64.zip` 达到 527 MB。按“核心能力一项不减”的前提重做编码与打包后降到 255 MB；随后把三个入口合并成单个可执行文件，再降到 215 MB：
 
 | 组成 | 0.3.1 | 0.4.0 | 做法 |
 |---|---|---|---|
-| `strikeye.exe` / `agent` / `cli` | 68.0 / 48.7 / 30.4 MB | 62.6 / 43.2 / 31.1 MB | `-ldflags "-s -w"`（符号表与 DWARF 去掉，约 −18%）+ `zip -9` |
+| 可执行文件 | 68.0 / 48.7 / 30.4 MB（三个） | 63.6 MB（一个） | `-ldflags "-s -w"`（符号表与 DWARF 去掉，约 −18%）+ `zip -9`；三入口合并进单个 `strikeye.exe`（`strikeye` = 桌面外壳、`strikeye agent` = 后台服务、`strikeye cli <cmd>` = 命令行） |
 | `map_geometry.zip` | 199.7 MB（16 图） | 119.9 MB（11 张竞技图） | 解掉发布方原有的 gzip 包装，改以 xz 帧存原始 `CSDAGEO` 负载（`de_inferno`：40.0→32.6 MB）；休闲图由设置页一键补充 |
 | FFmpeg 边车 | 119.5 MB `.zip`（含 ffplay 与文档） | 51.3 MB `.tar.zst`（只留 ffmpeg/ffprobe，固态压缩） | 上游换 gyan.dev essentials（两个 110 MB 二进制，非 master 的 172 MB）；旧 `.zip` 名仍被接受 |
 | HLAE 边车 | 9.1 MB | 9.1 MB | 保持上游压缩包 |
-| 内嵌 CJK 字体 | 每字重 10.55 MB × 3 个 exe | 每字重 7.7 MB | GBK 子集 + 源码非 ASCII 字符集，`scripts/subset-fonts.sh` 可重建，覆盖测试拦缺字 |
+| 内嵌 CJK 字体 | 每字重 10.55 MB × 3 个 exe | 每字重 7.7 MB × 1 个 exe | GBK 子集 + 源码非 ASCII 字符集，`scripts/subset-fonts.sh` 可重建，覆盖测试拦缺字；单文件分发后字体与地图数据只编入一次 |
 
 校验：全新 DataRoot 跑内置安装 → `22 nav meshes, callouts=1`，解析真实 de_dust2 demo 后按需解压 `de_dust2.tri` 16.6 MB，`killctx` 平均交火 760.9 单位 / 遮挡 20.4% / 穿烟 7.3%，TTD 569.7 ms（161 样本）、TTK 509.1 ms（63 样本），与压缩前完全一致。开放数据集的 xz 编码代价是首次用到某图时约 1–5 秒解码，之后常驻缓存。
+
+## 8.2 单文件分发（2026-11-26，v0.5.0）
+
+早期版本把职责拆成 `strikeye.exe`（桌面外壳）、`strikeye-agent.exe`（后台服务）、`strikeye-cli.exe`（命令行）三个可执行文件。它们共享同一模块与同一套内嵌资源，其中两个是严格冗余的：外壳本来就用 `--agent` 自举自身运行代理，命令行也只是一组子命令。
+
+现在发布包只有一个 `strikeye.exe`，分派规则在 `cmd/strikeye/dispatch.go` 的纯函数 `resolveMode` 里：
+
+| 调用 | 行为 |
+|---|---|
+| `strikeye.exe` | 桌面外壳（沿用守卫、单实例与代理自举流程） |
+| `strikeye.exe agent --data-root D` | 无界面后台代理 |
+| `strikeye.exe cli doctor` | 命令行子命令（doctor/parse/zones/export/sql/corpus…） |
+| 复制成 `strikeye-cli.exe` / `strikeye-agent.exe` | 按程序名认回旧入口，旧脚本无需修改 |
+
+代价与对策：exe 以 `-H windowsgui` 链接（否则每次开 GUI 都会闪控制台），因此命令行模式在 Windows 上先 `AttachConsole(ATTACH_PARENT_PROCESS)` 并重绑标准流，输出仍落在调用方的终端里；热更新在装入合并包时删除旧的 `strikeye-agent`/`strikeye-cli`（含 `.old`），过渡包仍带旧名称时一个都不删。`cmd/strikeye-cli`、`cmd/strikeye-agent` 保留为开发薄壳供 `go run` 与 CI 使用，不再打包。
 
 ## 9. 仍未补齐及原因
 
